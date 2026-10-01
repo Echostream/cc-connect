@@ -16390,3 +16390,84 @@ func TestProcessInteractiveEvents_StreamingCard_BareNoReply_Suppressed(t *testin
 		t.Fatalf("silent reply leaked NO_REPLY into the streaming card: %q", card.finalContent())
 	}
 }
+
+// pathRecordingPlatform distinguishes Reply from Send calls so tests can prove
+// which outbound primitive a code path selects. The pre-existing
+// stubPlatformEngine appends both into one slice, which is exactly why the
+// Weixin push-budget regression (issue #1742: the engine's final answer routed
+// as p.Send) was not caught by existing tests.
+type pathRecordingPlatform struct {
+	stubPlatformEngine
+	mu         sync.Mutex
+	replyCalls int
+	sendCalls  int
+}
+
+func (p *pathRecordingPlatform) Reply(_ context.Context, _ any, content string) error {
+	p.mu.Lock()
+	p.replyCalls++
+	p.mu.Unlock()
+	return p.stubPlatformEngine.Reply(context.Background(), nil, content)
+}
+
+func (p *pathRecordingPlatform) Send(_ context.Context, _ any, content string) error {
+	p.mu.Lock()
+	p.sendCalls++
+	p.mu.Unlock()
+	return p.stubPlatformEngine.Send(context.Background(), nil, content)
+}
+
+func (p *pathRecordingPlatform) counts() (reply, send int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.replyCalls, p.sendCalls
+}
+
+// TestProcessInteractiveEvents_FinalAnswerUsesReply proves the engine routes a
+// plain agent turn's final answer through Reply, not Send, so reactive replies
+// no longer consume the platform's proactive push/send budget (#1742).
+func TestProcessInteractiveEvents_FinalAnswerUsesReply(t *testing.T) {
+	p := &pathRecordingPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "test:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s1")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-1",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	final := "the final answer"
+	agentSession.events <- Event{Type: EventResult, Content: final, Done: true}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil, 0)
+
+	replyCalls, sendCalls := p.counts()
+	if replyCalls < 1 {
+		t.Fatalf("final answer did not use Reply: replyCalls=%d sendCalls=%d", replyCalls, sendCalls)
+	}
+	if sendCalls != 0 {
+		t.Fatalf("final answer unexpectedly used Send: replyCalls=%d sendCalls=%d", replyCalls, sendCalls)
+	}
+	if sent := p.getSent(); len(sent) == 0 || sent[len(sent)-1] != final {
+		t.Fatalf("final answer not delivered: sent=%#v", sent)
+	}
+}
+
+// TestEngineSendUsesSend proves the proactive outbound helper still routes
+// through Send, so timer / cron / heartbeat / relay pushes keep consuming the
+// push budget as intended (unchanged by the Reply fix).
+func TestEngineSendUsesSend(t *testing.T) {
+	p := &pathRecordingPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.send(p, "ctx", "proactive message")
+
+	replyCalls, sendCalls := p.counts()
+	if sendCalls != 1 {
+		t.Fatalf("proactive send did not use Send exactly once: replyCalls=%d sendCalls=%d", replyCalls, sendCalls)
+	}
+	if replyCalls != 0 {
+		t.Fatalf("proactive send must not use Reply: replyCalls=%d sendCalls=%d", replyCalls, sendCalls)
+	}
+}
