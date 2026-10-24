@@ -81,16 +81,27 @@ func NewLegacyScheduler(maxWaiting int) *LegacyScheduler {
 }
 
 func (s *LegacyScheduler) Submit(task ProjectTask) SubmitResult {
-	return s.SubmitWithOptions(task, SubmitOptions{})
+	return s.submit(task, admissionInteractiveQueue)
 }
 
-// SubmitOnlyIfIdle 当前采用全 Scheduler 空闲的保守门禁，避免主动任务绕过
-// 已接受的普通消息。各主动入口的 beta.3 兼容语义由后续任务逐项接线和验收。
+// SubmitProactive 只在目标 SessionKey lane 空闲时接纳，不受其他 lane 影响。
+func (s *LegacyScheduler) SubmitProactive(task ProjectTask) SubmitResult {
+	return s.submit(task, admissionProactive)
+}
+
+// SubmitOnlyIfIdle 只检查目标 SessionKey lane；Legacy 的不同 lane 可并行。
 func (s *LegacyScheduler) SubmitOnlyIfIdle(task ProjectTask) SubmitResult {
-	return s.SubmitWithOptions(task, SubmitOptions{OnlyIfIdle: true})
+	return s.submit(task, admissionOnlyIfIdle)
 }
 
 func (s *LegacyScheduler) SubmitWithOptions(task ProjectTask, options SubmitOptions) SubmitResult {
+	if options.OnlyIfIdle {
+		return s.SubmitOnlyIfIdle(task)
+	}
+	return s.Submit(task)
+}
+
+func (s *LegacyScheduler) submit(task ProjectTask, admission submitAdmission) SubmitResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -102,13 +113,14 @@ func (s *LegacyScheduler) SubmitWithOptions(task ProjectTask, options SubmitOpti
 		s.rejected++
 		return SubmitResult{Status: SubmitRejectedBusy}
 	}
-	if options.OnlyIfIdle && (s.activeCount != 0 || s.waitingCount != 0 || s.completionCount != 0) {
-		s.rejected++
-		return SubmitResult{Status: SubmitRejectedBusy}
-	}
 
 	task = normalizeLegacyTask(task)
 	lane := s.lanes[task.SessionKey]
+	laneBusy := lane != nil && (lane.active != nil || lane.completing != 0 || len(lane.waiting) > 0)
+	if admission != admissionInteractiveQueue && laneBusy {
+		s.rejected++
+		return SubmitResult{Status: SubmitRejectedBusy}
+	}
 	laneOwned := lane != nil && (lane.active != nil || lane.completing != 0)
 	if laneOwned && len(lane.waiting) >= s.maxWaiting {
 		s.rejected++

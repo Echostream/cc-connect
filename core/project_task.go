@@ -84,6 +84,14 @@ type SubmitOptions struct {
 	OnlyIfIdle bool
 }
 
+type submitAdmission uint8
+
+const (
+	admissionInteractiveQueue submitAdmission = iota
+	admissionProactive
+	admissionOnlyIfIdle
+)
+
 type SubmitFeedback uint8
 
 const (

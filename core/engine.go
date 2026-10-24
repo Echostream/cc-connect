@@ -830,10 +830,10 @@ func (pp *pendingPermission) resolve() {
 // EngineScheduler coordinates Engine work that must be accepted, queued,
 // rejected, cancelled, stopped, or observed consistently by the runtime.
 //
-// Submit and SubmitOnlyIfIdle define ownership transfer: SubmitStarted and
-// SubmitQueued mean the scheduler owns the ProjectTask until it reaches a
-// terminal TaskResult and must call ProjectTask.Cleanup exactly once; any
-// SubmitRejected* status means the caller keeps ownership and must clean up.
+// Submit 和 SubmitOnlyIfIdle 定义相同的 ownership transfer：SubmitStarted、
+// SubmitQueued 表示 Scheduler 接管 ProjectTask，直到任务进入固定终态，并且必须恰好
+// 调用一次 ProjectTask.Cleanup；任何 SubmitRejected* 表示调用方仍持有 ownership
+// 并负责清理。可选 EngineProactiveScheduler capability 使用相同 ownership 合同。
 // CancelSessionContext requests cancellation for work in the supplied session
 // scope and reports whether any accepted work is still draining. Stop rejects
 // later submissions and cleans up all accepted active or waiting tasks before it
@@ -848,6 +848,13 @@ type EngineScheduler interface {
 	Snapshot() SchedulerSnapshot
 	CancelSessionContext(context.Context, string, CancelMode) CancelResult
 	Stop(context.Context)
+}
+
+// EngineProactiveScheduler 是可选 capability，不扩展 EngineScheduler 的必选方法集，
+// 以保持仓外 Scheduler 实现的源码兼容。Project 模式把 proactive 任务放入全局 FIFO；
+// Legacy 模式仅当目标 SessionKey lane 空闲时接纳。
+type EngineProactiveScheduler interface {
+	SubmitProactive(ProjectTask) SubmitResult
 }
 
 // EngineProjectScheduler is kept as a compatibility alias for callers that used

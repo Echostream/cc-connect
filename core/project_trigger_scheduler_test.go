@@ -448,6 +448,8 @@ func exprString(expr ast.Expr) string {
 	}
 }
 
+var _ EngineScheduler = (*captureEngineScheduler)(nil)
+
 type captureEngineScheduler struct {
 	mu       sync.Mutex
 	tasks    []ProjectTask

@@ -16,9 +16,9 @@ type ProjectScheduler struct {
 type schedulerCommand interface{}
 
 type submitCommand struct {
-	task    ProjectTask
-	options SubmitOptions
-	resp    chan SubmitResult
+	task      ProjectTask
+	admission submitAdmission
+	resp      chan SubmitResult
 }
 
 type snapshotCommand struct {
@@ -179,17 +179,29 @@ func NewProjectScheduler(clock SchedulerClock, maxWaiting int, waitingTTL, runTi
 }
 
 func (s *ProjectScheduler) Submit(task ProjectTask) SubmitResult {
-	return s.SubmitWithOptions(task, SubmitOptions{})
+	return s.submit(task, admissionInteractiveQueue)
+}
+
+// SubmitProactive 在 Project 调度下与普通交互任务共享全局 FIFO。
+func (s *ProjectScheduler) SubmitProactive(task ProjectTask) SubmitResult {
+	return s.submit(task, admissionProactive)
 }
 
 func (s *ProjectScheduler) SubmitOnlyIfIdle(task ProjectTask) SubmitResult {
-	return s.SubmitWithOptions(task, SubmitOptions{OnlyIfIdle: true})
+	return s.submit(task, admissionOnlyIfIdle)
 }
 
 func (s *ProjectScheduler) SubmitWithOptions(task ProjectTask, options SubmitOptions) SubmitResult {
+	if options.OnlyIfIdle {
+		return s.SubmitOnlyIfIdle(task)
+	}
+	return s.Submit(task)
+}
+
+func (s *ProjectScheduler) submit(task ProjectTask, admission submitAdmission) SubmitResult {
 	resp := make(chan SubmitResult, 1)
 	select {
-	case s.commands <- submitCommand{task: task, options: options, resp: resp}:
+	case s.commands <- submitCommand{task: task, admission: admission, resp: resp}:
 		return <-resp
 	case <-s.done:
 		return SubmitResult{Status: SubmitRejectedStopped}
@@ -337,7 +349,7 @@ func (l *schedulerLoop) run() {
 func (l *schedulerLoop) handleCommand(cmd schedulerCommand) bool {
 	switch c := cmd.(type) {
 	case submitCommand:
-		c.resp <- l.handleSubmitWithOptions(c.task, c.options)
+		c.resp <- l.handleSubmit(c.task, c.admission)
 	case snapshotCommand:
 		c.resp <- l.snapshot()
 	case beginLocalMutationCommand:
@@ -360,7 +372,7 @@ func (l *schedulerLoop) handleCommand(cmd schedulerCommand) bool {
 	return false
 }
 
-func (l *schedulerLoop) handleSubmitWithOptions(task ProjectTask, options SubmitOptions) SubmitResult {
+func (l *schedulerLoop) handleSubmit(task ProjectTask, admission submitAdmission) SubmitResult {
 	if l.stopped {
 		l.recordRejected()
 		return SubmitResult{Status: SubmitRejectedStopped}
@@ -370,7 +382,7 @@ func (l *schedulerLoop) handleSubmitWithOptions(task ProjectTask, options Submit
 		return SubmitResult{Status: SubmitRejectedBusy}
 	}
 	busy := l.active != nil || l.completionCount != 0 || len(l.waiting) > 0
-	if options.OnlyIfIdle && busy {
+	if admission == admissionOnlyIfIdle && busy {
 		l.recordRejected()
 		return SubmitResult{Status: SubmitRejectedBusy}
 	}
