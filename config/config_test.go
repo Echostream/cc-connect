@@ -3730,6 +3730,15 @@ waiting_ttl_mins = 9223372036854775807
 type = "project"
 unknown_nested = 1
 `, wantErr: `projects.scheduler.unknown_nested is not supported`},
+		{name: "scheduler unknown type-like key is strict", extra: `[projects.scheduler]
+type = "project"
+type_key = "future"
+`, wantErr: `projects.scheduler.type_key is not supported`},
+		{name: "scheduler unknown nested table is strict", extra: `[projects.scheduler]
+type = "project"
+[projects.scheduler.limits]
+max_waiting = 10
+`, wantErr: `projects.scheduler.limits`},
 		{name: "duplicate parse error", extra: `[projects.scheduler]
 type = "project"
 type = "legacy"
@@ -3748,6 +3757,33 @@ type = 1
 			}
 		})
 	}
+}
+
+func TestProjectSchedulerConfigRejectsUnknownSchedulerKeyInAnyProject(t *testing.T) {
+	_, err := Load(writeConfigFixture(t, `[[projects]]
+name = "first"
+[projects.agent]
+type = "claudecode"
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "first-token"
+[projects.scheduler]
+type = "legacy"
+
+[[projects]]
+name = "second"
+[projects.agent]
+type = "claudecode"
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "second-token"
+[projects.scheduler]
+type = "project"
+future_limit = 123
+`))
+	assertErrContains(t, err, `projects.scheduler.future_limit is not supported`)
 }
 
 func TestProjectSchedulerConfigSupportsMultipleProjects(t *testing.T) {
@@ -3795,7 +3831,7 @@ max_turn_time_mins = 32
 	}
 }
 
-func TestGlobalUnknownFieldsStillLoadAndSurviveSave(t *testing.T) {
+func TestSurgicalSavePreservesGlobalAndProjectUnknownFields(t *testing.T) {
 	writeTestConfig(t, `future_global = "keep-me"
 
 [[projects]]
@@ -3821,6 +3857,135 @@ token = "test-token"
 	if !strings.Contains(string(data), `future_global = "keep-me"`) || !strings.Contains(string(data), `future_project_key = "also-loads"`) {
 		t.Fatalf("unknown fields were not preserved after save:\n%s", data)
 	}
+}
+
+func TestFullRewriteUpdatesRejectUnknownSchedulerAndKeepOriginalFile(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		config string
+		act    func() error
+	}{
+		{
+			name:   "save global settings rejects future scheduler key",
+			config: configWithUnknownSchedulerKey(),
+			act: func() error {
+				lang := "zh"
+				return SaveGlobalSettings(GlobalSettingsUpdate{Language: &lang})
+			},
+		},
+		{
+			name:   "save project settings rejects nested scheduler table",
+			config: configWithUnknownSchedulerNestedTable(),
+			act: func() error {
+				admin := "owner"
+				return SaveProjectSettings("demo", ProjectSettingsUpdate{AdminFrom: &admin})
+			},
+		},
+		{
+			name:   "provider crud rejects unknown scheduler via loadLocked",
+			config: configWithUnknownSchedulerKey(),
+			act: func() error {
+				return AddGlobalProvider(ProviderConfig{Name: "new-provider", APIKey: "new-key"})
+			},
+		},
+		{
+			name:   "enable web admin rejects unknown scheduler",
+			config: configWithUnknownSchedulerNestedTable(),
+			act: func() error {
+				_, err := EnableWebAdmin("mgmt-token", "bridge-token")
+				return err
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			writeTestConfig(t, tt.config)
+			before, err := os.ReadFile(ConfigPath)
+			if err != nil {
+				t.Fatalf("read before: %v", err)
+			}
+			err = tt.act()
+			assertErrContains(t, err, "projects.scheduler")
+			after, readErr := os.ReadFile(ConfigPath)
+			if readErr != nil {
+				t.Fatalf("read after: %v", readErr)
+			}
+			if string(after) != string(before) {
+				t.Fatalf("config changed after rejected update\nbefore:\n%s\nafter:\n%s", before, after)
+			}
+		})
+	}
+}
+
+func TestFullRewriteUpdatesStillAcceptKnownSchedulerConfig(t *testing.T) {
+	writeTestConfig(t, configWithKnownScheduler())
+	lang := "zh"
+	if err := SaveGlobalSettings(GlobalSettingsUpdate{Language: &lang}); err != nil {
+		t.Fatalf("SaveGlobalSettings known scheduler: %v", err)
+	}
+	admin := "owner"
+	if err := SaveProjectSettings("demo", ProjectSettingsUpdate{AdminFrom: &admin}); err != nil {
+		t.Fatalf("SaveProjectSettings known scheduler: %v", err)
+	}
+	if err := AddGlobalProvider(ProviderConfig{Name: "new-provider", APIKey: "new-key"}); err != nil {
+		t.Fatalf("AddGlobalProvider known scheduler: %v", err)
+	}
+	if _, err := EnableWebAdmin("mgmt-token", "bridge-token"); err != nil {
+		t.Fatalf("EnableWebAdmin known scheduler: %v", err)
+	}
+}
+
+func configWithKnownScheduler() string {
+	return `[[projects]]
+name = "demo"
+[projects.agent]
+type = "claudecode"
+[projects.agent.options]
+mode = "default"
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "test-token"
+[projects.scheduler]
+type = "project"
+max_waiting = 10
+waiting_ttl_mins = 360
+max_turn_time_mins = 30
+`
+}
+
+func configWithUnknownSchedulerKey() string {
+	return `[[projects]]
+name = "demo"
+[projects.agent]
+type = "claudecode"
+[projects.agent.options]
+mode = "default"
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "test-token"
+[projects.scheduler]
+type = "project"
+future_limit = 123
+`
+}
+
+func configWithUnknownSchedulerNestedTable() string {
+	return `[[projects]]
+name = "demo"
+[projects.agent]
+type = "claudecode"
+[projects.agent.options]
+mode = "default"
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "test-token"
+[projects.scheduler]
+type = "project"
+[projects.scheduler.limits]
+max_waiting = 10
+`
 }
 
 func TestSaveGlobalSettingsKeepsLegacyQueueMaxDepthConfigurable(t *testing.T) {

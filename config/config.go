@@ -675,6 +675,14 @@ type LogConfig struct {
 	Level string `toml:"level"`
 }
 
+func decodeConfigWithSchedulerStrict(data []byte, cfg *Config) error {
+	meta, err := toml.NewDecoder(bytes.NewReader(data)).Decode(cfg)
+	if err != nil {
+		return err
+	}
+	return validateSchedulerUndecodedKeys(meta)
+}
+
 // load parses, env-resolves, and wires providers in the config file but does
 // NOT validate — callers must call validate() or validatePermissive() themselves.
 func load(path string) (*Config, error) {
@@ -683,12 +691,8 @@ func load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
 	cfg := &Config{Log: LogConfig{Level: "info"}}
-	meta, err := toml.NewDecoder(bytes.NewReader(data)).Decode(cfg)
-	if err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
-	}
-	if err := validateSchedulerUndecodedKeys(meta); err != nil {
-		return nil, err
 	}
 	resolveEnvInConfig(cfg)
 	if cfg.DataDir == "" {
@@ -1372,7 +1376,7 @@ func SaveProviderModel(projectName, providerName, model string) error {
 	}
 	raw := string(data)
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 
@@ -1461,7 +1465,7 @@ func AddProviderToConfig(projectName string, provider ProviderConfig) error {
 		return fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 
@@ -1498,7 +1502,7 @@ func RemoveProviderFromConfig(projectName, providerName string) error {
 		return fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 
@@ -1689,7 +1693,7 @@ func loadLocked() (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	return cfg, nil
@@ -1820,7 +1824,7 @@ func ListProjects() ([]string, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	var names []string
@@ -1842,7 +1846,7 @@ func AddCommand(cmd CommandConfig) error {
 		return fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 	for _, c := range cfg.Commands {
@@ -1866,7 +1870,7 @@ func RemoveCommand(name string) error {
 		return fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 	found := false
@@ -1897,7 +1901,7 @@ func AddAlias(alias AliasConfig) error {
 		return fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 	for i, a := range cfg.Aliases {
@@ -1922,7 +1926,7 @@ func RemoveAlias(name string) error {
 		return fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 	found := false
@@ -1992,7 +1996,7 @@ func GetProjectProviders(projectName string) ([]ProviderConfig, string, error) {
 		return nil, "", fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return nil, "", fmt.Errorf("parse config: %w", err)
 	}
 	for _, p := range cfg.Projects {
@@ -2072,7 +2076,7 @@ func EnsureProjectWithFeishuPlatform(opts EnsureProjectWithFeishuOptions) (*Ensu
 	}
 	raw := string(data)
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
@@ -2195,7 +2199,7 @@ func SaveFeishuPlatformCredentials(opts FeishuCredentialUpdateOptions) (*FeishuC
 	}
 	raw := string(data)
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
@@ -2442,7 +2446,7 @@ func EnsureProjectWithWeixinPlatform(opts EnsureProjectWithWeixinOptions) (*Ensu
 	}
 	raw := string(data)
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
@@ -2559,7 +2563,7 @@ func SaveWeixinPlatformCredentials(opts WeixinCredentialUpdateOptions) (*WeixinC
 	}
 	raw := string(data)
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
@@ -2730,7 +2734,7 @@ func EnsureProjectWithYuanbaoPlatform(opts EnsureProjectWithYuanbaoOptions) (*En
 	}
 	raw := string(data)
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
@@ -2869,7 +2873,7 @@ func SaveYuanbaoPlatformCredentials(opts YuanbaoCredentialUpdateOptions) (*Yuanb
 	}
 	raw := string(data)
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
@@ -3086,7 +3090,7 @@ func patchProjectAgentOption(projectName, key, value string) error {
 	}
 	raw := string(data)
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 
@@ -3547,7 +3551,7 @@ func SaveProjectSettings(projectName string, update ProjectSettingsUpdate) error
 		return fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 
@@ -3696,7 +3700,7 @@ func GetProjectConfigDetails(projectName string) map[string]any {
 		return nil
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return nil
 	}
 	for _, p := range cfg.Projects {
@@ -3761,7 +3765,7 @@ func SaveProviderRefs(projectName string, refs []string) error {
 		return fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 	for i := range cfg.Projects {
@@ -3785,7 +3789,7 @@ func RemoveProject(projectName string) error {
 		return fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 	found := false
@@ -3816,7 +3820,7 @@ func AddPlatformToProject(projectName string, platform PlatformConfig, workDir, 
 		return fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 	if platform.Options == nil {
@@ -3884,7 +3888,7 @@ func FormatConfigFile(path string) error {
 		return fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return fmt.Errorf("invalid TOML: %w", err)
 	}
 	formatted := formatTOML(string(data))
@@ -3924,7 +3928,7 @@ func GetGlobalSettings() map[string]any {
 		return nil
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return nil
 	}
 	result := map[string]any{
@@ -4028,7 +4032,7 @@ func SaveGlobalSettings(u GlobalSettingsUpdate) error {
 		return fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 	if u.Language != nil {
@@ -4098,7 +4102,7 @@ func EnableWebAdmin(mgmtToken, bridgeToken string) (*WebSetupResult, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	if err := decodeConfigWithSchedulerStrict(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
