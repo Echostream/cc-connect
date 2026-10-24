@@ -489,6 +489,12 @@ type Engine struct {
 	// Interactive agent session management
 	interactiveMu     sync.Mutex
 	interactiveStates map[string]*interactiveState // key = sessionKey
+	// agentStartSem serializes the per-start mutable Agent snapshot transaction
+	// (SetSessionEnv/SetPlatformPrompt/provider restore/ValidateSessionID/StartSession)
+	// without holding interactiveMu. This preserves existing Agent implementations
+	// that store per-start options on the Agent object before StartSession snapshots
+	// them, while keeping active-state lookups and /stop unblocked by slow starts.
+	agentStartSem chan struct{}
 
 	// Teardown tracking. A session's state is removed from interactiveStates
 	// as soon as /stop is issued, but its OS process can live on for up to
@@ -557,9 +563,29 @@ type queuedMessage struct {
 	userMessageTimeMs int64  // Feishu create_time ms (optional); see Message.UserMessageTimeMs
 }
 
+type interactiveStart struct {
+	done   chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu        sync.Mutex
+	result    *interactiveStartResult
+	cancelled bool
+	doneOnce  sync.Once
+}
+
+type interactiveStartResult struct {
+	agentSession AgentSession
+	err          error
+	isResume     bool
+	elapsed      time.Duration
+	agentName    string
+}
+
 // interactiveState tracks a running interactive agent session and its permission state.
 type interactiveState struct {
 	agentSession AgentSession
+	starting     *interactiveStart
 	// busySession is the core.Session whose busy lock guards the in-flight
 	// turn. Set by getOrCreateInteractiveStateWith so /stop can release the
 	// lock after tearing the turn down (#1830).
@@ -613,6 +639,34 @@ type interactiveState struct {
 // latestUserMessageWatermarkLocked returns the highest UserMessageTimeMs among
 // completed turns, the in-flight turn, and queued messages for this session.
 // state.mu must be held by the caller.
+func (s *interactiveStart) setResult(result *interactiveStartResult) {
+	s.mu.Lock()
+	s.result = result
+	s.mu.Unlock()
+}
+
+func (s *interactiveStart) finish() {
+	s.doneOnce.Do(func() { close(s.done) })
+}
+
+func (s *interactiveStart) markCancelled() {
+	s.mu.Lock()
+	s.cancelled = true
+	cancel := s.cancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *interactiveStart) isCancelled() bool {
+	s.mu.Lock()
+	cancelled := s.cancelled
+	ctx := s.ctx
+	s.mu.Unlock()
+	return cancelled || (ctx != nil && ctx.Err() != nil)
+}
+
 func latestUserMessageWatermarkLocked(state *interactiveState) int64 {
 	if state == nil {
 		return 0
@@ -842,6 +896,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		skills:                NewSkillRegistry(),
 		aliases:               make(map[string]string),
 		interactiveStates:     make(map[string]*interactiveState),
+		agentStartSem:         make(chan struct{}, 1),
 		closingSessions:       make(map[string]chan struct{}),
 		unsafeResume:          make(map[string]bool),
 		unsafeResumeTokens:    make(map[string]uint64),
@@ -2663,11 +2718,11 @@ func (e *Engine) Stop() error {
 	}
 
 	var errs []error
+	stopTimeout := e.projectSchedulerStopTimeout
+	if stopTimeout <= 0 {
+		stopTimeout = 10 * time.Second
+	}
 	if e.projectScheduler != nil {
-		stopTimeout := e.projectSchedulerStopTimeout
-		if stopTimeout <= 0 {
-			stopTimeout = 10 * time.Second
-		}
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), stopTimeout)
 		e.projectScheduler.Stop(stopCtx)
 		if err := stopCtx.Err(); err != nil {
@@ -2692,9 +2747,27 @@ func (e *Engine) Stop() error {
 	e.interactiveMu.Unlock()
 
 	for key, state := range states {
-		if state.agentSession != nil {
+		if state == nil {
+			continue
+		}
+		state.mu.Lock()
+		start := state.starting
+		agentSession := state.agentSession
+		state.starting = nil
+		state.agentSession = nil
+		state.mu.Unlock()
+		state.markStopped()
+		if start != nil {
+			start.markCancelled()
+			select {
+			case <-start.done:
+			case <-time.After(stopTimeout):
+				errs = append(errs, fmt.Errorf("interactive start stop timeout for %s", key))
+			}
+		}
+		if agentSession != nil {
 			slog.Debug("engine.Stop: closing agent session", "session", key)
-			state.agentSession.Close()
+			agentSession.Close()
 		}
 	}
 
@@ -3910,6 +3983,13 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 		return false
 	}
 found:
+	state.mu.Lock()
+	agentSession := state.agentSession
+	state.mu.Unlock()
+	if agentSession == nil {
+		slog.Warn("dropping pending permission response while agent session is not ready", "session", msg.SessionKey)
+		return true
+	}
 
 	// AskUserQuestion: interpret user response as an answer, not a permission decision
 	if len(pending.Questions) > 0 {
@@ -3941,7 +4021,7 @@ found:
 		// All questions answered — build response and resolve
 		updatedInput := buildAskQuestionResponse(pending.ToolInput, pending.Questions, pending.Answers)
 
-		if err := state.agentSession.RespondPermission(pending.RequestID, PermissionResult{
+		if err := agentSession.RespondPermission(pending.RequestID, PermissionResult{
 			Behavior:     "allow",
 			UpdatedInput: updatedInput,
 		}); err != nil {
@@ -3965,7 +4045,7 @@ found:
 		state.approveAll = true
 		state.mu.Unlock()
 
-		if err := state.agentSession.RespondPermission(pending.RequestID, PermissionResult{
+		if err := agentSession.RespondPermission(pending.RequestID, PermissionResult{
 			Behavior:     "allow",
 			UpdatedInput: pending.ToolInput,
 		}); err != nil {
@@ -3975,7 +4055,7 @@ found:
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPermissionApproveAll))
 		}
 	} else if isAllowResponse(lower) {
-		if err := state.agentSession.RespondPermission(pending.RequestID, PermissionResult{
+		if err := agentSession.RespondPermission(pending.RequestID, PermissionResult{
 			Behavior:     "allow",
 			UpdatedInput: pending.ToolInput,
 		}); err != nil {
@@ -3985,7 +4065,7 @@ found:
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPermissionAllowed))
 		}
 	} else if isDenyResponse(lower) {
-		if err := state.agentSession.RespondPermission(pending.RequestID, PermissionResult{
+		if err := agentSession.RespondPermission(pending.RequestID, PermissionResult{
 			Behavior: "deny",
 			Message:  "User denied this tool use.",
 		}); err != nil {
@@ -4274,6 +4354,9 @@ func (e *Engine) processInteractiveMessageWithContext(runCtx context.Context, p 
 		agentOverride = agent
 	}
 	state := e.getOrCreateInteractiveStateWithContext(runCtx, interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey)
+	if runCtx.Err() != nil || e.ctx.Err() != nil {
+		return
+	}
 
 	// Set workspaceDir on the state for idle reaper identification
 	if workspaceDir != "" {
@@ -4357,6 +4440,10 @@ func (e *Engine) processInteractiveMessageWithContext(runCtx context.Context, p 
 	images, files, releaseAttachments, err := e.activeTurnAttachments(msg)
 	if err != nil {
 		return attachmentFailureTaskResult(e.replyAttachmentFailure(p, msg.ReplyCtx))
+	}
+	if runCtx.Err() != nil || e.ctx.Err() != nil {
+		releaseAttachments()
+		return
 	}
 
 	sendStart := time.Now()
@@ -4574,62 +4661,129 @@ func (e *Engine) getOrCreateInteractiveStateWithContext(runCtx context.Context, 
 	if runCtx == nil {
 		runCtx = context.Background()
 	}
-	// /stop removes the state from the map immediately but tears the process
-	// down in the background. Wait that teardown out *before* taking the lock:
-	// spawning now would start a second process on the same agent session ID
-	// while the first one is still alive and writing to the same transcript.
 	closeSettled := e.awaitSessionClose(sessionKey)
 
-	e.interactiveMu.Lock()
-	defer e.interactiveMu.Unlock()
+	for {
+		e.interactiveMu.Lock()
+		state, ok := e.interactiveStates[sessionKey]
+		if ok && state != nil && state.agentSession != nil && state.agentSession.Alive() {
+			wantID := session.GetAgentSessionID()
+			currentID := state.agentSession.CurrentSessionID()
+			needRecycle := currentID != "" && (wantID == "" || wantID != currentID)
+			if !needRecycle {
+				state.mu.Lock()
+				state.busySession = session
+				state.mu.Unlock()
+				e.interactiveMu.Unlock()
+				return state
+			}
 
-	state, ok := e.interactiveStates[sessionKey]
-	if ok && state.agentSession != nil && state.agentSession.Alive() {
-		// Verify the running agent session matches the current active session.
-		// After /new or /switch the active session changes, but the old agent
-		// process may still be alive. Reusing it would send messages to the
-		// wrong conversation context.
-		wantID := session.GetAgentSessionID()
-		currentID := state.agentSession.CurrentSessionID()
-		// Reuse only when the live process matches what the Session expects:
-		// - IDs match (same Claude session), or
-		// - the process has not reported an ID yet (startup; empty want is OK).
-		// If wantID is empty (/new, cleared session) but the process already has
-		// a concrete ID, reusing would keep --resume context — recycle (#238).
-		needRecycle := currentID != "" && (wantID == "" || wantID != currentID)
-		if !needRecycle {
-			state.mu.Lock()
-			state.busySession = session
-			state.mu.Unlock()
-			return state
+			slog.Info("interactive session mismatch, recycling",
+				"session_key", sessionKey,
+				"want_agent_session", wantID,
+				"have_agent_session", currentID,
+			)
+			e.stopUnsolicitedReader(state)
+			state.markStopped()
+			agentSession := state.agentSession
+			closePlatform := state.platform
+			closeReplyCtx := state.replyCtx
+			state.agentSession = nil
+			delete(e.interactiveStates, sessionKey)
+			e.interactiveMu.Unlock()
+			e.closeAgentSessionWithTimeout(sessionKey, agentSession, closePlatform, closeReplyCtx)
+			closeSettled = e.awaitSessionClose(sessionKey)
+			continue
 		}
-		// Tear down the stale agent so we start one that matches the Session below.
-		slog.Info("interactive session mismatch, recycling",
-			"session_key", sessionKey,
-			"want_agent_session", wantID,
-			"have_agent_session", currentID,
-		)
-		e.stopUnsolicitedReader(state)
-		state.markStopped()
-		// Close synchronously to prevent race condition where old agent
-		// continues outputting while new agent starts (issue #327).
-		e.closeAgentSessionWithTimeout(sessionKey, state.agentSession, state.platform, state.replyCtx)
-		delete(e.interactiveStates, sessionKey)
-		ok = false // prevent reading stale settings below
+
+		if ok && state != nil && state.starting != nil {
+			start := state.starting
+			e.interactiveMu.Unlock()
+			return e.waitInteractiveStart(runCtx, sessionKey, state, start)
+		}
+
+		agent := e.agent
+		if agentOverride != nil {
+			agent = agentOverride
+		}
+		ccKey := sessionKey
+		if ccSessionKey != "" {
+			ccKey = ccSessionKey
+		}
+
+		startCtx, cancel := context.WithCancel(runCtx)
+		start := &interactiveStart{done: make(chan struct{}), ctx: startCtx, cancel: cancel}
+		newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true, busySession: session, starting: start}
+		adoptPendingFromPlaceholder(state, newState)
+		e.interactiveStates[sessionKey] = newState
+		e.interactiveMu.Unlock()
+
+		result := e.runInteractiveStart(startCtx, sessionKey, ccKey, closeSettled, p, replyCtx, session, sessions, agent)
+		start.setResult(result)
+		return e.finishInteractiveStart(sessionKey, newState, start, result, session, sessions, p)
+	}
+}
+
+func (e *Engine) waitInteractiveStart(runCtx context.Context, sessionKey string, state *interactiveState, start *interactiveStart) *interactiveState {
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
+	select {
+	case <-start.done:
+		e.interactiveMu.Lock()
+		current := e.interactiveStates[sessionKey]
+		e.interactiveMu.Unlock()
+		if current != nil {
+			return current
+		}
+		return state
+	case <-runCtx.Done():
+		return state
+	}
+}
+
+func (e *Engine) acquireAgentStart(ctx context.Context) error {
+	if e.agentStartSem == nil {
+		e.agentStartSem = make(chan struct{}, 1)
+	}
+	select {
+	case e.agentStartSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *Engine) releaseAgentStart() {
+	if e.agentStartSem == nil {
+		return
+	}
+	select {
+	case <-e.agentStartSem:
+	default:
+	}
+}
+
+func contextErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
+}
+
+func isContextCancellation(err error, ctx context.Context) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || contextErr(ctx) != nil
+}
+
+func (e *Engine) runInteractiveStart(startCtx context.Context, sessionKey, ccKey string, closeSettled bool, p Platform, replyCtx any, session *Session, sessions *SessionManager, agent Agent) *interactiveStartResult {
+	if err := e.acquireAgentStart(startCtx); err != nil {
+		return &interactiveStartResult{err: err, agentName: agent.Name()}
+	}
+	defer e.releaseAgentStart()
+	if err := contextErr(startCtx); err != nil {
+		return &interactiveStartResult{err: err, agentName: agent.Name()}
 	}
 
-	// Select the agent to use for this session
-	agent := e.agent
-	if agentOverride != nil {
-		agent = agentOverride
-	}
-
-	ccKey := sessionKey
-	if ccSessionKey != "" {
-		ccKey = ccSessionKey
-	}
-
-	// Inject per-session env vars so the agent subprocess can call `cc-connect cron add` etc.
 	if inj, ok := agent.(SessionEnvInjector); ok {
 		envVars := []string{
 			"CC_PROJECT=" + e.name,
@@ -4646,88 +4800,78 @@ func (e *Engine) getOrCreateInteractiveStateWithContext(runCtx context.Context, 
 				envVars = append(envVars, "PATH="+binDir)
 			}
 		}
+		if err := contextErr(startCtx); err != nil {
+			return &interactiveStartResult{err: err, agentName: agent.Name()}
+		}
 		inj.SetSessionEnv(envVars)
 	}
+	if err := contextErr(startCtx); err != nil {
+		return &interactiveStartResult{err: err, agentName: agent.Name()}
+	}
 
-	// Inject platform-specific formatting instructions into the agent's system prompt.
-	// Clear the prompt first so instructions from a previous platform don't leak
-	// into sessions for platforms that don't provide their own instructions.
 	if ppi, ok := agent.(PlatformPromptInjector); ok {
 		prompt := ""
 		if fip, ok := p.(FormattingInstructionProvider); ok {
 			prompt = fip.FormattingInstructions()
 		}
+		if err := contextErr(startCtx); err != nil {
+			return &interactiveStartResult{err: err, agentName: agent.Name()}
+		}
 		ppi.SetPlatformPrompt(prompt)
 	}
 
-	// Check if context is already canceled (e.g. during shutdown/restart)
 	if e.ctx.Err() != nil {
 		slog.Debug("skipping session start: context canceled", "session_key", sessionKey)
-		newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true, busySession: session}
-		adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
-		state = newState
-		e.interactiveStates[sessionKey] = state
-		return state
+		return &interactiveStartResult{err: e.ctx.Err(), agentName: agent.Name()}
+	}
+	if err := contextErr(startCtx); err != nil {
+		return &interactiveStartResult{err: err, agentName: agent.Name()}
 	}
 
-	// Restore the agent's active provider from the session before starting a
-	// new sub-process. The provider choice is persisted to disk by
-	// `/provider switch`; without restoring it here, a cc-connect process
-	// restart silently drops the user's choice while keeping the resumed
-	// agent_session_id, producing "model X does not exist" errors when
-	// the model name is sent to the wrong base_url
-	// (cc-connect internal task t-20260614-qp7xnl).
 	restoreActiveProviderFromSession(agent, session)
+	if err := contextErr(startCtx); err != nil {
+		return &interactiveStartResult{err: err, agentName: agent.Name()}
+	}
 
-	// Resume only when we have a concrete saved agent session ID. If the session
-	// is unbound, force a fresh start instead of attaching to whichever CLI
-	// conversation happens to be "latest" in this workspace.
 	startSessionID := session.GetAgentSessionID()
-	// Cross-project session leakage guard (issue #599): if a session ID was
-	// inherited from a different project's workspace (e.g. another
-	// cc-connect project that happens to share a Session row), the agent
-	// can detect the mismatch and we should clear the ID rather than
-	// resume a conversation that has nothing to do with this project.
 	if startSessionID != "" {
-		if validator, ok := agent.(SessionIDValidator); ok && !validator.ValidateSessionID(runCtx, startSessionID) {
-			slog.Warn("session ID does not belong to this project, clearing it",
-				"session_key", sessionKey, "invalid_session_id", startSessionID)
-			session.SetAgentSessionID("", agent.Name())
-			sessions.Save()
-			startSessionID = ""
+		if validator, ok := agent.(SessionIDValidator); ok {
+			valid := validator.ValidateSessionID(startCtx, startSessionID)
+			if err := contextErr(startCtx); err != nil {
+				return &interactiveStartResult{err: err, agentName: agent.Name()}
+			}
+			if !valid {
+				slog.Warn("session ID does not belong to this project, clearing it",
+					"session_key", sessionKey, "invalid_session_id", startSessionID)
+				session.SetAgentSessionID("", agent.Name())
+				sessions.Save()
+				startSessionID = ""
+			}
 		}
 	}
-	// Refuse to resume when the previous process could not be confirmed dead
-	// (close reported a kill failure, timed out, or we gave up waiting for it).
-	// Starting fresh loses this conversation's history, but resuming would put
-	// two live agents on one transcript — both replying, both calling tools.
 	if startSessionID != "" && (!closeSettled || e.peekUnsafeResume(sessionKey)) {
 		slog.Warn("previous agent process not confirmed dead; refusing to start a new agent",
 			"session_key", sessionKey, "retained_session_id", startSessionID)
 		e.send(p, replyCtx, e.i18n.T(MsgSessionResumeUnsafe))
-		newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true, busySession: session}
-		adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
-		state = newState
-		e.interactiveStates[sessionKey] = state
-		return state
+		return &interactiveStartResult{err: fmt.Errorf("previous agent process not confirmed dead"), agentName: agent.Name()}
 	}
 
 	isResume := startSessionID != ""
 	startAt := time.Now()
-	agentSession, err := agent.StartSession(runCtx, startSessionID)
+	agentSession, err := agent.StartSession(startCtx, startSessionID)
 	startElapsed := time.Since(startAt)
 	if err != nil {
-		// If resume/continue failed, try a fresh session as fallback.
+		if isContextCancellation(err, startCtx) {
+			return &interactiveStartResult{err: err, elapsed: startElapsed, agentName: agent.Name()}
+		}
 		if startSessionID != "" {
 			slog.Error("session resume failed, falling back to fresh session",
 				"session_key", sessionKey, "failed_session_id", startSessionID,
 				"error", err, "elapsed", startElapsed)
-			// Clear the stale session ID so CompareAndSetAgentSessionID can
-			// write the new ID, matching the relay fallback at line 12640.
 			session.SetAgentSessionID("", agent.Name())
 			sessions.Save()
 			startAt = time.Now()
-			agentSession, err = agent.StartSession(runCtx, "")
+			agentSession, err = agent.StartSession(startCtx, "")
 			startElapsed = time.Since(startAt)
 			if err == nil {
 				slog.Info("fresh session started after resume failure",
@@ -4736,39 +4880,80 @@ func (e *Engine) getOrCreateInteractiveStateWithContext(runCtx context.Context, 
 		}
 		if err != nil {
 			slog.Error("failed to start interactive session", "error", err, "elapsed", startElapsed)
-			e.hooks.Emit(HookEvent{
-				Event:      HookEventError,
-				SessionKey: sessionKey,
-				Platform:   p.Name(),
-				Error:      fmt.Sprintf("failed to start session: %v", err),
-			})
-			newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true, busySession: session}
-			adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
-			state = newState
-			e.interactiveStates[sessionKey] = state
-			return state
+			return &interactiveStartResult{err: err, elapsed: startElapsed, agentName: agent.Name()}
 		}
 	}
 	if startElapsed >= slowAgentStart {
 		slog.Warn("slow agent session start", "elapsed", startElapsed, "agent", agent.Name(), "session_id", startSessionID)
 	}
 
-	// Surface any startup warning (e.g. permission mode downgrade under root) to the IM user.
+	return &interactiveStartResult{agentSession: agentSession, err: nil, isResume: isResume, elapsed: startElapsed, agentName: agent.Name()}
+}
+
+func (e *Engine) finishInteractiveStart(sessionKey string, state *interactiveState, start *interactiveStart, result *interactiveStartResult, session *Session, sessions *SessionManager, p Platform) *interactiveState {
+	if result == nil {
+		result = &interactiveStartResult{err: fmt.Errorf("missing start result")}
+	}
+
+	shouldPublish := result.err == nil && result.agentSession != nil && !start.isCancelled()
+	var finishLateClose func()
+
+	e.interactiveMu.Lock()
+	current := e.interactiveStates[sessionKey]
+	state.mu.Lock()
+	if current != state || state.starting != start {
+		// Engine.Stop 可能已删除 map 中的 placeholder；这条窗口依赖 engine ctx 的
+		// shutdown gate 阻止新 Start，不声称由提前注册的 close barrier 保护。
+		// late Start 真正返回到这里后，仍会在释放锁前补注册 close barrier。
+		shouldPublish = false
+	} else if !shouldPublish {
+		if result.agentSession != nil {
+			finishLateClose = e.beginSessionClose(sessionKey)
+		}
+		state.starting = nil
+		delete(e.interactiveStates, sessionKey)
+	}
+	if !shouldPublish && result.agentSession != nil && finishLateClose == nil {
+		finishLateClose = e.beginSessionClose(sessionKey)
+	}
+	if shouldPublish {
+		state.agentSession = result.agentSession
+		state.starting = nil
+		state.busySession = session
+		state.platform = p
+		state.eventsNeedResync = true
+	}
+	state.mu.Unlock()
+	e.interactiveMu.Unlock()
+
+	if !shouldPublish {
+		if result.agentSession != nil {
+			e.closeLateStartedSessionUntilConfirmed(sessionKey, result.agentSession, state.platform, state.replyCtx, finishLateClose)
+		}
+		if result.err != nil {
+			e.notifyDroppedQueuedMessages(state, result.err)
+			e.hooks.Emit(HookEvent{
+				Event:      HookEventError,
+				SessionKey: sessionKey,
+				Platform:   p.Name(),
+				Error:      fmt.Sprintf("failed to start session: %v", result.err),
+			})
+		}
+		start.finish()
+		return state
+	}
+
+	agentSession := result.agentSession
 	if warner, ok := agentSession.(StartupWarner); ok {
 		if msg := warner.StartupWarning(); msg != "" {
-			e.send(p, replyCtx, msg)
+			e.send(p, state.replyCtx, msg)
 		}
 	}
 
 	if newID := agentSession.CurrentSessionID(); newID != "" {
-		// Track the latest session ID Claude reports. Each --resume forks a new
-		// session_id, so the stored ID must follow the live process or a later
-		// resume (after /stop or /model) would target a stale node and lose
-		// context. Session naming binds only on first assignment to avoid
-		// polluting sessionNames with every forked ID.
 		wasEmpty := session.GetAgentSessionID() == ""
 		if session.GetAgentSessionID() != newID {
-			session.SetAgentSessionID(newID, agent.Name())
+			session.SetAgentSessionID(newID, result.agentName)
 			if wasEmpty {
 				pendingName := session.GetName()
 				if pendingName != "" && pendingName != "session" && pendingName != "default" {
@@ -4779,19 +4964,7 @@ func (e *Engine) getOrCreateInteractiveStateWithContext(runCtx context.Context, 
 		}
 	}
 
-	newState := &interactiveState{
-		agentSession:     agentSession,
-		busySession:      session,
-		platform:         p,
-		replyCtx:         replyCtx,
-		agent:            agent,
-		eventsNeedResync: true,
-	}
-	adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
-	state = newState
-	e.interactiveStates[sessionKey] = state
-
-	slog.Info("session spawned", "session_key", sessionKey, "agent_session", session.GetAgentSessionID(), "is_resume", isResume, "elapsed", startElapsed)
+	slog.Info("session spawned", "session_key", sessionKey, "agent_session", session.GetAgentSessionID(), "is_resume", result.isResume, "elapsed", result.elapsed)
 
 	e.hooks.Emit(HookEvent{
 		Event:      HookEventSessionStarted,
@@ -4799,10 +4972,11 @@ func (e *Engine) getOrCreateInteractiveStateWithContext(runCtx context.Context, 
 		Platform:   p.Name(),
 		Extra: map[string]any{
 			"agent_session_id": session.GetAgentSessionID(),
-			"is_resume":        isResume,
+			"is_resume":        result.isResume,
 		},
 	})
 
+	start.finish()
 	return state
 }
 
@@ -4826,12 +5000,15 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 	// Capture the agent session and nil it out atomically to prevent a
 	// concurrent cleanup (without expected) from closing the same session.
 	var agentSession AgentSession
+	var start *interactiveStart
 	var closePlatform Platform
 	var closeReplyCtx any
 	if ok && state != nil {
 		state.mu.Lock()
 		agentSession = state.agentSession
 		state.agentSession = nil
+		start = state.starting
+		state.starting = nil
 		closePlatform = state.platform
 		closeReplyCtx = state.replyCtx
 		if state.agentSessionIdleCancel != nil {
@@ -4848,6 +5025,9 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 		e.stopUnsolicitedReader(state)
 
 		state.markStopped()
+		if start != nil {
+			start.markCancelled()
+		}
 
 		// Resolve any pending permission so the reader goroutine (or event
 		// loop) does not block on <-pending.Resolved forever.
@@ -4881,6 +5061,67 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 	}
 	delete(e.interactiveStates, sessionKey)
 	e.interactiveMu.Unlock()
+}
+
+// closeLateStartedSessionUntilConfirmed 只用于“starting 已被取消，但底层 StartSession 迟到成功”的会话。
+// 它刻意不同于普通 live session close：普通 close 可以在 Engine 停机时随 e.ctx 收敛；
+// late-start close 则必须拿到 Close() == nil 才能证明迟到进程已真实退出。e.ctx.Done()
+// 只能说明 supervisor 正在停机，不能证明 agent 子进程已死，因此这里不能用 ctx done 释放
+// close registration、start.done 或 ProjectScheduler active slot。
+func (e *Engine) closeLateStartedSessionUntilConfirmed(sessionKey string, agentSession AgentSession, platform Platform, replyCtx any, finish func()) {
+	if agentSession == nil {
+		if finish != nil {
+			finish()
+		}
+		return
+	}
+	if finish == nil {
+		finish = e.beginSessionClose(sessionKey)
+	}
+	closeStart := time.Now()
+	timeout := e.closeAgentSessionTimeout()
+	errCh := make(chan error, 1)
+	go func() { errCh <- agentSession.Close() }()
+	for {
+		select {
+		case closeErr := <-errCh:
+			if closeErr == nil {
+				e.clearUnsafeResume(sessionKey)
+				if elapsed := time.Since(closeStart); elapsed >= slowAgentClose {
+					slog.Warn("slow late-start agent session close", "elapsed", elapsed, "session", sessionKey)
+				}
+				finish()
+				return
+			}
+			slog.Error("late-start agent session close reported failure, process may still be running",
+				"session", sessionKey, "error", closeErr)
+			e.markUnsafeResume(sessionKey)
+			e.notifySessionCloseFailure(sessionKey, platform, replyCtx, closeErr)
+			// 故意常驻到进程退出：Close error 不是退出证明，不能自动重试或关闭 start.done。
+			select {}
+		case <-time.After(timeout):
+			slog.Error("late-start agent session close timed out; waiting for real close confirmation before settling start",
+				"timeout", timeout, "session", sessionKey)
+			token := e.markUnsafeResume(sessionKey)
+			e.notifySessionCloseFailure(sessionKey, platform, replyCtx,
+				fmt.Errorf("did not respond within %s", timeout))
+			closeErr := <-errCh
+			if closeErr == nil {
+				e.clearUnsafeResumeIfToken(sessionKey, token)
+				if elapsed := time.Since(closeStart); elapsed >= slowAgentClose {
+					slog.Warn("slow late-start agent session close", "elapsed", elapsed, "session", sessionKey)
+				}
+				finish()
+				return
+			}
+			slog.Error("late-start agent session close reported failure after timeout, process may still be running",
+				"session", sessionKey, "error", closeErr)
+			e.markUnsafeResume(sessionKey)
+			e.notifySessionCloseFailure(sessionKey, platform, replyCtx, closeErr)
+			// 故意常驻到进程退出：Close error 不是退出证明，不能自动重试或关闭 start.done。
+			select {}
+		}
+	}
 }
 
 func (e *Engine) cancelAgentSessionIdleClose(state *interactiveState) {
@@ -11232,9 +11473,32 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 	pending := state.pending
 	state.pending = nil
 	agentSession := state.agentSession
+	start := state.starting
 	closePlatform := state.platform
 	closeReplyCtx := state.replyCtx
 	state.mu.Unlock()
+
+	if start != nil && agentSession == nil {
+		start.markCancelled()
+		state.markStopped()
+		e.interactiveMu.Unlock()
+
+		if pending != nil {
+			pending.resolve()
+		}
+		if notifyQueued {
+			e.notifyDroppedQueuedMessages(state, fmt.Errorf("session reset"))
+		} else {
+			state.mu.Lock()
+			state.pendingMessages = nil
+			state.mu.Unlock()
+		}
+		e.hooks.Emit(HookEvent{
+			Event:      HookEventSessionEnded,
+			SessionKey: sessionKey,
+		})
+		return true
+	}
 
 	// If the agent session supports graceful turn cancellation (e.g. ACP),
 	// send a cancel notification and keep the session alive for the next

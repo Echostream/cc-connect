@@ -248,6 +248,7 @@ func TestAgentSessionBypassStaticGate(t *testing.T) {
 func projectAgentBypassViolations(fset *token.FileSet, files []*ast.File, info *types.Info, parents map[ast.Node]ast.Node) []string {
 	allowedStart := map[string]bool{
 		"getOrCreateInteractiveStateWithContext": true,
+		"runInteractiveStart":                    true,
 		"runRelayProjectTask":                    true,
 	}
 	allowedAgentSend := map[string]bool{
@@ -302,7 +303,8 @@ func projectAgentBypassViolations(fset *token.FileSet, files []*ast.File, info *
 				start := obj.Name() == "StartSession" && isStartSessionSignature(obj.Type())
 				send := obj.Name() == "Send" && isAgentSessionSendSignature(obj.Type())
 				runner := isProjectAgentRunnerMethod(selection)
-				if !start && !send && !runner {
+				interactiveStart := isEngineMethod(selection, "runInteractiveStart")
+				if !start && !send && !runner && !interactiveStart {
 					return true
 				}
 				pos := fset.Position(sel.Pos()).String()
@@ -313,6 +315,9 @@ func projectAgentBypassViolations(fset *token.FileSet, files []*ast.File, info *
 				}
 				if start && !allowedStart[fn.Name.Name] {
 					violations = append(violations, fmt.Sprintf("%s: %s calls Agent.StartSession", pos, fn.Name.Name))
+				}
+				if interactiveStart && (fn.Name.Name != "getOrCreateInteractiveStateWithContext" || !isSynchronousFunctionBody(call, fn, parents)) {
+					violations = append(violations, fmt.Sprintf("%s: %s calls runInteractiveStart outside reviewed synchronous start owner", pos, fn.Name.Name))
 				}
 				if send && !allowedAgentSend[fn.Name.Name] {
 					violations = append(violations, fmt.Sprintf("%s: %s calls AgentSession.Send", pos, fn.Name.Name))
@@ -349,6 +354,13 @@ func isProjectAgentRunnerMethod(selection *types.Selection) bool {
 	switch selection.Obj().Name() {
 	case "processInteractiveMessage", "processInteractiveMessageWith", "processInteractiveMessageWithContext", "runRelayProjectTask", "runCompress":
 	default:
+		return false
+	}
+	return isEngineMethod(selection, selection.Obj().Name())
+}
+
+func isEngineMethod(selection *types.Selection, name string) bool {
+	if selection == nil || selection.Obj() == nil || selection.Obj().Name() != name {
 		return false
 	}
 	typ := selection.Recv()
@@ -776,18 +788,23 @@ type AgentSession interface { Send(string,string,[]int,[]int) error }
 type Platform interface { Send(context.Context,any,string) error }
 type Engine struct{}
 func (*Engine) processInteractiveMessageWithContext(context.Context) {}
+func (*Engine) runInteractiveStart(context.Context) {}
 `
 	cases := []struct {
 		name, body string
 		reject     bool
 	}{
 		{"sync_real_task", `func handleMessage(e *Engine) { _ = ProjectTask{Run:func(ctx context.Context) TaskResult { e.processInteractiveMessageWithContext(ctx); return TaskResult{} }} }`, false},
+		{"sync_reviewed_start_owner", `func (e *Engine) getOrCreateInteractiveStateWithContext(ctx context.Context) { e.runInteractiveStart(ctx) }`, false},
 		{"platform_send", `func good(p Platform) { _ = p.Send(context.Background(), nil, "ok") }`, false},
 		{"fake_task", `func handleMessage(e *Engine) { _ = fakeTask{Run:func(ctx context.Context) TaskResult { e.processInteractiveMessageWithContext(ctx); return TaskResult{} }} }`, true},
 		{"package_method_value", `var escaped = (*Engine).processInteractiveMessageWithContext`, true},
 		{"wrapper_method_value", `func handleMessage(e *Engine) { f := e.processInteractiveMessageWithContext; f(context.Background()) }`, true},
 		{"agent_method_value", `func runCompress(s AgentSession) { f := s.Send; _ = f("","",nil,nil) }`, true},
 		{"parameter_escape", `func forward(f func(context.Context)) {} ; func handleMessage(e *Engine) { forward(e.processInteractiveMessageWithContext) }`, true},
+		{"start_helper_outside_owner", `func handleMessage(e *Engine, ctx context.Context) { e.runInteractiveStart(ctx) }`, true},
+		{"start_helper_method_value", `func handleMessage(e *Engine) { f := e.runInteractiveStart; f(context.Background()) }`, true},
+		{"start_helper_go", `func (e *Engine) getOrCreateInteractiveStateWithContext(ctx context.Context) { go e.runInteractiveStart(ctx) }`, true},
 		{"nested_go", `func handleMessage(e *Engine) { _ = ProjectTask{Run:func(ctx context.Context) TaskResult { go func(){ e.processInteractiveMessageWithContext(ctx) }(); return TaskResult{} }} }`, true},
 		{"direct_go", `func handleMessage(e *Engine) { _ = ProjectTask{Run:func(ctx context.Context) TaskResult { go e.processInteractiveMessageWithContext(ctx); return TaskResult{} }} }`, true},
 		{"nested_defer", `func handleMessage(e *Engine) { _ = ProjectTask{Run:func(ctx context.Context) TaskResult { defer func(){ e.processInteractiveMessageWithContext(ctx) }(); return TaskResult{} }} }`, true},

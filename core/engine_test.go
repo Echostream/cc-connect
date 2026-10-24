@@ -9812,18 +9812,13 @@ func TestProcessInteractiveMessageWith_NilAgentSession_NoPanic(t *testing.T) {
 		t.Fatalf("expected MsgFailedToStartAgentSession, got %q", sent[0])
 	}
 
-	// State must still be present (cleanup did NOT run) and agentSession must
-	// still be nil — the user should be able to retry with a fresh message.
+	// Failed starts clear their placeholder so the next user message can create
+	// a fresh starting state instead of reusing a permanent agentSession-nil entry.
 	e.interactiveMu.Lock()
 	state, ok := e.interactiveStates[sessionKey]
 	e.interactiveMu.Unlock()
-	if !ok || state == nil {
-		t.Fatal("expected interactive state to remain in the map for retry")
-	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.agentSession != nil {
-		t.Fatal("expected agentSession to remain nil after failed start")
+	if ok || state != nil {
+		t.Fatalf("expected failed-start placeholder to be cleared, got %#v", state)
 	}
 }
 
