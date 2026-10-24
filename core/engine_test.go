@@ -17517,12 +17517,13 @@ func TestAbandonedLocalMutationBeginDoesNotLeakLease(t *testing.T) {
 }
 
 type attachmentLifecycleAgent struct {
-	name      string
-	workDir   string
-	startGate chan struct{}
-	mu        sync.Mutex
-	starts    int
-	sessions  []*attachmentLifecycleSession
+	name             string
+	workDir          string
+	startGate        chan struct{}
+	configureSession func(*attachmentLifecycleSession)
+	mu               sync.Mutex
+	starts           int
+	sessions         []*attachmentLifecycleSession
 }
 
 func newAttachmentLifecycleAgent(workDir string) *attachmentLifecycleAgent {
@@ -17540,6 +17541,9 @@ func (a *attachmentLifecycleAgent) StartSession(ctx context.Context, _ string) (
 		}
 	}
 	s := newAttachmentLifecycleSession()
+	if a.configureSession != nil {
+		a.configureSession(s)
+	}
 	a.mu.Lock()
 	a.starts++
 	a.sessions = append(a.sessions, s)
@@ -17565,10 +17569,11 @@ func (a *attachmentLifecycleAgent) lastSession() *attachmentLifecycleSession {
 }
 
 type attachmentLifecycleSession struct {
-	events    chan Event
-	mu        sync.Mutex
-	sends     []attachmentSendRecord
-	blockSend chan struct{}
+	events        chan Event
+	mu            sync.Mutex
+	sends         []attachmentSendRecord
+	blockSend     chan struct{}
+	onSendEntered func()
 }
 
 type attachmentSendRecord struct {
@@ -17581,6 +17586,9 @@ func newAttachmentLifecycleSession() *attachmentLifecycleSession {
 	return &attachmentLifecycleSession{events: make(chan Event, 8)}
 }
 func (s *attachmentLifecycleSession) Send(_ string, messageID string, images []ImageAttachment, files []FileAttachment) error {
+	if s.onSendEntered != nil {
+		s.onSendEntered()
+	}
 	if s.blockSend != nil {
 		<-s.blockSend
 	}
@@ -17669,23 +17677,42 @@ func TestAttachmentStageFailureDoesNotStartAgentAndRepliesOnce(t *testing.T) {
 func TestEngineStagesAttachmentsBeforeSubmitAndActiveReadAllOnly(t *testing.T) {
 	workDir := t.TempDir()
 	agent := newAttachmentLifecycleAgent(workDir)
-	agent.startGate = make(chan struct{})
+	firstSendEntered := make(chan struct{})
+	releaseFirstSend := make(chan struct{})
+	var firstSendEnteredOnce sync.Once
+	var releaseFirstSendOnce sync.Once
+	agent.configureSession = func(s *attachmentLifecycleSession) {
+		s.blockSend = releaseFirstSend
+		s.onSendEntered = func() { firstSendEnteredOnce.Do(func() { close(firstSendEntered) }) }
+	}
 	platform := &stubPlatformEngine{n: "test"}
 	clock := newFakeSchedulerClock(time.Unix(12_000, 0))
 	e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish, WithProjectScheduler(NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)))
 	t.Cleanup(func() { _ = e.Stop() })
+	t.Cleanup(func() { releaseFirstSendOnce.Do(func() { close(releaseFirstSend) }) })
 
 	first := &Message{SessionKey: "test:stage", Platform: "test", MessageID: "m1", UserID: "u", UserName: "user", Content: "first", Files: []FileAttachment{{FileName: "first.txt", MimeType: "text/plain", Data: []byte("first-bytes")}}, ReplyCtx: "r1"}
 	second := &Message{SessionKey: "test:stage", Platform: "test", MessageID: "m2", UserID: "u", UserName: "user", Content: "second", Files: []FileAttachment{{FileName: "second.txt", MimeType: "text/plain", Data: []byte("second-bytes")}}, ReplyCtx: "r2"}
 	e.handleMessage(platform, first)
 	waitAttachmentCondition(t, func() bool { return first.Staged != nil && len(first.Files) == 0 }, "first staged and raw bytes released")
+	select {
+	case <-firstSendEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first send to enter blocking gate")
+	}
 	e.handleMessage(platform, second)
 	waitAttachmentCondition(t, func() bool { return second.Staged != nil && len(second.Files) == 0 }, "second queued staged and raw bytes released")
-	if agent.startCount() != 0 {
-		t.Fatalf("agent started before gate released; waiting task must not read staged bytes early")
+	if got := agent.startCount(); got != 1 {
+		t.Fatalf("agent starts while first send is blocked = %d, want 1 active session and no queued task start", got)
+	}
+	if records := agent.lastSession().sendRecords(); len(records) != 0 {
+		t.Fatalf("send records before releasing first send = %d, want 0", len(records))
+	}
+	if _, err := os.Stat(second.Staged.Entries()[0].Path); err != nil {
+		t.Fatalf("queued staged file should still exist before active ReadAll, stat: %v", err)
 	}
 
-	close(agent.startGate)
+	releaseFirstSendOnce.Do(func() { close(releaseFirstSend) })
 	waitAttachmentCondition(t, func() bool {
 		s := agent.lastSession()
 		return s != nil && len(s.sendRecords()) >= 2

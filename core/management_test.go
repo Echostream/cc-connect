@@ -3339,7 +3339,7 @@ func TestStatusExposesCountersAndHashedKeysOnly(t *testing.T) {
 
 type fakeRawHealthPlatform struct{ stubPlatformEngine }
 
-func (p fakeRawHealthPlatform) PlatformHealth() PlatformHealthInfo {
+func (p *fakeRawHealthPlatform) PlatformHealth() PlatformHealthInfo {
 	return PlatformHealthInfo{Name: p.Name(), Connected: false, Degraded: true, DegradedReason: "CANARY-RAW-HEALTH-REASON", DegradedSince: time.Unix(123, 0)}
 }
 
