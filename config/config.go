@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -146,6 +148,43 @@ type CronConfig struct {
 // QueueConfig controls the per-session message queue.
 type QueueConfig struct {
 	MaxDepth *int `toml:"max_depth"` // max queued messages per session; default 5
+}
+
+// SchedulerType selects the per-project scheduling compatibility mode.
+type SchedulerType string
+
+const (
+	// SchedulerTypeLegacy keeps the pre-project-scheduler compatibility path.
+	SchedulerTypeLegacy SchedulerType = "legacy"
+	// SchedulerTypeProject enables the project-wide FIFO scheduler contract.
+	SchedulerTypeProject SchedulerType = "project"
+)
+
+const (
+	defaultProjectSchedulerMaxWaiting      = 10
+	defaultProjectSchedulerWaitingTTLMins  = 360
+	defaultProjectSchedulerMaxTurnTimeMins = 30
+)
+
+// SchedulerConfig is the raw [projects.scheduler] TOML subtree.
+//
+// C2.1 only parses and validates the forward-compatible schema. Runtime wiring
+// still happens in later C2 steps, so a successfully parsed legacy value here
+// must not be read as proof that the current binary executes the legacy path.
+type SchedulerConfig struct {
+	Type            SchedulerType `toml:"type,omitempty"`
+	MaxWaiting      *int          `toml:"max_waiting,omitempty"`
+	WaitingTTLMins  *int          `toml:"waiting_ttl_mins,omitempty"`
+	MaxTurnTimeMins *int          `toml:"max_turn_time_mins,omitempty"`
+}
+
+// EffectiveSchedulerConfig is the validated scheduling config with defaults
+// resolved. It deliberately does not mutate the raw SchedulerConfig pointers.
+type EffectiveSchedulerConfig struct {
+	Type            SchedulerType
+	MaxWaiting      int
+	WaitingTTLMins  int
+	MaxTurnTimeMins int
 }
 
 // WebhookConfig controls the external HTTP webhook endpoint.
@@ -561,9 +600,10 @@ type ProjectConfig struct {
 	//   [projects.display]
 	//   thinking_messages = false
 	//   tool_messages = false
-	Display    *DisplayConfig  `toml:"display,omitempty"`
-	Observe    *ObserveConfig  `toml:"observe,omitempty"`
-	References ReferenceConfig `toml:"references,omitempty"`
+	Display    *DisplayConfig   `toml:"display,omitempty"`
+	Observe    *ObserveConfig   `toml:"observe,omitempty"`
+	References ReferenceConfig  `toml:"references,omitempty"`
+	Scheduler  *SchedulerConfig `toml:"scheduler,omitempty"`
 	// FilterExternalSessions: when true, /list only shows sessions created by
 	// cc-connect, hiding sessions created by direct CLI usage in the same work_dir.
 	// Default is false (show all sessions).
@@ -643,8 +683,12 @@ func load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
 	cfg := &Config{Log: LogConfig{Level: "info"}}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	meta, err := toml.NewDecoder(bytes.NewReader(data)).Decode(cfg)
+	if err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	if err := validateSchedulerUndecodedKeys(meta); err != nil {
+		return nil, err
 	}
 	resolveEnvInConfig(cfg)
 	if cfg.DataDir == "" {
@@ -1023,13 +1067,93 @@ func (c *Config) validate() error {
 	return c.validateInternal(false)
 }
 
+// EffectiveScheduler returns the validated scheduling mode for a project.
+// It resolves Project-mode numeric defaults (10 waiting, 360 minute waiting TTL,
+// 30 minute max turn time) without writing those defaults back to the raw config.
+func EffectiveScheduler(proj *ProjectConfig) (EffectiveSchedulerConfig, error) {
+	if proj == nil || proj.Scheduler == nil {
+		return EffectiveSchedulerConfig{Type: SchedulerTypeLegacy}, nil
+	}
+	if err := validateSchedulerConfig("projects.scheduler", proj.Scheduler); err != nil {
+		return EffectiveSchedulerConfig{}, err
+	}
+	if proj.Scheduler.Type == SchedulerTypeLegacy {
+		return EffectiveSchedulerConfig{Type: SchedulerTypeLegacy}, nil
+	}
+	return EffectiveSchedulerConfig{
+		Type:            SchedulerTypeProject,
+		MaxWaiting:      schedulerValueOrDefault(proj.Scheduler.MaxWaiting, defaultProjectSchedulerMaxWaiting),
+		WaitingTTLMins:  schedulerValueOrDefault(proj.Scheduler.WaitingTTLMins, defaultProjectSchedulerWaitingTTLMins),
+		MaxTurnTimeMins: schedulerValueOrDefault(proj.Scheduler.MaxTurnTimeMins, defaultProjectSchedulerMaxTurnTimeMins),
+	}, nil
+}
+
+func schedulerValueOrDefault(value *int, fallback int) int {
+	if value == nil {
+		return fallback
+	}
+	return *value
+}
+
+func validateSchedulerUndecodedKeys(meta toml.MetaData) error {
+	for _, key := range meta.Undecoded() {
+		parts := []string(key)
+		if len(parts) >= 3 && parts[0] == "projects" && parts[1] == "scheduler" {
+			return fmt.Errorf("config: projects.scheduler.%s is not supported", strings.Join(parts[2:], "."))
+		}
+	}
+	return nil
+}
+
+func validateSchedulerConfig(prefix string, sched *SchedulerConfig) error {
+	if sched == nil {
+		return nil
+	}
+	if sched.Type == "" {
+		return fmt.Errorf("config: %s.type is required", prefix)
+	}
+	switch sched.Type {
+	case SchedulerTypeLegacy:
+		if sched.MaxWaiting != nil {
+			return fmt.Errorf("config: %s.max_waiting is only valid when type = \"project\"", prefix)
+		}
+		if sched.WaitingTTLMins != nil {
+			return fmt.Errorf("config: %s.waiting_ttl_mins is only valid when type = \"project\"", prefix)
+		}
+		if sched.MaxTurnTimeMins != nil {
+			return fmt.Errorf("config: %s.max_turn_time_mins is only valid when type = \"project\"", prefix)
+		}
+		return nil
+	case SchedulerTypeProject:
+		if err := validatePositiveSchedulerInt(prefix, "max_waiting", sched.MaxWaiting, false); err != nil {
+			return err
+		}
+		if err := validatePositiveSchedulerInt(prefix, "waiting_ttl_mins", sched.WaitingTTLMins, true); err != nil {
+			return err
+		}
+		if err := validatePositiveSchedulerInt(prefix, "max_turn_time_mins", sched.MaxTurnTimeMins, true); err != nil {
+			return err
+		}
+		return nil
+	default:
+		return fmt.Errorf("config: %s.type must be \"legacy\" or \"project\"", prefix)
+	}
+}
+
+func validatePositiveSchedulerInt(prefix, name string, value *int, checkDuration bool) error {
+	if value == nil {
+		return nil
+	}
+	if *value <= 0 {
+		return fmt.Errorf("config: %s.%s must be > 0", prefix, name)
+	}
+	if checkDuration && time.Duration(*value) > time.Duration(1<<63-1)/time.Minute {
+		return fmt.Errorf("config: %s.%s overflows time.Duration", prefix, name)
+	}
+	return nil
+}
+
 func (c *Config) validateInternal(permissive bool) error {
-	if c.Queue.MaxDepth != nil && *c.Queue.MaxDepth != 10 {
-		return fmt.Errorf("config: queue.max_depth must be 10")
-	}
-	if c.MaxTurnTimeMins != nil && *c.MaxTurnTimeMins != 30 {
-		return fmt.Errorf("config: max_turn_time_mins must be 30")
-	}
 	if err := validateDisplayConfig("display", &c.Display); err != nil {
 		return err
 	}
@@ -1092,6 +1216,9 @@ func (c *Config) validateInternal(permissive bool) error {
 			return err
 		}
 		if err := validateDisplayConfig(prefix+".display", proj.Display); err != nil {
+			return err
+		}
+		if err := validateSchedulerConfig(prefix+".scheduler", proj.Scheduler); err != nil {
 			return err
 		}
 	}
@@ -3941,9 +4068,6 @@ func SaveGlobalSettings(u GlobalSettingsUpdate) error {
 		cfg.RateLimit.WindowSecs = u.RateLimitWindow
 	}
 	if u.QueueMaxDepth != nil {
-		if *u.QueueMaxDepth != 10 {
-			return fmt.Errorf("config: queue.max_depth must be 10")
-		}
 		cfg.Queue.MaxDepth = u.QueueMaxDepth
 	}
 	if err := cfg.validatePermissive(); err != nil {

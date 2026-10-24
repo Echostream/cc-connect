@@ -3528,28 +3528,302 @@ func TestRemoveGlobalProvider_CleansUpProviderRefs(t *testing.T) {
 	}
 }
 
-func TestProjectSchedulerFixedLegacyConfigValidation(t *testing.T) {
-	cfg := Config{Projects: []ProjectConfig{validProject("demo")}}
-	queue := 5
-	cfg.Queue.MaxDepth = &queue
-	assertErrContains(t, cfg.validate(), "queue.max_depth must be 10")
-
-	cfg = Config{Projects: []ProjectConfig{validProject("demo")}}
-	maxTurn := 0
-	cfg.MaxTurnTimeMins = &maxTurn
-	assertErrContains(t, cfg.validate(), "max_turn_time_mins must be 30")
-
-	cfg = Config{Projects: []ProjectConfig{validProject("demo")}}
-	queue = 10
-	maxTurn = 30
-	cfg.Queue.MaxDepth = &queue
-	cfg.MaxTurnTimeMins = &maxTurn
-	if err := cfg.validate(); err != nil {
-		t.Fatalf("validate fixed scheduler values: %v", err)
+func TestLegacyGlobalQueueAndTurnValuesRemainConfigurable(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		queue   int
+		maxTurn int
+	}{
+		{name: "old queue depth five and disabled max turn", queue: 5, maxTurn: 0},
+		{name: "old custom timeout", queue: 5, maxTurn: 15},
+		{name: "project-era values still parse as legacy globals", queue: 10, maxTurn: 30},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{Projects: []ProjectConfig{validProject("demo")}}
+			cfg.Queue.MaxDepth = &tt.queue
+			cfg.MaxTurnTimeMins = &tt.maxTurn
+			if err := cfg.validate(); err != nil {
+				t.Fatalf("validate legacy global scheduler knobs: %v", err)
+			}
+		})
 	}
 }
 
-func TestSaveGlobalSettingsRejectsNonFixedQueueMaxDepth(t *testing.T) {
+func TestProjectSchedulerConfigParsingAndEffective(t *testing.T) {
+	base := `[[projects]]
+name = "demo"
+legacy_project_unknown = "kept-for-forward-compat"
+max_turn_time_mins = 15
+[projects.agent]
+type = "claudecode"
+[projects.agent.options]
+mode = "default"
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "test-token"
+`
+
+	t.Run("missing subtree is legacy and keeps raw nil", func(t *testing.T) {
+		cfg, err := Load(writeConfigFixture(t, base+`
+[unknown_global]
+future = true
+`))
+		if err != nil {
+			t.Fatalf("Load missing scheduler: %v", err)
+		}
+		if cfg.Projects[0].Scheduler != nil {
+			t.Fatalf("Scheduler = %#v, want nil for omitted subtree", cfg.Projects[0].Scheduler)
+		}
+		effective, err := EffectiveScheduler(&cfg.Projects[0])
+		if err != nil {
+			t.Fatalf("EffectiveScheduler omitted: %v", err)
+		}
+		if effective.Type != SchedulerTypeLegacy {
+			t.Fatalf("EffectiveScheduler type = %q, want legacy", effective.Type)
+		}
+	})
+
+	t.Run("explicit legacy accepts old global knobs", func(t *testing.T) {
+		cfg, err := Load(writeConfigFixture(t, `queue.max_depth = 5
+max_turn_time_mins = 0
+`+base+`
+[projects.scheduler]
+type = "legacy"
+`))
+		if err != nil {
+			t.Fatalf("Load explicit legacy: %v", err)
+		}
+		effective, err := EffectiveScheduler(&cfg.Projects[0])
+		if err != nil {
+			t.Fatalf("EffectiveScheduler explicit legacy: %v", err)
+		}
+		if effective.Type != SchedulerTypeLegacy {
+			t.Fatalf("EffectiveScheduler type = %q, want legacy", effective.Type)
+		}
+	})
+
+	t.Run("project defaults do not mutate raw pointers", func(t *testing.T) {
+		cfg, err := Load(writeConfigFixture(t, base+`
+[projects.scheduler]
+type = "project"
+`))
+		if err != nil {
+			t.Fatalf("Load project defaults: %v", err)
+		}
+		sched := cfg.Projects[0].Scheduler
+		if sched == nil || sched.MaxWaiting != nil || sched.WaitingTTLMins != nil || sched.MaxTurnTimeMins != nil {
+			t.Fatalf("raw scheduler = %#v, want numeric pointers nil", sched)
+		}
+		effective, err := EffectiveScheduler(&cfg.Projects[0])
+		if err != nil {
+			t.Fatalf("EffectiveScheduler project defaults: %v", err)
+		}
+		if effective.Type != SchedulerTypeProject || effective.MaxWaiting != 10 || effective.WaitingTTLMins != 360 || effective.MaxTurnTimeMins != 30 {
+			t.Fatalf("EffectiveScheduler = %#v, want project 10/360/30", effective)
+		}
+		if sched.MaxWaiting != nil || sched.WaitingTTLMins != nil || sched.MaxTurnTimeMins != nil {
+			t.Fatalf("EffectiveScheduler mutated raw scheduler pointers: %#v", sched)
+		}
+	})
+
+	t.Run("project explicit numbers override defaults", func(t *testing.T) {
+		cfg, err := Load(writeConfigFixture(t, base+`
+[projects.scheduler]
+type = "project"
+max_waiting = 11
+waiting_ttl_mins = 361
+max_turn_time_mins = 31
+`))
+		if err != nil {
+			t.Fatalf("Load project explicit numbers: %v", err)
+		}
+		effective, err := EffectiveScheduler(&cfg.Projects[0])
+		if err != nil {
+			t.Fatalf("EffectiveScheduler project explicit numbers: %v", err)
+		}
+		if effective.MaxWaiting != 11 || effective.WaitingTTLMins != 361 || effective.MaxTurnTimeMins != 31 {
+			t.Fatalf("EffectiveScheduler = %#v, want explicit 11/361/31", effective)
+		}
+	})
+
+	t.Run("old project-local top keys do not feed project scheduler", func(t *testing.T) {
+		cfg, err := Load(writeConfigFixture(t, base+`
+[projects.scheduler]
+type = "project"
+`))
+		if err != nil {
+			t.Fatalf("Load project with old local key: %v", err)
+		}
+		effective, err := EffectiveScheduler(&cfg.Projects[0])
+		if err != nil {
+			t.Fatalf("EffectiveScheduler: %v", err)
+		}
+		if effective.MaxTurnTimeMins != 30 {
+			t.Fatalf("EffectiveScheduler max turn = %d, want default 30 not project-local old key", effective.MaxTurnTimeMins)
+		}
+	})
+}
+
+func TestProjectSchedulerConfigRejectsInvalidSchema(t *testing.T) {
+	base := `[[projects]]
+name = "demo"
+[projects.agent]
+type = "claudecode"
+[projects.agent.options]
+mode = "default"
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "test-token"
+app_secret = "super-secret-nearby"
+`
+
+	cases := []struct {
+		name    string
+		extra   string
+		wantErr string
+	}{
+		{name: "empty object", extra: `[projects.scheduler]
+`, wantErr: `projects[0].scheduler.type is required`},
+		{name: "numeric without type", extra: `[projects.scheduler]
+max_waiting = 10
+`, wantErr: `projects[0].scheduler.type is required`},
+		{name: "unknown type", extra: `[projects.scheduler]
+type = "weird"
+`, wantErr: `projects[0].scheduler.type must be "legacy" or "project"`},
+		{name: "case is strict", extra: `[projects.scheduler]
+type = "Project"
+`, wantErr: `projects[0].scheduler.type must be "legacy" or "project"`},
+		{name: "whitespace is strict", extra: `[projects.scheduler]
+type = " project "
+`, wantErr: `projects[0].scheduler.type must be "legacy" or "project"`},
+		{name: "legacy rejects max waiting", extra: `[projects.scheduler]
+type = "legacy"
+max_waiting = 10
+`, wantErr: `projects[0].scheduler.max_waiting is only valid when type = "project"`},
+		{name: "legacy rejects ttl", extra: `[projects.scheduler]
+type = "legacy"
+waiting_ttl_mins = 360
+`, wantErr: `projects[0].scheduler.waiting_ttl_mins is only valid when type = "project"`},
+		{name: "legacy rejects max turn", extra: `[projects.scheduler]
+type = "legacy"
+max_turn_time_mins = 30
+`, wantErr: `projects[0].scheduler.max_turn_time_mins is only valid when type = "project"`},
+		{name: "project rejects zero max waiting", extra: `[projects.scheduler]
+type = "project"
+max_waiting = 0
+`, wantErr: `projects[0].scheduler.max_waiting must be > 0`},
+		{name: "project rejects negative ttl", extra: `[projects.scheduler]
+type = "project"
+waiting_ttl_mins = -1
+`, wantErr: `projects[0].scheduler.waiting_ttl_mins must be > 0`},
+		{name: "project rejects zero max turn", extra: `[projects.scheduler]
+type = "project"
+max_turn_time_mins = 0
+`, wantErr: `projects[0].scheduler.max_turn_time_mins must be > 0`},
+		{name: "duration overflow rejected", extra: `[projects.scheduler]
+type = "project"
+waiting_ttl_mins = 9223372036854775807
+`, wantErr: `projects[0].scheduler.waiting_ttl_mins overflows time.Duration`},
+		{name: "scheduler unknown key is strict", extra: `[projects.scheduler]
+type = "project"
+unknown_nested = 1
+`, wantErr: `projects.scheduler.unknown_nested is not supported`},
+		{name: "duplicate parse error", extra: `[projects.scheduler]
+type = "project"
+type = "legacy"
+`, wantErr: `parse config`},
+		{name: "type must be string", extra: `[projects.scheduler]
+type = 1
+`, wantErr: `parse config`},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Load(writeConfigFixture(t, base+tt.extra))
+			assertErrContains(t, err, tt.wantErr)
+			if err != nil && strings.Contains(err.Error(), "super-secret-nearby") {
+				t.Fatalf("error leaked adjacent secret: %v", err)
+			}
+		})
+	}
+}
+
+func TestProjectSchedulerConfigSupportsMultipleProjects(t *testing.T) {
+	cfg, err := Load(writeConfigFixture(t, `[[projects]]
+name = "legacy-demo"
+[projects.agent]
+type = "claudecode"
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "legacy-token"
+[projects.scheduler]
+type = "legacy"
+
+[[projects]]
+name = "project-demo"
+[projects.agent]
+type = "claudecode"
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "project-token"
+[projects.scheduler]
+type = "project"
+max_waiting = 12
+waiting_ttl_mins = 362
+max_turn_time_mins = 32
+`))
+	if err != nil {
+		t.Fatalf("Load mixed projects: %v", err)
+	}
+	legacy, err := EffectiveScheduler(&cfg.Projects[0])
+	if err != nil {
+		t.Fatalf("EffectiveScheduler legacy: %v", err)
+	}
+	project, err := EffectiveScheduler(&cfg.Projects[1])
+	if err != nil {
+		t.Fatalf("EffectiveScheduler project: %v", err)
+	}
+	if legacy.Type != SchedulerTypeLegacy {
+		t.Fatalf("first project effective = %#v, want legacy", legacy)
+	}
+	if project.Type != SchedulerTypeProject || project.MaxWaiting != 12 || project.WaitingTTLMins != 362 || project.MaxTurnTimeMins != 32 {
+		t.Fatalf("second project effective = %#v, want project 12/362/32", project)
+	}
+}
+
+func TestGlobalUnknownFieldsStillLoadAndSurviveSave(t *testing.T) {
+	writeTestConfig(t, `future_global = "keep-me"
+
+[[projects]]
+name = "demo"
+future_project_key = "also-loads"
+[projects.agent]
+type = "claudecode"
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "test-token"
+`)
+	if _, err := Load(ConfigPath); err != nil {
+		t.Fatalf("Load with old unknown global/project fields: %v", err)
+	}
+	if err := SaveActiveProvider("demo", "test-provider"); err != nil {
+		t.Fatalf("SaveActiveProvider: %v", err)
+	}
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		t.Fatalf("read saved config: %v", err)
+	}
+	if !strings.Contains(string(data), `future_global = "keep-me"`) || !strings.Contains(string(data), `future_project_key = "also-loads"`) {
+		t.Fatalf("unknown fields were not preserved after save:\n%s", data)
+	}
+}
+
+func TestSaveGlobalSettingsKeepsLegacyQueueMaxDepthConfigurable(t *testing.T) {
 	writeTestConfig(t, `[[projects]]
 name = "demo"
 [projects.agent]
@@ -3561,12 +3835,12 @@ type = "telegram"
 [projects.platforms.options]
 token = "test-token"
 `)
-	bad := 5
-	if err := SaveGlobalSettings(GlobalSettingsUpdate{QueueMaxDepth: &bad}); err == nil || !strings.Contains(err.Error(), "queue.max_depth must be 10") {
-		t.Fatalf("SaveGlobalSettings bad queue err = %v, want fixed value rejection", err)
+	legacyDepth := 5
+	if err := SaveGlobalSettings(GlobalSettingsUpdate{QueueMaxDepth: &legacyDepth}); err != nil {
+		t.Fatalf("SaveGlobalSettings legacy queue depth: %v", err)
 	}
-	good := 10
-	if err := SaveGlobalSettings(GlobalSettingsUpdate{QueueMaxDepth: &good}); err != nil {
-		t.Fatalf("SaveGlobalSettings fixed queue: %v", err)
+	cfg := readTestConfig(t)
+	if cfg.Queue.MaxDepth == nil || *cfg.Queue.MaxDepth != legacyDepth {
+		t.Fatalf("queue.max_depth = %v, want %d", cfg.Queue.MaxDepth, legacyDepth)
 	}
 }
