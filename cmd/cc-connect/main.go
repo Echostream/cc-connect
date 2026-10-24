@@ -230,6 +230,17 @@ var topLevelCommandHandlers = map[string]func([]string){
 	"web":       runWeb,
 }
 
+func stopEnginesForShutdown(engines []*core.Engine, logErr func(error)) {
+	for _, e := range engines {
+		if e == nil {
+			continue
+		}
+		if err := e.Stop(); err != nil && logErr != nil {
+			logErr(err)
+		}
+	}
+}
+
 func main() {
 	// Agy hooks require stdout to contain only the final JSON decision. Handle
 	// this internal command before update checks, logging, or normal CLI setup.
@@ -418,7 +429,8 @@ func main() {
 			lang = core.LangAuto // auto-detect
 		}
 
-		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
+		projectScheduler := core.NewProjectScheduler(nil, 10, 6*time.Hour, 30*time.Minute)
+		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang, core.WithProjectScheduler(projectScheduler))
 		// Wire display settings including show_context_indicator and reply_footer
 		// Global [display] config can be overridden by project-level settings
 		_, _, _, _, _, showCtx, showFooter, _ := config.EffectiveDisplay(cfg, &proj)
@@ -692,15 +704,10 @@ func main() {
 			}
 		}
 
-		// Wire max turn time (absolute per-turn wall-clock cap; 0 = disabled)
-		if cfg.MaxTurnTimeMins != nil && *cfg.MaxTurnTimeMins > 0 {
-			engine.SetMaxTurnTime(time.Duration(*cfg.MaxTurnTimeMins) * time.Minute)
-		}
-
-		// Wire queue depth
-		if cfg.Queue.MaxDepth != nil && *cfg.Queue.MaxDepth > 0 {
-			engine.SetMaxQueuedMessages(*cfg.Queue.MaxDepth)
-		}
+		// ProjectScheduler owns the fixed project-wide queue contract: max waiting 10,
+		// waiting TTL 6h, and absolute Agent turn timeout 30m. Legacy config keys
+		// are validated for compatibility but no longer drive a second timeout or
+		// per-session queue depth here.
 
 		// Wire auto-compress settings
 		if proj.AutoCompress.Enabled != nil && *proj.AutoCompress.Enabled {
@@ -1356,11 +1363,9 @@ func main() {
 	if apiSrv != nil {
 		apiSrv.Stop()
 	}
-	for _, e := range engines {
-		if err := e.Stop(); err != nil {
-			slog.Error("shutdown error", "error", err)
-		}
-	}
+	stopEnginesForShutdown(engines, func(err error) {
+		slog.Error("shutdown error", "error", err)
+	})
 	if logCloser != nil {
 		logCloser.Close()
 	}

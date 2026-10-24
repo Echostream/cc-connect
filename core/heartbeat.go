@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -337,19 +338,6 @@ func (hs *HeartbeatScheduler) run(entry *heartbeatEntry) {
 func (hs *HeartbeatScheduler) execute(entry *heartbeatEntry) {
 	cfg := entry.config
 
-	if cfg.OnlyWhenIdle {
-		session := entry.engine.sessions.GetOrCreateActive(cfg.SessionKey)
-		if gen, ok := session.TryLock(); !ok {
-			slog.Debug("heartbeat: session busy, skipping", "project", entry.project, "session_key", cfg.SessionKey)
-			hs.mu.Lock()
-			entry.skippedBusy++
-			hs.mu.Unlock()
-			return
-		} else {
-			session.Unlock(gen)
-		}
-	}
-
 	prompt := cfg.Prompt
 	if prompt == "" {
 		prompt = readHeartbeatMD(entry.workDir)
@@ -363,7 +351,11 @@ func (hs *HeartbeatScheduler) execute(entry *heartbeatEntry) {
 	timeout := time.Duration(cfg.TimeoutMins) * time.Minute
 	done := make(chan error, 1)
 	go func() {
-		done <- entry.engine.ExecuteHeartbeat(cfg.SessionKey, prompt, cfg.Silent)
+		if cfg.OnlyWhenIdle {
+			done <- entry.engine.ExecuteHeartbeatOnlyIfIdle(cfg.SessionKey, prompt, cfg.Silent)
+		} else {
+			done <- entry.engine.ExecuteHeartbeat(cfg.SessionKey, prompt, cfg.Silent)
+		}
 	}()
 
 	var err error
@@ -376,7 +368,11 @@ func (hs *HeartbeatScheduler) execute(entry *heartbeatEntry) {
 	hs.mu.Lock()
 	entry.runCount++
 	entry.lastRun = time.Now()
-	if err != nil {
+	if errors.Is(err, errProjectSchedulerBusy) {
+		entry.skippedBusy++
+		entry.lastError = ""
+		slog.Debug("heartbeat: project busy, skipping", "project", entry.project, "session_key", cfg.SessionKey)
+	} else if err != nil {
 		entry.errorCount++
 		entry.lastError = err.Error()
 		slog.Error("heartbeat: execution failed", "project", entry.project, "error", err)

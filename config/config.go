@@ -1024,6 +1024,12 @@ func (c *Config) validate() error {
 }
 
 func (c *Config) validateInternal(permissive bool) error {
+	if c.Queue.MaxDepth != nil && *c.Queue.MaxDepth != 10 {
+		return fmt.Errorf("config: queue.max_depth must be 10")
+	}
+	if c.MaxTurnTimeMins != nil && *c.MaxTurnTimeMins != 30 {
+		return fmt.Errorf("config: max_turn_time_mins must be 30")
+	}
 	if err := validateDisplayConfig("display", &c.Display); err != nil {
 		return err
 	}
@@ -3935,7 +3941,13 @@ func SaveGlobalSettings(u GlobalSettingsUpdate) error {
 		cfg.RateLimit.WindowSecs = u.RateLimitWindow
 	}
 	if u.QueueMaxDepth != nil {
+		if *u.QueueMaxDepth != 10 {
+			return fmt.Errorf("config: queue.max_depth must be 10")
+		}
 		cfg.Queue.MaxDepth = u.QueueMaxDepth
+	}
+	if err := cfg.validatePermissive(); err != nil {
+		return err
 	}
 	return saveConfig(cfg)
 }

@@ -10,6 +10,109 @@ import (
 	"sync"
 )
 
+type BusyCommandDisposition string
+
+const (
+	BusyCommandUnknown        BusyCommandDisposition = "unknown"
+	BusyCommandReadonly       BusyCommandDisposition = "readonly"
+	BusyCommandScopeControl   BusyCommandDisposition = "scope_control"
+	BusyCommandAgentTrigger   BusyCommandDisposition = "agent_trigger"
+	BusyCommandSharedMutation BusyCommandDisposition = "shared_mutation"
+)
+
+const ProjectBusyMutationRejectedReason = "project_busy_mutation_rejected"
+
+func ClassifyBusyCommand(cmd string, args []string) BusyCommandDisposition {
+	cmd = strings.ToLower(strings.TrimSpace(cmd))
+	if strings.HasPrefix(cmd, "/") {
+		cmd = strings.TrimPrefix(cmd, "/")
+	}
+	sub := ""
+	if len(args) > 0 {
+		sub = strings.ToLower(strings.TrimSpace(args[0]))
+	}
+	isQuerySub := func(allowed ...string) bool {
+		if sub == "" {
+			return true
+		}
+		for _, value := range allowed {
+			if sub == value {
+				return true
+			}
+		}
+		return false
+	}
+
+	switch cmd {
+	case "stop", "cancel", "new":
+		return BusyCommandScopeControl
+	case "list", "sessions", "current", "status", "usage", "quota", "history", "help", "start", "version", "whoami", "myid", "doctor", "show", "diff", "search", "find", "queue":
+		return BusyCommandReadonly
+	case "commands", "command", "cmd":
+		if isQuerySub("list") {
+			return BusyCommandReadonly
+		}
+		return BusyCommandSharedMutation
+	case "skills", "skill":
+		return BusyCommandReadonly
+	case "config":
+		if sub == "get" {
+			return BusyCommandReadonly
+		}
+		return BusyCommandSharedMutation
+	case "provider":
+		if isQuerySub("list", "current") {
+			return BusyCommandReadonly
+		}
+		return BusyCommandSharedMutation
+	case "model", "reasoning", "effort", "mode", "tts":
+		if isQuerySub("list", "status") {
+			return BusyCommandReadonly
+		}
+		return BusyCommandSharedMutation
+	case "memory":
+		if isQuerySub("show") || (sub == "global" && len(args) == 1) {
+			return BusyCommandReadonly
+		}
+		return BusyCommandSharedMutation
+	case "cron":
+		switch sub {
+		case "", "list":
+			return BusyCommandReadonly
+		case "exec", "run", "trigger":
+			return BusyCommandAgentTrigger
+		default:
+			return BusyCommandSharedMutation
+		}
+	case "timer":
+		if sub == "" || sub == "list" {
+			return BusyCommandReadonly
+		}
+		return BusyCommandSharedMutation
+	case "heartbeat", "hb":
+		if sub == "" || sub == "status" {
+			return BusyCommandReadonly
+		}
+		return BusyCommandSharedMutation
+	case "web", "bind":
+		if sub == "status" {
+			return BusyCommandReadonly
+		}
+		return BusyCommandSharedMutation
+	case "workspace", "ws":
+		if sub == "" || sub == "list" || (sub == "shared" && (len(args) == 1 || (len(args) > 1 && strings.ToLower(args[1]) == "list"))) {
+			return BusyCommandReadonly
+		}
+		return BusyCommandSharedMutation
+	case "compress", "compact":
+		return BusyCommandAgentTrigger
+	case "switch", "name", "rename", "delete", "del", "rm", "allow", "lang", "quiet", "alias", "restart", "shell", "sh", "exec", "run", "dir", "cd", "chdir", "workdir", "ps", "btw", "upgrade", "update":
+		return BusyCommandSharedMutation
+	default:
+		return BusyCommandUnknown
+	}
+}
+
 // CustomCommand represents a registered slash command (from config or agent command files).
 type CustomCommand struct {
 	Name        string // command name without leading "/"

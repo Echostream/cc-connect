@@ -1,0 +1,1345 @@
+package core
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+)
+
+type fakeSchedulerClock struct {
+	mu     sync.Mutex
+	now    time.Time
+	timers []*fakeSchedulerTimer
+}
+
+type fakeSchedulerTimer struct {
+	mu      sync.Mutex
+	clock   *fakeSchedulerClock
+	at      time.Time
+	ch      chan time.Time
+	stopped bool
+	fired   bool
+}
+
+func newFakeSchedulerClock(now time.Time) *fakeSchedulerClock {
+	return &fakeSchedulerClock{now: now}
+}
+
+func (c *fakeSchedulerClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeSchedulerClock) NewTimer(d time.Duration) SchedulerTimer {
+	c.mu.Lock()
+	now := c.now
+	t := &fakeSchedulerTimer{
+		clock: c,
+		at:    now.Add(d),
+		ch:    make(chan time.Time, 1),
+	}
+	c.timers = append(c.timers, t)
+	c.mu.Unlock()
+
+	t.fireIfDue(now)
+	return t
+}
+
+func (c *fakeSchedulerClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	now := c.now
+	timers := append([]*fakeSchedulerTimer(nil), c.timers...)
+	c.mu.Unlock()
+
+	for _, timer := range timers {
+		timer.fireIfDue(now)
+	}
+}
+
+func (c *fakeSchedulerClock) timersSnapshot() []*fakeSchedulerTimer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]*fakeSchedulerTimer(nil), c.timers...)
+}
+
+func (t *fakeSchedulerTimer) isStopped() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.stopped
+}
+
+func (t *fakeSchedulerTimer) C() <-chan time.Time { return t.ch }
+
+func (t *fakeSchedulerTimer) Stop() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped || t.fired {
+		return false
+	}
+	t.stopped = true
+	return true
+}
+
+func (t *fakeSchedulerTimer) fireIfDue(now time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped || t.fired || now.Before(t.at) {
+		return
+	}
+	t.fired = true
+	select {
+	case t.ch <- now:
+	default:
+	}
+}
+
+func waitStarted(t *testing.T, started <-chan string) string {
+	t.Helper()
+	select {
+	case got := <-started:
+		return got
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for task to start")
+		return ""
+	}
+}
+
+func assertNoBufferedStart(t *testing.T, started <-chan string) {
+	t.Helper()
+	select {
+	case got := <-started:
+		t.Fatalf("unexpected additional start already buffered: %s", got)
+	default:
+	}
+}
+
+type projectSchedulerStubPlatform struct{ name string }
+
+func (p projectSchedulerStubPlatform) Name() string                             { return p.name }
+func (p projectSchedulerStubPlatform) Start(MessageHandler) error               { return nil }
+func (p projectSchedulerStubPlatform) Reply(context.Context, any, string) error { return nil }
+func (p projectSchedulerStubPlatform) Send(context.Context, any, string) error  { return nil }
+func (p projectSchedulerStubPlatform) Stop() error                              { return nil }
+
+func TestProjectSchedulerSerializesDifferentSessionsAndSourcesFIFO(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(0, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	t.Cleanup(func() { scheduler.Stop(context.Background()) })
+
+	started := make(chan string, 3)
+	release := make(chan struct{}, 3)
+	task := func(id, source, session string, platform Platform) ProjectTask {
+		return ProjectTask{ID: id, Source: AgentTriggerSource(source), SessionKey: session, Platform: platform, Run: func(ctx context.Context) TaskResult {
+			started <- id
+			select {
+			case <-release:
+				return TaskResult{State: "completed"}
+			case <-ctx.Done():
+				return TaskResult{State: "cancelled", Err: ctx.Err()}
+			}
+		}}
+	}
+
+	if got := scheduler.Submit(task("a", "interactive", "feishu:chat-a:root:r1", projectSchedulerStubPlatform{name: "feishu"})); got.Status != SubmitStarted || got.Position != 0 {
+		t.Fatalf("submit a = %+v", got)
+	}
+	if got := scheduler.Submit(task("b", "heartbeat", "telegram:-100:42", projectSchedulerStubPlatform{name: "telegram"})); got.Status != SubmitQueued || got.Position != 1 {
+		t.Fatalf("submit b = %+v", got)
+	}
+	if got := scheduler.Submit(task("c", "timer", "weixin:user", projectSchedulerStubPlatform{name: "weixin"})); got.Status != SubmitQueued || got.Position != 2 {
+		t.Fatalf("submit c = %+v", got)
+	}
+
+	if got := waitStarted(t, started); got != "a" {
+		t.Fatalf("first started = %q", got)
+	}
+	if snap := scheduler.Snapshot(); snap.ActiveCount != 1 || snap.WaitingCount != 2 {
+		t.Fatalf("snapshot while a active = %+v", snap)
+	}
+	assertNoBufferedStart(t, started)
+
+	release <- struct{}{}
+	if got := waitStarted(t, started); got != "b" {
+		t.Fatalf("second started = %q, want FIFO task b before source/platform variants", got)
+	}
+	if snap := scheduler.Snapshot(); snap.ActiveCount != 1 || snap.WaitingCount != 1 {
+		t.Fatalf("snapshot while b active = %+v", snap)
+	}
+	assertNoBufferedStart(t, started)
+
+	release <- struct{}{}
+	if got := waitStarted(t, started); got != "c" {
+		t.Fatalf("third started = %q", got)
+	}
+	if snap := scheduler.Snapshot(); snap.ActiveCount != 1 || snap.WaitingCount != 0 {
+		t.Fatalf("snapshot while c active = %+v", snap)
+	}
+	release <- struct{}{}
+}
+
+func TestWaitingCapacityIsTenExcludingActive(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(100, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	t.Cleanup(func() { scheduler.Stop(context.Background()) })
+
+	started := make(chan string, 12)
+	release := make(chan struct{})
+	blockingTask := ProjectTask{ID: "active", SessionKey: "weixin:active", Run: func(ctx context.Context) TaskResult {
+		started <- "active"
+		select {
+		case <-release:
+			return TaskResult{State: "completed"}
+		case <-ctx.Done():
+			return TaskResult{State: "cancelled", Err: ctx.Err()}
+		}
+	}}
+	if got := scheduler.Submit(blockingTask); got.Status != SubmitStarted {
+		t.Fatalf("submit active = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "active" {
+		t.Fatalf("started active = %q", got)
+	}
+
+	for i := 1; i <= 10; i++ {
+		got := scheduler.Submit(ProjectTask{ID: fmt.Sprintf("waiting-%02d", i), Source: "interactive", SessionKey: fmt.Sprintf("session-%02d", i), Run: func(ctx context.Context) TaskResult {
+			started <- "unexpected"
+			return TaskResult{State: "completed"}
+		}})
+		if got.Status != SubmitQueued || got.Position != i {
+			t.Fatalf("submit waiting %d = %+v", i, got)
+		}
+	}
+
+	got := scheduler.Submit(ProjectTask{ID: "overflow", SessionKey: "overflow", Run: func(ctx context.Context) TaskResult {
+		started <- "overflow"
+		return TaskResult{State: "completed"}
+	}})
+	if got.Status != SubmitRejectedFull || got.Position != 0 {
+		t.Fatalf("overflow submit = %+v", got)
+	}
+	if snap := scheduler.Snapshot(); snap.ActiveCount != 1 || snap.WaitingCount != 10 {
+		t.Fatalf("snapshot full waiting = %+v", snap)
+	}
+	assertNoBufferedStart(t, started)
+}
+
+func TestProjectSchedulerDefaultsQueueTimesAndCleanup(t *testing.T) {
+	now := time.Unix(123, 0)
+	clock := newFakeSchedulerClock(now)
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	t.Cleanup(func() { scheduler.Stop(context.Background()) })
+
+	started := make(chan string, 1)
+	activeRelease := make(chan struct{})
+	if got := scheduler.Submit(ProjectTask{ID: "active", Run: func(ctx context.Context) TaskResult {
+		started <- "active"
+		select {
+		case <-activeRelease:
+			return TaskResult{State: "completed"}
+		case <-ctx.Done():
+			return TaskResult{State: "cancelled", Err: ctx.Err()}
+		}
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit active = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "active" {
+		t.Fatalf("started = %q", got)
+	}
+
+	if got := scheduler.Submit(ProjectTask{ID: "queued", Source: "relay", SessionKey: "telegram:-100:topic"}); got.Status != SubmitQueued || got.Position != 1 {
+		t.Fatalf("submit queued = %+v", got)
+	}
+	snap := scheduler.Snapshot()
+	if snap.WaitingCount != 1 {
+		t.Fatalf("waiting count = %d", snap.WaitingCount)
+	}
+	queued := snap.Waiting[0]
+	if !queued.EnqueuedAt.Equal(now) || !queued.ExpiresAt.Equal(now.Add(6*time.Hour)) {
+		t.Fatalf("queued times = enqueued %s expires %s", queued.EnqueuedAt, queued.ExpiresAt)
+	}
+	close(activeRelease)
+}
+
+func TestProjectSchedulerStopCancelsRunTimer(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(0, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+
+	started := make(chan struct{}, 1)
+	if got := scheduler.Submit(ProjectTask{ID: "active", Run: func(ctx context.Context) TaskResult {
+		started <- struct{}{}
+		<-ctx.Done()
+		return TaskResult{State: "cancelled", Err: ctx.Err()}
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit active = %+v", got)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for active task")
+	}
+
+	scheduler.Stop(context.Background())
+	timers := clock.timersSnapshot()
+	if len(timers) != 1 {
+		t.Fatalf("timer count = %d, want exactly run timer", len(timers))
+	}
+	if !timers[0].isStopped() {
+		t.Fatal("run timer still active after Stop")
+	}
+	clock.Advance(30 * time.Minute)
+	if got := scheduler.Submit(ProjectTask{ID: "late"}); got.Status != SubmitRejectedStopped {
+		t.Fatalf("submit after stopped timer advance = %+v", got)
+	}
+}
+
+func TestFakeSchedulerClockNewTimerZeroIsReady(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(0, 0))
+	timer := clock.NewTimer(0)
+	select {
+	case got := <-timer.C():
+		if !got.Equal(clock.Now()) {
+			t.Fatalf("zero timer fired at %s, want %s", got, clock.Now())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("zero-duration fake timer was not ready immediately")
+	}
+}
+
+func TestProjectSchedulerRejectsSubmitAfterStop(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(0, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	scheduler.Stop(context.Background())
+
+	got := scheduler.Submit(ProjectTask{ID: "late", Run: func(ctx context.Context) TaskResult {
+		return TaskResult{State: "completed"}
+	}})
+	if got.Status != SubmitRejectedStopped {
+		t.Fatalf("submit after stop = %+v", got)
+	}
+}
+
+type projectSchedulerFinishRecord struct {
+	id     string
+	result TaskResult
+}
+
+func waitFinish(t *testing.T, finished <-chan projectSchedulerFinishRecord) projectSchedulerFinishRecord {
+	t.Helper()
+	select {
+	case got := <-finished:
+		return got
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for terminal callback")
+		return projectSchedulerFinishRecord{}
+	}
+}
+
+func waitCleanup(t *testing.T, cleaned <-chan string) string {
+	t.Helper()
+	select {
+	case got := <-cleaned:
+		return got
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for cleanup")
+		return ""
+	}
+}
+
+func assertNoFinish(t *testing.T, finished <-chan projectSchedulerFinishRecord) {
+	t.Helper()
+	select {
+	case got := <-finished:
+		t.Fatalf("unexpected terminal callback already buffered: %+v", got)
+	default:
+	}
+}
+
+func assertNoCleanup(t *testing.T, cleaned <-chan string) {
+	t.Helper()
+	select {
+	case got := <-cleaned:
+		t.Fatalf("unexpected cleanup already buffered: %s", got)
+	default:
+	}
+}
+
+func TestSixHourExpiryCleansAndContinuesFIFO(t *testing.T) {
+	// 防回归点：queued 任务到达 ExpiresAt 的精确边界时，不能启动 Run，必须终态 expired、清理一次并继续 FIFO。
+	now := time.Unix(1_000, 0)
+	clock := newFakeSchedulerClock(now)
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 7*time.Hour)
+	t.Cleanup(func() { scheduler.Stop(context.Background()) })
+
+	started := make(chan string, 4)
+	cleaned := make(chan string, 4)
+	finished := make(chan projectSchedulerFinishRecord, 4)
+	activeRelease := make(chan struct{})
+	cRelease := make(chan struct{})
+
+	makeTask := func(id string, run func(context.Context) TaskResult) ProjectTask {
+		return ProjectTask{
+			ID:  id,
+			Run: run,
+			Cleanup: func() {
+				cleaned <- id
+			},
+			OnFinish: func(result TaskResult) {
+				finished <- projectSchedulerFinishRecord{id: id, result: result}
+			},
+		}
+	}
+
+	if got := scheduler.Submit(makeTask("active", func(ctx context.Context) TaskResult {
+		started <- "active"
+		select {
+		case <-activeRelease:
+			return TaskResult{State: "completed"}
+		case <-ctx.Done():
+			return TaskResult{State: "cancelled", Err: ctx.Err()}
+		}
+	})); got.Status != SubmitStarted {
+		t.Fatalf("submit active = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "active" {
+		t.Fatalf("started active = %q", got)
+	}
+
+	expiresAt := now.Add(6 * time.Hour)
+	if got := scheduler.Submit(ProjectTask{
+		ID:         "expired",
+		EnqueuedAt: now,
+		ExpiresAt:  expiresAt,
+		Run: func(context.Context) TaskResult {
+			started <- "expired"
+			return TaskResult{State: "completed"}
+		},
+		Cleanup: func() { cleaned <- "expired" },
+		OnFinish: func(result TaskResult) {
+			finished <- projectSchedulerFinishRecord{id: "expired", result: result}
+		},
+	}); got.Status != SubmitQueued || got.Position != 1 {
+		t.Fatalf("submit expired = %+v", got)
+	}
+	if got := scheduler.Submit(ProjectTask{
+		ID:         "next",
+		EnqueuedAt: now,
+		ExpiresAt:  expiresAt.Add(time.Nanosecond),
+		Run: func(ctx context.Context) TaskResult {
+			started <- "next"
+			select {
+			case <-cRelease:
+				return TaskResult{State: "completed"}
+			case <-ctx.Done():
+				return TaskResult{State: "cancelled", Err: ctx.Err()}
+			}
+		},
+		Cleanup: func() { cleaned <- "next" },
+		OnFinish: func(result TaskResult) {
+			finished <- projectSchedulerFinishRecord{id: "next", result: result}
+		},
+	}); got.Status != SubmitQueued || got.Position != 2 {
+		t.Fatalf("submit next = %+v", got)
+	}
+
+	clock.Advance(6 * time.Hour)
+	close(activeRelease)
+	cleanedBeforeNext := map[string]int{}
+	for i := 0; i < 2; i++ {
+		cleanedBeforeNext[waitCleanup(t, cleaned)]++
+	}
+	if cleanedBeforeNext["active"] != 1 || cleanedBeforeNext["expired"] != 1 {
+		t.Fatalf("cleanup before next = %+v, want active and expired exactly once", cleanedBeforeNext)
+	}
+	finishedBeforeNext := map[string]string{}
+	for i := 0; i < 2; i++ {
+		got := waitFinish(t, finished)
+		finishedBeforeNext[got.id] = got.result.State
+	}
+	if finishedBeforeNext["active"] != "completed" || finishedBeforeNext["expired"] != "expired" {
+		t.Fatalf("finishes before next = %+v, want active completed and expired expired", finishedBeforeNext)
+	}
+	if got := waitStarted(t, started); got != "next" {
+		t.Fatalf("next started = %q, want next; expired Run must not start", got)
+	}
+	assertNoBufferedStart(t, started)
+	close(cRelease)
+	if got := waitCleanup(t, cleaned); got != "next" {
+		t.Fatalf("third cleanup = %q, want next", got)
+	}
+	if got := waitFinish(t, finished); got.id != "next" || got.result.State != "completed" {
+		t.Fatalf("next finish = %+v, want completed", got)
+	}
+}
+
+func TestThirtyMinuteTimeoutReleasesSlotAndCleansOnce(t *testing.T) {
+	// 防回归点：runTimeout 是绝对 30m，不因 Run 持续执行而滑动；协作 Run 退出后发布 timed_out 并释放 FIFO 下一项。
+	clock := newFakeSchedulerClock(time.Unix(2_000, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	t.Cleanup(func() { scheduler.Stop(context.Background()) })
+
+	started := make(chan string, 3)
+	cleaned := make(chan string, 3)
+	finished := make(chan projectSchedulerFinishRecord, 3)
+	nextRelease := make(chan struct{})
+
+	if got := scheduler.Submit(ProjectTask{
+		ID: "slow",
+		Run: func(ctx context.Context) TaskResult {
+			started <- "slow"
+			<-ctx.Done()
+			return TaskResult{State: "cancelled", Err: ctx.Err()}
+		},
+		Cleanup:  func() { cleaned <- "slow" },
+		OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: "slow", result: result} },
+	}); got.Status != SubmitStarted {
+		t.Fatalf("submit slow = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "slow" {
+		t.Fatalf("started slow = %q", got)
+	}
+	if got := scheduler.Submit(ProjectTask{
+		ID: "next",
+		Run: func(ctx context.Context) TaskResult {
+			started <- "next"
+			select {
+			case <-nextRelease:
+				return TaskResult{State: "completed"}
+			case <-ctx.Done():
+				return TaskResult{State: "cancelled", Err: ctx.Err()}
+			}
+		},
+		Cleanup:  func() { cleaned <- "next" },
+		OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: "next", result: result} },
+	}); got.Status != SubmitQueued || got.Position != 1 {
+		t.Fatalf("submit next = %+v", got)
+	}
+
+	clock.Advance(30 * time.Minute)
+	if got := waitCleanup(t, cleaned); got != "slow" {
+		t.Fatalf("first cleanup = %q, want slow", got)
+	}
+	if got := waitFinish(t, finished); got.id != "slow" || got.result.State != "timed_out" {
+		t.Fatalf("timeout finish = %+v, want timed_out", got)
+	}
+	if got := waitStarted(t, started); got != "next" {
+		t.Fatalf("next started = %q, want next after cooperative timeout", got)
+	}
+	assertNoBufferedStart(t, started)
+	close(nextRelease)
+	if got := waitCleanup(t, cleaned); got != "next" {
+		t.Fatalf("second cleanup = %q, want next", got)
+	}
+	if got := waitFinish(t, finished); got.id != "next" || got.result.State != "completed" {
+		t.Fatalf("next finish = %+v, want completed", got)
+	}
+}
+
+func TestTimedOutRunMustExitBeforeNextStarts(t *testing.T) {
+	// 防回归点：不合作 Run 超时后只能先裁定并 cancel ctx，原 Run 未退出前不得启动下一项或清理其附件。
+	clock := newFakeSchedulerClock(time.Unix(3_000, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	t.Cleanup(func() { scheduler.Stop(context.Background()) })
+
+	started := make(chan string, 3)
+	cleaned := make(chan string, 3)
+	finished := make(chan projectSchedulerFinishRecord, 3)
+	ctxCancelled := make(chan struct{})
+	releaseSlow := make(chan struct{})
+	nextRelease := make(chan struct{})
+
+	if got := scheduler.Submit(ProjectTask{
+		ID: "stubborn",
+		Run: func(ctx context.Context) TaskResult {
+			started <- "stubborn"
+			go func() {
+				<-ctx.Done()
+				close(ctxCancelled)
+			}()
+			<-releaseSlow
+			return TaskResult{State: "completed"}
+		},
+		Cleanup:  func() { cleaned <- "stubborn" },
+		OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: "stubborn", result: result} },
+	}); got.Status != SubmitStarted {
+		t.Fatalf("submit stubborn = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "stubborn" {
+		t.Fatalf("started stubborn = %q", got)
+	}
+	if got := scheduler.Submit(ProjectTask{
+		ID: "next",
+		Run: func(ctx context.Context) TaskResult {
+			started <- "next"
+			select {
+			case <-nextRelease:
+				return TaskResult{State: "completed"}
+			case <-ctx.Done():
+				return TaskResult{State: "cancelled", Err: ctx.Err()}
+			}
+		},
+		Cleanup:  func() { cleaned <- "next" },
+		OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: "next", result: result} },
+	}); got.Status != SubmitQueued || got.Position != 1 {
+		t.Fatalf("submit next = %+v", got)
+	}
+
+	clock.Advance(30 * time.Minute)
+	select {
+	case <-ctxCancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for timeout to cancel stubborn Run context")
+	}
+	assertNoBufferedStart(t, started)
+	assertNoCleanup(t, cleaned)
+	assertNoFinish(t, finished)
+
+	close(releaseSlow)
+	if got := waitCleanup(t, cleaned); got != "stubborn" {
+		t.Fatalf("first cleanup = %q, want stubborn after Run exits", got)
+	}
+	if got := waitFinish(t, finished); got.id != "stubborn" || got.result.State != "timed_out" {
+		t.Fatalf("stubborn finish = %+v, want timed_out after Run exits", got)
+	}
+	if got := waitStarted(t, started); got != "next" {
+		t.Fatalf("next started = %q, want next only after stubborn exits", got)
+	}
+	close(nextRelease)
+	if got := waitCleanup(t, cleaned); got != "next" {
+		t.Fatalf("second cleanup = %q, want next", got)
+	}
+	if got := waitFinish(t, finished); got.id != "next" || got.result.State != "completed" {
+		t.Fatalf("next finish = %+v, want completed", got)
+	}
+}
+
+func TestCompletionCancellationRaceReleasesSlotOnce(t *testing.T) {
+	// 防回归点：Run 正常完成与 Stop 取消竞态时，只能有一个终态、一次 cleanup；本轮不提前实现 SessionKey scope cancel。
+	for i := 0; i < 100; i++ {
+		clock := newFakeSchedulerClock(time.Unix(int64(4_000+i), 0))
+		scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+
+		started := make(chan struct{}, 1)
+		cleaned := make(chan string, 2)
+		finished := make(chan projectSchedulerFinishRecord, 2)
+		releaseRun := make(chan struct{})
+		beginRace := make(chan struct{})
+
+		if got := scheduler.Submit(ProjectTask{
+			ID: "race",
+			Run: func(ctx context.Context) TaskResult {
+				started <- struct{}{}
+				select {
+				case <-releaseRun:
+					return TaskResult{State: "completed"}
+				case <-ctx.Done():
+					return TaskResult{State: "cancelled", Err: ctx.Err()}
+				}
+			},
+			Cleanup:  func() { cleaned <- "race" },
+			OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: "race", result: result} },
+		}); got.Status != SubmitStarted {
+			t.Fatalf("iteration %d submit race = %+v", i, got)
+		}
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d timed out waiting for race task start", i)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-beginRace
+			close(releaseRun)
+		}()
+		go func() {
+			defer wg.Done()
+			<-beginRace
+			scheduler.Stop(context.Background())
+		}()
+		close(beginRace)
+
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d timed out waiting for completion/cancellation race", i)
+		}
+
+		if got := waitCleanup(t, cleaned); got != "race" {
+			t.Fatalf("iteration %d cleanup = %q, want race", i, got)
+		}
+		got := waitFinish(t, finished)
+		if got.id != "race" || (got.result.State != "completed" && got.result.State != "cancelled") {
+			t.Fatalf("iteration %d finish = %+v, want completed or cancelled", i, got)
+		}
+		assertNoCleanup(t, cleaned)
+		assertNoFinish(t, finished)
+	}
+}
+
+func waitSnapshot(t *testing.T, scheduler *ProjectScheduler) SchedulerSnapshot {
+	t.Helper()
+	result := make(chan SchedulerSnapshot, 1)
+	go func() { result <- scheduler.Snapshot() }()
+	select {
+	case got := <-result:
+		return got
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for scheduler Snapshot")
+		return SchedulerSnapshot{}
+	}
+}
+
+func waitStopReturned(t *testing.T, stopped <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Stop to return")
+	}
+}
+
+func TestBlockedOnFinishBacklogIsBoundedAndDoesNotBlockOwner(t *testing.T) {
+	// 防回归点：阻塞 OnFinish 只能占用有界通知槽；槽满后独立拒绝，不能反压 owner loop 使 Snapshot/Stop 不可达。
+	clock := newFakeSchedulerClock(time.Unix(5_000, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	unblockCallbacks := make(chan struct{})
+	defer scheduler.Stop(context.Background())
+	defer close(unblockCallbacks)
+
+	started := make(chan string, 32)
+	cleaned := make(chan string, 32)
+	callbackEntered := make(chan string, 32)
+
+	submitBatch := func(prefix string, release <-chan struct{}) {
+		for i := 0; i < 11; i++ {
+			id := fmt.Sprintf("%s-%02d", prefix, i)
+			got := scheduler.Submit(ProjectTask{
+				ID: id,
+				Run: func(context.Context) TaskResult {
+					started <- id
+					<-release
+					return TaskResult{State: TaskStateCompleted}
+				},
+				Cleanup: func() { cleaned <- id },
+				OnFinish: func(TaskResult) {
+					callbackEntered <- id
+					<-unblockCallbacks
+				},
+			})
+			if i == 0 {
+				if got.Status != SubmitStarted {
+					t.Fatalf("submit %s = %+v, want started", id, got)
+				}
+				continue
+			}
+			if got.Status != SubmitQueued || got.Position != i {
+				t.Fatalf("submit %s = %+v, want queued position %d", id, got, i)
+			}
+		}
+	}
+
+	firstRelease := make(chan struct{})
+	submitBatch("first", firstRelease)
+	close(firstRelease)
+	for i := 0; i < 11; i++ {
+		waitCleanup(t, cleaned)
+	}
+	if got := waitStarted(t, started); got != "first-00" {
+		t.Fatalf("first start = %q", got)
+	}
+	for i := 1; i < 11; i++ {
+		waitStarted(t, started)
+	}
+	if got := waitFinishStart(t, callbackEntered); got == "" {
+		t.Fatal("first callback did not start")
+	}
+
+	secondRelease := make(chan struct{})
+	submitBatch("second", secondRelease)
+	close(secondRelease)
+	for i := 0; i < 11; i++ {
+		waitCleanup(t, cleaned)
+	}
+	for i := 0; i < 11; i++ {
+		waitStarted(t, started)
+	}
+
+	snap := waitSnapshot(t, scheduler)
+	if snap.NotificationCapacity != 22 || snap.NotificationPending != 22 {
+		t.Fatalf("notification snapshot = pending %d capacity %d, want 22/22", snap.NotificationPending, snap.NotificationCapacity)
+	}
+	got := scheduler.Submit(ProjectTask{
+		ID:       "rejected-notification",
+		Run:      func(context.Context) TaskResult { return TaskResult{State: TaskStateCompleted} },
+		Cleanup:  func() { cleaned <- "rejected-notification" },
+		OnFinish: func(TaskResult) {},
+	})
+	if got.Status != SubmitRejectedNotificationBacklog {
+		t.Fatalf("submit with full notification backlog = %+v, want rejected_notification_backlog", got)
+	}
+	assertNoCleanup(t, cleaned)
+
+	nilNotify := scheduler.Submit(ProjectTask{ID: "nil-notify", Run: func(context.Context) TaskResult {
+		started <- "nil-notify"
+		return TaskResult{State: TaskStateCompleted}
+	}})
+	if nilNotify.Status != SubmitStarted {
+		t.Fatalf("nil OnFinish submit with full notification backlog = %+v, want started", nilNotify)
+	}
+	waitStarted(t, started)
+
+	stopReturned := make(chan struct{})
+	go func() {
+		scheduler.Stop(context.Background())
+		close(stopReturned)
+	}()
+	waitStopReturned(t, stopReturned)
+}
+
+func waitFinishStart(t *testing.T, callbackEntered <-chan string) string {
+	t.Helper()
+	select {
+	case got := <-callbackEntered:
+		return got
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for OnFinish to start")
+		return ""
+	}
+}
+
+func TestOnFinishPanicReleasesNotificationSlot(t *testing.T) {
+	// 防回归点：OnFinish panic 不能杀死 publisher goroutine，且必须释放通知槽，后续任务仍能发布。
+	clock := newFakeSchedulerClock(time.Unix(5_100, 0))
+	scheduler := NewProjectScheduler(clock, 1, 6*time.Hour, 30*time.Minute)
+	defer scheduler.Stop(context.Background())
+
+	started := make(chan string, 2)
+	cleaned := make(chan string, 2)
+	finished := make(chan projectSchedulerFinishRecord, 1)
+
+	if got := scheduler.Submit(ProjectTask{
+		ID: "panic",
+		Run: func(context.Context) TaskResult {
+			started <- "panic"
+			return TaskResult{State: TaskStateCompleted}
+		},
+		Cleanup: func() { cleaned <- "panic" },
+		OnFinish: func(TaskResult) {
+			panic("boom")
+		},
+	}); got.Status != SubmitStarted {
+		t.Fatalf("submit panic = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "panic" {
+		t.Fatalf("started panic = %q", got)
+	}
+	if got := waitCleanup(t, cleaned); got != "panic" {
+		t.Fatalf("cleanup panic = %q", got)
+	}
+
+	if got := scheduler.Submit(ProjectTask{
+		ID: "after-panic",
+		Run: func(context.Context) TaskResult {
+			started <- "after-panic"
+			return TaskResult{State: TaskStateCompleted}
+		},
+		Cleanup: func() { cleaned <- "after-panic" },
+		OnFinish: func(result TaskResult) {
+			finished <- projectSchedulerFinishRecord{id: "after-panic", result: result}
+		},
+	}); got.Status != SubmitStarted {
+		t.Fatalf("submit after panic = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "after-panic" {
+		t.Fatalf("started after panic = %q", got)
+	}
+	if got := waitCleanup(t, cleaned); got != "after-panic" {
+		t.Fatalf("cleanup after panic = %q", got)
+	}
+	if got := waitFinish(t, finished); got.id != "after-panic" || got.result.State != TaskStateCompleted {
+		t.Fatalf("finish after panic = %+v", got)
+	}
+}
+
+func TestStopWinsPublishesCancelledEvenIfRunReturnsCompleted(t *testing.T) {
+	// 防回归点：Stop 已被 owner 接受后即裁定 active cancelled；不合作 Run 后续返回 completed 也不能覆盖裁定。
+	clock := newFakeSchedulerClock(time.Unix(5_200, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	defer scheduler.Stop(context.Background())
+
+	started := make(chan string, 2)
+	cleaned := make(chan string, 2)
+	finished := make(chan projectSchedulerFinishRecord, 2)
+	ctxCancelled := make(chan struct{})
+	releaseRun := make(chan struct{})
+
+	if got := scheduler.Submit(ProjectTask{
+		ID: "stubborn",
+		Run: func(ctx context.Context) TaskResult {
+			started <- "stubborn"
+			<-ctx.Done()
+			close(ctxCancelled)
+			<-releaseRun
+			return TaskResult{State: TaskStateCompleted}
+		},
+		Cleanup:  func() { cleaned <- "stubborn" },
+		OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: "stubborn", result: result} },
+	}); got.Status != SubmitStarted {
+		t.Fatalf("submit stubborn = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "stubborn" {
+		t.Fatalf("started stubborn = %q", got)
+	}
+	stopReturned := make(chan struct{})
+	go func() {
+		scheduler.Stop(context.Background())
+		close(stopReturned)
+	}()
+	select {
+	case <-ctxCancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Stop to cancel Run context")
+	}
+	close(releaseRun)
+	waitStopReturned(t, stopReturned)
+	if got := waitCleanup(t, cleaned); got != "stubborn" {
+		t.Fatalf("cleanup = %q, want stubborn", got)
+	}
+	if got := waitFinish(t, finished); got.id != "stubborn" || got.result.State != TaskStateCancelled {
+		t.Fatalf("finish = %+v, want cancelled despite completed Run return", got)
+	}
+}
+
+func TestCompletionCancellationRaceHandlesSuccessorOnce(t *testing.T) {
+	// 防回归点：completion 与 Stop 竞态必须覆盖 successor；Stop 赢则 successor 不启动并 cancelled once，completion 赢则 successor 至多启动一次再由 Stop 收尾。
+	for i := 0; i < 100; i++ {
+		clock := newFakeSchedulerClock(time.Unix(int64(5_300+i), 0))
+		scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+
+		started := make(chan string, 2)
+		cleaned := make(chan string, 2)
+		finished := make(chan projectSchedulerFinishRecord, 2)
+		releaseRun := make(chan struct{})
+		beginRace := make(chan struct{})
+
+		if got := scheduler.Submit(ProjectTask{
+			ID: "race",
+			Run: func(ctx context.Context) TaskResult {
+				started <- "race"
+				select {
+				case <-releaseRun:
+					return TaskResult{State: TaskStateCompleted}
+				case <-ctx.Done():
+					return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+				}
+			},
+			Cleanup:  func() { cleaned <- "race" },
+			OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: "race", result: result} },
+		}); got.Status != SubmitStarted {
+			t.Fatalf("iteration %d submit race = %+v", i, got)
+		}
+		if got := waitStarted(t, started); got != "race" {
+			t.Fatalf("iteration %d started = %q, want race", i, got)
+		}
+		if got := scheduler.Submit(ProjectTask{
+			ID: "next",
+			Run: func(ctx context.Context) TaskResult {
+				started <- "next"
+				<-ctx.Done()
+				return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+			},
+			Cleanup:  func() { cleaned <- "next" },
+			OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: "next", result: result} },
+		}); got.Status != SubmitQueued || got.Position != 1 {
+			t.Fatalf("iteration %d submit next = %+v", i, got)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-beginRace
+			close(releaseRun)
+		}()
+		stopReturned := make(chan struct{})
+		go func() {
+			defer wg.Done()
+			<-beginRace
+			scheduler.Stop(context.Background())
+			close(stopReturned)
+		}()
+		close(beginRace)
+		waitStopReturned(t, stopReturned)
+		wg.Wait()
+
+		seenCleanup := map[string]int{}
+		for j := 0; j < 2; j++ {
+			seenCleanup[waitCleanup(t, cleaned)]++
+		}
+		if seenCleanup["race"] != 1 || seenCleanup["next"] != 1 {
+			t.Fatalf("iteration %d cleanup counts = %+v, want race/next once", i, seenCleanup)
+		}
+		seenFinish := map[string]string{}
+		for j := 0; j < 2; j++ {
+			got := waitFinish(t, finished)
+			seenFinish[got.id] = got.result.State
+		}
+		if seenFinish["race"] != TaskStateCompleted && seenFinish["race"] != TaskStateCancelled {
+			t.Fatalf("iteration %d race finish = %q", i, seenFinish["race"])
+		}
+		if seenFinish["next"] != TaskStateCancelled {
+			t.Fatalf("iteration %d next finish = %q, want cancelled", i, seenFinish["next"])
+		}
+		assertNoCleanup(t, cleaned)
+		assertNoFinish(t, finished)
+		assertStartedAtMostOnce(t, started, "next")
+	}
+}
+
+func assertStartedAtMostOnce(t *testing.T, started <-chan string, id string) {
+	t.Helper()
+	count := 0
+	for {
+		select {
+		case got := <-started:
+			if got == id {
+				count++
+			}
+			if count > 1 {
+				t.Fatalf("%s started %d times, want at most once", id, count)
+			}
+		default:
+			return
+		}
+	}
+}
+
+func TestConversationScopedCancellation(t *testing.T) {
+	modes := []struct {
+		name string
+		mode CancelMode
+	}{
+		{name: "stop", mode: CancelStop},
+		{name: "cancel", mode: CancelAndNew},
+		{name: "new", mode: CancelNew},
+	}
+	for _, tc := range modes {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := newFakeSchedulerClock(time.Unix(6_000, 0))
+			scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+			t.Cleanup(func() { scheduler.Stop(context.Background()) })
+
+			started := make(chan string, 4)
+			cleaned := make(chan string, 4)
+			finished := make(chan projectSchedulerFinishRecord, 4)
+			bRelease := make(chan struct{})
+
+			makeTask := func(id, scope string) ProjectTask {
+				return ProjectTask{
+					ID:         id,
+					SessionKey: scope,
+					Run: func(ctx context.Context) TaskResult {
+						started <- id
+						if scope == "scope-b" {
+							select {
+							case <-bRelease:
+								return TaskResult{State: TaskStateCompleted}
+							case <-ctx.Done():
+								return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+							}
+						}
+						<-ctx.Done()
+						return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+					},
+					Cleanup:  func() { cleaned <- id },
+					OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: id, result: result} },
+				}
+			}
+
+			if got := scheduler.Submit(makeTask("a1", "scope-a")); got.Status != SubmitStarted {
+				t.Fatalf("submit a1 = %+v", got)
+			}
+			if got := waitStarted(t, started); got != "a1" {
+				t.Fatalf("first start = %q", got)
+			}
+			if got := scheduler.Submit(makeTask("a2", "scope-a")); got.Status != SubmitQueued || got.Position != 1 {
+				t.Fatalf("submit a2 = %+v", got)
+			}
+			if got := scheduler.Submit(makeTask("b1", "scope-b")); got.Status != SubmitQueued || got.Position != 2 {
+				t.Fatalf("submit b1 = %+v", got)
+			}
+			if got := scheduler.Submit(makeTask("b2", "scope-b")); got.Status != SubmitQueued || got.Position != 3 {
+				t.Fatalf("submit b2 = %+v", got)
+			}
+
+			result := scheduler.CancelSession("scope-a", tc.mode)
+			if result.ActiveCancelled != 1 || result.WaitingCancelled != 1 {
+				t.Fatalf("CancelSession result = %+v, want active=1 waiting=1", result)
+			}
+
+			seenCleanup := map[string]int{}
+			seenFinish := map[string]string{}
+			for i := 0; i < 2; i++ {
+				seenCleanup[waitCleanup(t, cleaned)]++
+				finish := waitFinish(t, finished)
+				seenFinish[finish.id] = finish.result.State
+			}
+			if seenCleanup["a1"] != 1 || seenCleanup["a2"] != 1 {
+				t.Fatalf("scope-a cleanup = %+v, want a1/a2 once", seenCleanup)
+			}
+			if seenFinish["a1"] != TaskStateCancelled || seenFinish["a2"] != TaskStateCancelled {
+				t.Fatalf("scope-a finishes = %+v, want cancelled", seenFinish)
+			}
+
+			if got := waitStarted(t, started); got != "b1" {
+				t.Fatalf("next start = %q, want b1; cross-scope FIFO must be preserved", got)
+			}
+			close(bRelease)
+			if got := waitCleanup(t, cleaned); got != "b1" {
+				t.Fatalf("b1 cleanup = %q", got)
+			}
+			if got := waitFinish(t, finished); got.id != "b1" || got.result.State != TaskStateCompleted {
+				t.Fatalf("b1 finish = %+v", got)
+			}
+			if got := waitStarted(t, started); got != "b2" {
+				t.Fatalf("final start = %q, want b2", got)
+			}
+			if got := waitCleanup(t, cleaned); got != "b2" {
+				t.Fatalf("b2 cleanup = %q", got)
+			}
+			if got := waitFinish(t, finished); got.id != "b2" || got.result.State != TaskStateCompleted {
+				t.Fatalf("b2 finish = %+v", got)
+			}
+		})
+	}
+}
+
+func TestCancelSessionInvalidScopeAndModeFailClosed(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(6_100, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	t.Cleanup(func() { scheduler.Stop(context.Background()) })
+	started := make(chan string, 1)
+	if got := scheduler.Submit(ProjectTask{ID: "active", SessionKey: "scope-a", Run: func(ctx context.Context) TaskResult {
+		started <- "active"
+		<-ctx.Done()
+		return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit active = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "active" {
+		t.Fatalf("started = %q", got)
+	}
+	if got := scheduler.CancelSession("", CancelStop); got.ActiveCancelled != 0 || got.WaitingCancelled != 0 {
+		t.Fatalf("empty scope cancelled tasks: %+v", got)
+	}
+	if got := scheduler.CancelSession("scope-a", CancelMode("bogus")); got.ActiveCancelled != 0 || got.WaitingCancelled != 0 {
+		t.Fatalf("invalid mode cancelled tasks: %+v", got)
+	}
+	if snap := scheduler.Snapshot(); snap.ActiveCount != 1 || snap.Active == nil || snap.Active.SessionKey != "scope-a" {
+		t.Fatalf("snapshot after invalid cancels = %+v", snap)
+	}
+}
+
+func TestCancelSessionContextReturnsPendingForStubbornRunAndKeepsSlot(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(6_200, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		scheduler.Stop(ctx)
+	})
+
+	started := make(chan string, 2)
+	if got := scheduler.Submit(ProjectTask{ID: "stubborn", SessionKey: "scope-a", Run: func(context.Context) TaskResult {
+		started <- "stubborn"
+		select {}
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit stubborn = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "stubborn" {
+		t.Fatalf("started = %q", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	result := scheduler.CancelSessionContext(ctx, "scope-a", CancelStop)
+	if result.ActiveCancelled != 1 || result.WaitingCancelled != 0 || !result.Pending {
+		t.Fatalf("CancelSessionContext result = %+v, want active=1 waiting=0 pending=true", result)
+	}
+
+	if got := scheduler.Submit(ProjectTask{ID: "next", SessionKey: "scope-b", Run: func(context.Context) TaskResult {
+		started <- "next"
+		return TaskResult{State: TaskStateCompleted}
+	}}); got.Status != SubmitQueued || got.Position != 1 {
+		t.Fatalf("submit next while stubborn pending = %+v", got)
+	}
+	assertNoBufferedStart(t, started)
+	if snap := scheduler.Snapshot(); snap.Active == nil || snap.Active.ID != "stubborn" || snap.WaitingCount != 1 {
+		t.Fatalf("snapshot after pending cancel = %+v, want stubborn active and next waiting", snap)
+	}
+}
+
+func TestSchedulerStopCleansAllTasksAndRejectsNewSubmissions(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(7_300, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	started := make(chan string, 2)
+	cleaned := make(chan string, 3)
+	finished := make(chan projectSchedulerFinishRecord, 3)
+
+	if got := scheduler.Submit(ProjectTask{
+		ID: "active",
+		Run: func(ctx context.Context) TaskResult {
+			started <- "active"
+			<-ctx.Done()
+			return TaskResult{Err: ctx.Err()}
+		},
+		Cleanup:  func() { cleaned <- "active" },
+		OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: "active", result: result} },
+	}); got.Status != SubmitStarted {
+		t.Fatalf("submit active = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "active" {
+		t.Fatalf("started = %q", got)
+	}
+	for _, id := range []string{"waiting-1", "waiting-2"} {
+		id := id
+		if got := scheduler.Submit(ProjectTask{
+			ID:       id,
+			Run:      func(context.Context) TaskResult { started <- id; return TaskResult{State: TaskStateCompleted} },
+			Cleanup:  func() { cleaned <- id },
+			OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: id, result: result} },
+		}); got.Status != SubmitQueued {
+			t.Fatalf("submit %s = %+v", id, got)
+		}
+	}
+
+	scheduler.Stop(context.Background())
+	seenCleanup := map[string]int{}
+	seenFinish := map[string]string{}
+	for i := 0; i < 3; i++ {
+		seenCleanup[waitCleanup(t, cleaned)]++
+		got := waitFinish(t, finished)
+		seenFinish[got.id] = got.result.State
+	}
+	if seenCleanup["active"] != 1 || seenCleanup["waiting-1"] != 1 || seenCleanup["waiting-2"] != 1 {
+		t.Fatalf("cleanup counts = %+v, want each task once", seenCleanup)
+	}
+	if seenFinish["active"] != TaskStateCancelled || seenFinish["waiting-1"] != TaskStateCancelled || seenFinish["waiting-2"] != TaskStateCancelled {
+		t.Fatalf("finish states = %+v, want all cancelled", seenFinish)
+	}
+	if got := scheduler.Submit(ProjectTask{ID: "late"}); got.Status != SubmitRejectedStopped {
+		t.Fatalf("post-stop submit = %+v, want rejected_stopped", got)
+	}
+	assertNoBufferedStart(t, started)
+}
+
+func TestStopDeadlineThenLateRunCompletionDoesNotDoublePublishOrCleanup(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(7_400, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	started := make(chan string, 2)
+	cleaned := make(chan string, 3)
+	finished := make(chan projectSchedulerFinishRecord, 3)
+	ctxCancelled := make(chan struct{})
+	releaseActive := make(chan struct{})
+
+	if got := scheduler.Submit(ProjectTask{
+		ID: "stubborn",
+		Run: func(ctx context.Context) TaskResult {
+			started <- "stubborn"
+			<-ctx.Done()
+			close(ctxCancelled)
+			<-releaseActive
+			return TaskResult{State: TaskStateCompleted}
+		},
+		Cleanup:  func() { cleaned <- "stubborn" },
+		OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: "stubborn", result: result} },
+	}); got.Status != SubmitStarted {
+		t.Fatalf("submit stubborn = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "stubborn" {
+		t.Fatalf("started = %q", got)
+	}
+	if got := scheduler.Submit(ProjectTask{
+		ID:       "next",
+		Run:      func(context.Context) TaskResult { started <- "next"; return TaskResult{State: TaskStateCompleted} },
+		Cleanup:  func() { cleaned <- "next" },
+		OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: "next", result: result} },
+	}); got.Status != SubmitQueued {
+		t.Fatalf("submit next = %+v", got)
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	stopReturned := make(chan struct{})
+	go func() { scheduler.Stop(stopCtx); close(stopReturned) }()
+	select {
+	case <-ctxCancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not cancel active context")
+	}
+	waitStopReturned(t, stopReturned)
+	if got := waitCleanup(t, cleaned); got != "next" {
+		t.Fatalf("first cleanup = %q, want waiting next cleanup at Stop", got)
+	}
+	if got := waitFinish(t, finished); got.id != "next" || got.result.State != TaskStateCancelled {
+		t.Fatalf("waiting finish = %+v, want cancelled", got)
+	}
+	assertNoCleanup(t, cleaned)
+	assertNoFinish(t, finished)
+	assertNoBufferedStart(t, started)
+	if got := scheduler.Submit(ProjectTask{ID: "post-stop"}); got.Status != SubmitRejectedStopped {
+		t.Fatalf("post-stop submit = %+v, want rejected_stopped", got)
+	}
+
+	close(releaseActive)
+	if got := waitCleanup(t, cleaned); got != "stubborn" {
+		t.Fatalf("late cleanup = %q, want stubborn once", got)
+	}
+	if got := waitFinish(t, finished); got.id != "stubborn" || got.result.State != TaskStateCancelled {
+		t.Fatalf("late finish = %+v, want cancelled once", got)
+	}
+	assertNoCleanup(t, cleaned)
+	assertNoFinish(t, finished)
+	assertNoBufferedStart(t, started)
+}
+
+func TestNewSchedulerStartsWithEmptyQueue(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(7_500, 0))
+	old := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	started := make(chan string, 2)
+	if got := old.Submit(ProjectTask{ID: "active", Run: func(ctx context.Context) TaskResult {
+		started <- "active"
+		<-ctx.Done()
+		return TaskResult{Err: ctx.Err()}
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit active = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "active" {
+		t.Fatalf("started = %q", got)
+	}
+	if got := old.Submit(ProjectTask{ID: "queued", Run: func(context.Context) TaskResult {
+		started <- "queued"
+		return TaskResult{State: TaskStateCompleted}
+	}}); got.Status != SubmitQueued {
+		t.Fatalf("submit queued = %+v", got)
+	}
+	old.Stop(context.Background())
+
+	fresh := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	defer fresh.Stop(context.Background())
+	if snap := fresh.Snapshot(); snap.ActiveCount != 0 || snap.WaitingCount != 0 || len(snap.Waiting) != 0 || snap.Active != nil {
+		t.Fatalf("fresh scheduler snapshot = %+v, want empty/no replay", snap)
+	}
+	assertNoBufferedStart(t, started)
+}

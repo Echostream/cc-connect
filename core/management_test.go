@@ -625,12 +625,19 @@ func TestMgmt_CronExecByID(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(platform.getSent()) >= 2 {
-			break
+			found, lastRunSet, _ := cronJobRunStatus(store, job.ID)
+			if !found {
+				t.Fatal("expected stored cron exec job")
+			}
+			if lastRunSet {
+				break
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if len(platform.getSent()) < 2 {
-		t.Fatalf("timed out waiting for triggered cron exec, sent=%v", platform.getSent())
+	found, lastRunSet, _ := cronJobRunStatus(store, job.ID)
+	if len(platform.getSent()) < 2 || !found || !lastRunSet {
+		t.Fatalf("timed out waiting for triggered cron exec persistence, sent=%v found=%v last_run_set=%v", platform.getSent(), found, lastRunSet)
 	}
 
 	aliasJob := &CronJob{
@@ -656,11 +663,18 @@ func TestMgmt_CronExecByID(t *testing.T) {
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(platform.getSent()) >= 4 {
-			return
+			found, lastRunSet, _ := cronJobRunStatus(store, aliasJob.ID)
+			if !found {
+				t.Fatal("expected stored cron alias job")
+			}
+			if lastRunSet {
+				return
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for triggered cron run alias, sent=%v", platform.getSent())
+	found, lastRunSet, _ = cronJobRunStatus(store, aliasJob.ID)
+	t.Fatalf("timed out waiting for triggered cron run alias persistence, sent=%v found=%v last_run_set=%v", platform.getSent(), found, lastRunSet)
 }
 
 func TestMgmt_CronExecByID_RejectsExtraPathSegments(t *testing.T) {

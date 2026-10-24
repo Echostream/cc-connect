@@ -129,6 +129,7 @@ type cujAgentSession struct {
 	// observed
 	sentPrompts []string
 	sentImages  [][]ImageAttachment
+	sentFiles   [][]FileAttachment
 	closeCount  int
 }
 
@@ -149,10 +150,11 @@ func newCUJAgentSession() *cujAgentSession {
 	}
 }
 
-func (s *cujAgentSession) Send(prompt string, _ string, images []ImageAttachment, _ []FileAttachment) error {
+func (s *cujAgentSession) Send(prompt string, _ string, images []ImageAttachment, files []FileAttachment) error {
 	s.mu.Lock()
 	s.sentPrompts = append(s.sentPrompts, prompt)
 	s.sentImages = append(s.sentImages, cloneCUJImages(images))
+	s.sentFiles = append(s.sentFiles, cloneCUJFiles(files))
 	reply := s.reply
 	delay := s.delayMs
 	override := s.nextEventOverride
@@ -225,12 +227,31 @@ func cloneCUJImages(images []ImageAttachment) []ImageAttachment {
 	return out
 }
 
+func cloneCUJFiles(files []FileAttachment) []FileAttachment {
+	out := make([]FileAttachment, len(files))
+	for i, file := range files {
+		out[i] = file
+		out[i].Data = append([]byte(nil), file.Data...)
+	}
+	return out
+}
+
 func (s *cujAgentSession) getSentImages() [][]ImageAttachment {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([][]ImageAttachment, len(s.sentImages))
 	for i, images := range s.sentImages {
 		out[i] = cloneCUJImages(images)
+	}
+	return out
+}
+
+func (s *cujAgentSession) getSentFiles() [][]FileAttachment {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([][]FileAttachment, len(s.sentFiles))
+	for i, files := range s.sentFiles {
+		out[i] = cloneCUJFiles(files)
 	}
 	return out
 }
@@ -1239,6 +1260,7 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
 
 	msg := &Message{
 		SessionKey: "test:file", Platform: "test", MessageID: "f1",
@@ -1249,20 +1271,39 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 	}
 	e.ReceiveMessage(plat, msg)
 
-	deadline := time.After(2 * time.Second)
-	for {
+	deadline := time.Now().Add(2 * time.Second)
+	var sess *cujAgentSession
+	for time.Now().Before(deadline) {
 		agent.mu.Lock()
-		n := len(agent.sessions)
+		if len(agent.sessions) > 0 {
+			sess = agent.sessions[0]
+		}
 		agent.mu.Unlock()
-		if n > 0 {
-			return
+		if sess != nil && len(plat.getSent()) > 0 && !e.sessions.GetOrCreateActive("test:file").Busy() {
+			break
 		}
-		select {
-		case <-deadline:
-			t.Fatal("agent never received the message with file attachment")
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sess == nil {
+		t.Fatal("agent never received the message with file attachment")
+	}
+	if len(plat.getSent()) == 0 {
+		t.Fatal("timed out waiting for final platform reply before asserting file delivery")
+	}
+	if e.sessions.GetOrCreateActive("test:file").Busy() {
+		t.Fatal("session still busy after final reply; refusing to race TempDir cleanup")
+	}
+	prompts := sess.getSentPrompts()
+	if len(prompts) != 1 || !strings.Contains(prompts[0], "read this file") {
+		t.Fatalf("agent prompts = %q, want one prompt with file request", prompts)
+	}
+	files := sess.getSentFiles()
+	if len(files) != 1 || len(files[0]) != 1 {
+		t.Fatalf("agent files = %+v, want one delivered file", files)
+	}
+	got := files[0][0]
+	if got.FileName != "note.txt" || got.MimeType != "text/plain" || !bytes.Equal(got.Data, []byte("hello world")) {
+		t.Fatalf("delivered file = %+v data=%q, want note.txt text/plain hello world", got, string(got.Data))
 	}
 }
 

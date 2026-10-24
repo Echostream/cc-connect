@@ -3527,3 +3527,46 @@ func TestRemoveGlobalProvider_CleansUpProviderRefs(t *testing.T) {
 		t.Errorf("proj2 provider_refs: want [], got %v", refs2)
 	}
 }
+
+func TestProjectSchedulerFixedLegacyConfigValidation(t *testing.T) {
+	cfg := Config{Projects: []ProjectConfig{validProject("demo")}}
+	queue := 5
+	cfg.Queue.MaxDepth = &queue
+	assertErrContains(t, cfg.validate(), "queue.max_depth must be 10")
+
+	cfg = Config{Projects: []ProjectConfig{validProject("demo")}}
+	maxTurn := 0
+	cfg.MaxTurnTimeMins = &maxTurn
+	assertErrContains(t, cfg.validate(), "max_turn_time_mins must be 30")
+
+	cfg = Config{Projects: []ProjectConfig{validProject("demo")}}
+	queue = 10
+	maxTurn = 30
+	cfg.Queue.MaxDepth = &queue
+	cfg.MaxTurnTimeMins = &maxTurn
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate fixed scheduler values: %v", err)
+	}
+}
+
+func TestSaveGlobalSettingsRejectsNonFixedQueueMaxDepth(t *testing.T) {
+	writeTestConfig(t, `[[projects]]
+name = "demo"
+[projects.agent]
+type = "claudecode"
+[projects.agent.options]
+mode = "default"
+[[projects.platforms]]
+type = "telegram"
+[projects.platforms.options]
+token = "test-token"
+`)
+	bad := 5
+	if err := SaveGlobalSettings(GlobalSettingsUpdate{QueueMaxDepth: &bad}); err == nil || !strings.Contains(err.Error(), "queue.max_depth must be 10") {
+		t.Fatalf("SaveGlobalSettings bad queue err = %v, want fixed value rejection", err)
+	}
+	good := 10
+	if err := SaveGlobalSettings(GlobalSettingsUpdate{QueueMaxDepth: &good}); err != nil {
+		t.Fatalf("SaveGlobalSettings fixed queue: %v", err)
+	}
+}

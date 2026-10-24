@@ -435,3 +435,27 @@ func TestRunTopLevelCommandUnknown(t *testing.T) {
 		t.Fatal("runTopLevelCommand() handled unknown command")
 	}
 }
+
+type shutdownOrderPlatform struct {
+	name  string
+	order *[]string
+}
+
+func (p *shutdownOrderPlatform) Name() string                             { return p.name }
+func (p *shutdownOrderPlatform) Start(core.MessageHandler) error          { return nil }
+func (p *shutdownOrderPlatform) Reply(context.Context, any, string) error { return nil }
+func (p *shutdownOrderPlatform) Send(context.Context, any, string) error  { return nil }
+func (p *shutdownOrderPlatform) Stop() error {
+	*p.order = append(*p.order, p.name)
+	return nil
+}
+
+func TestStopEnginesForShutdownStopsAllEnginesWithoutSignals(t *testing.T) {
+	var order []string
+	e1 := core.NewEngine("one", &stubMainAgent{}, []core.Platform{&shutdownOrderPlatform{name: "p1", order: &order}}, filepath.Join(t.TempDir(), "s1.json"), core.LangEnglish)
+	e2 := core.NewEngine("two", &stubMainAgent{}, []core.Platform{&shutdownOrderPlatform{name: "p2", order: &order}}, filepath.Join(t.TempDir(), "s2.json"), core.LangEnglish)
+	stopEnginesForShutdown([]*core.Engine{e1, nil, e2}, func(err error) { t.Fatalf("unexpected stop error: %v", err) })
+	if got, want := strings.Join(order, ","), "p1,p2"; got != want {
+		t.Fatalf("shutdown platform stop order = %q, want %q", got, want)
+	}
+}

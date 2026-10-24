@@ -270,3 +270,43 @@ func TestAllowList(t *testing.T) {
 		}
 	}
 }
+
+func TestBusyCommandClassificationExactCommandsAndSubcommands(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		args []string
+		want BusyCommandDisposition
+	}{
+		{name: "status readonly", cmd: "status", want: BusyCommandReadonly},
+		{name: "queue readonly", cmd: "queue", want: BusyCommandReadonly},
+		{name: "stop scope control", cmd: "stop", want: BusyCommandScopeControl},
+		{name: "model query no args", cmd: "model", want: BusyCommandReadonly},
+		{name: "model list query", cmd: "model", args: []string{"list"}, want: BusyCommandReadonly},
+		{name: "model target mutation", cmd: "model", args: []string{"doubao-seed-2.1-pro"}, want: BusyCommandSharedMutation},
+		{name: "provider current query", cmd: "provider", args: []string{"current"}, want: BusyCommandReadonly},
+		{name: "provider switch mutation", cmd: "provider", args: []string{"switch", "ark"}, want: BusyCommandSharedMutation},
+		{name: "commands list query", cmd: "commands", args: []string{"list"}, want: BusyCommandReadonly},
+		{name: "commands add mutation", cmd: "commands", args: []string{"add", "x", "prompt"}, want: BusyCommandSharedMutation},
+		{name: "cron list query", cmd: "cron", args: []string{"list"}, want: BusyCommandReadonly},
+		{name: "cron run agent trigger", cmd: "cron", args: []string{"run", "job"}, want: BusyCommandAgentTrigger},
+		{name: "shell mutation risk", cmd: "shell", args: []string{"echo", "hi"}, want: BusyCommandSharedMutation},
+		{name: "ps active supplement rejected", cmd: "ps", args: []string{"more"}, want: BusyCommandSharedMutation},
+		{name: "unknown stays unknown", cmd: "does-not-exist", want: BusyCommandUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ClassifyBusyCommand(tt.cmd, tt.args); got != tt.want {
+				t.Fatalf("ClassifyBusyCommand(%q, %v) = %v, want %v", tt.cmd, tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBusyCommandClassificationDoesNotInferBySubstring(t *testing.T) {
+	for _, cmd := range []string{"modelset", "statusx", "queue-depth", "shellsafe"} {
+		if got := ClassifyBusyCommand(cmd, nil); got != BusyCommandUnknown {
+			t.Fatalf("ClassifyBusyCommand(%q) = %v, want unknown", cmd, got)
+		}
+	}
+}

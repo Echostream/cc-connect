@@ -9269,20 +9269,13 @@ func TestIssue814_QueuedMessageAfterCleanEventResult_UsesOwnReplyCtx(t *testing.
 		}
 		sess.sendMu.Unlock()
 
-		// Wait until B has been queued behind A. Poll the engine's
-		// interactive state directly; this is the same state that
-		// handleMessage updated when it called queueMessageForBusySession.
+		// Wait until B has been accepted by the project scheduler behind A.
+		// Task 3.3 removes the old per-session pendingMessages queue, so this
+		// regression now observes the project FIFO rather than state.pendingMessages.
 		for {
-			e.interactiveMu.Lock()
-			st, ok := e.interactiveStates[key]
-			e.interactiveMu.Unlock()
-			if ok && st != nil {
-				st.mu.Lock()
-				n := len(st.pendingMessages)
-				st.mu.Unlock()
-				if n >= 1 {
-					break
-				}
+			snap := e.projectScheduler.Snapshot()
+			if snap.WaitingCount >= 1 && len(snap.Waiting) > 0 && snap.Waiting[0].SessionKey == key {
+				break
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
@@ -10189,18 +10182,23 @@ func TestCmdCompress_SessionBusy_RepliesPreviousProcessing(t *testing.T) {
 	msg := &Message{SessionKey: key, Content: "/compress", ReplyCtx: "ctx"}
 	e.cmdCompress(p, msg)
 
-	sent := p.getSent()
-	found := false
-	for _, s := range sent {
-		if strings.Contains(s, e.i18n.T(MsgPreviousProcessing)) {
-			found = true
-			break
+	deadline := time.After(2 * time.Second)
+	for {
+		sent := p.getSent()
+		for _, s := range sent {
+			if strings.Contains(s, e.i18n.T(MsgPreviousProcessing)) {
+				session.Unlock(0)
+				return
+			}
+		}
+		select {
+		case <-deadline:
+			session.Unlock(0)
+			t.Fatalf("expected MsgPreviousProcessing reply, got %v", sent)
+		default:
+			time.Sleep(5 * time.Millisecond)
 		}
 	}
-	if !found {
-		t.Fatalf("expected MsgPreviousProcessing reply, got %v", sent)
-	}
-	session.Unlock(0)
 }
 
 func TestCmdCompress_Success_SendsCompressDone(t *testing.T) {
@@ -16389,4 +16387,1129 @@ func TestProcessInteractiveEvents_StreamingCard_BareNoReply_Suppressed(t *testin
 	if strings.Contains(card.finalContent(), "NO_REPLY") {
 		t.Fatalf("silent reply leaked NO_REPLY into the streaming card: %q", card.finalContent())
 	}
+}
+
+type schedulerResumeAgent struct {
+	mu          sync.Mutex
+	sessions    []*schedulerResumeSession
+	startIDs    []string
+	startCtxs   []context.Context
+	nextStarted chan *schedulerResumeSession
+}
+
+func newSchedulerResumeAgent() *schedulerResumeAgent {
+	return &schedulerResumeAgent{nextStarted: make(chan *schedulerResumeSession, 4)}
+}
+
+func (a *schedulerResumeAgent) Name() string { return "resume" }
+func (a *schedulerResumeAgent) StartSession(ctx context.Context, sessionID string) (AgentSession, error) {
+	s := newSchedulerResumeSession("stored-session-id")
+	a.mu.Lock()
+	a.startIDs = append(a.startIDs, sessionID)
+	a.startCtxs = append(a.startCtxs, ctx)
+	a.sessions = append(a.sessions, s)
+	a.mu.Unlock()
+	a.nextStarted <- s
+	return s, nil
+}
+func (a *schedulerResumeAgent) ListSessions(context.Context) ([]AgentSessionInfo, error) {
+	return nil, nil
+}
+func (a *schedulerResumeAgent) Stop() error { return nil }
+func (a *schedulerResumeAgent) calls() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.startIDs...)
+}
+func (a *schedulerResumeAgent) ctxs() []context.Context {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]context.Context(nil), a.startCtxs...)
+}
+
+type schedulerResumeSession struct {
+	id        string
+	events    chan Event
+	closed    chan struct{}
+	closeOnce sync.Once
+	alive     atomic.Bool
+	mu        sync.Mutex
+	prompts   []string
+	messageID []string
+}
+
+func newSchedulerResumeSession(id string) *schedulerResumeSession {
+	s := &schedulerResumeSession{id: id, events: make(chan Event), closed: make(chan struct{})}
+	s.alive.Store(true)
+	return s
+}
+func (s *schedulerResumeSession) Send(prompt string, messageID string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.mu.Lock()
+	s.prompts = append(s.prompts, prompt)
+	s.messageID = append(s.messageID, messageID)
+	s.mu.Unlock()
+	<-s.closed
+	return context.Canceled
+}
+func (s *schedulerResumeSession) RespondPermission(string, PermissionResult) error { return nil }
+func (s *schedulerResumeSession) Events() <-chan Event                             { return s.events }
+func (s *schedulerResumeSession) CurrentSessionID() string                         { return s.id }
+func (s *schedulerResumeSession) Alive() bool                                      { return s.alive.Load() }
+func (s *schedulerResumeSession) Close() error {
+	s.closeOnce.Do(func() {
+		s.alive.Store(false)
+		close(s.closed)
+		close(s.events)
+	})
+	return nil
+}
+func (s *schedulerResumeSession) promptsSnapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.prompts...)
+}
+
+func waitSchedulerResumeSession(t *testing.T, ch <-chan *schedulerResumeSession) *schedulerResumeSession {
+	t.Helper()
+	select {
+	case got := <-ch:
+		return got
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for scheduler resume StartSession")
+		return nil
+	}
+}
+
+func waitSchedulerResumePrompt(t *testing.T, s *schedulerResumeSession, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		prompts := s.promptsSnapshot()
+		for _, got := range prompts {
+			if strings.Contains(got, want) {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for prompt containing %q; prompts=%q", want, s.promptsSnapshot())
+}
+
+func waitSchedulerSnapshot(t *testing.T, scheduler *ProjectScheduler, pred func(SchedulerSnapshot) bool) SchedulerSnapshot {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var last SchedulerSnapshot
+	for time.Now().Before(deadline) {
+		last = scheduler.Snapshot()
+		if pred(last) {
+			return last
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for scheduler snapshot; last=%+v", last)
+	return last
+}
+
+func TestThirtyMinuteTimeoutRetainsSessionForExplicitResume(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(7_000, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	agent := newSchedulerResumeAgent()
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	e.projectScheduler = scheduler
+	t.Cleanup(func() { _ = e.Stop() })
+
+	e.handleMessage(platform, &Message{SessionKey: "test:scope", Platform: "test", MessageID: "m-old", UserID: "u", UserName: "user", Content: "old prompt", ReplyCtx: "r-old"})
+	first := waitSchedulerResumeSession(t, agent.nextStarted)
+	waitSchedulerResumePrompt(t, first, "old prompt")
+	if calls := agent.calls(); len(calls) != 1 || calls[0] != "" {
+		t.Fatalf("initial StartSession calls = %q, want fresh empty id", calls)
+	}
+
+	clock.Advance(30 * time.Minute)
+	waitSchedulerSnapshot(t, scheduler, func(s SchedulerSnapshot) bool { return s.ActiveCount == 0 && s.WaitingCount == 0 })
+	if got := e.sessions.GetOrCreateActive("test:scope").GetAgentSessionID(); got != "stored-session-id" {
+		t.Fatalf("stored session id after timeout = %q, want retained", got)
+	}
+	if prompts := first.promptsSnapshot(); len(prompts) != 1 || !strings.Contains(prompts[0], "old prompt") {
+		t.Fatalf("first prompts = %q, want exactly one old prompt", prompts)
+	}
+
+	e.handleMessage(platform, &Message{SessionKey: "test:scope", Platform: "test", MessageID: "m-new", UserID: "u", UserName: "user", Content: "new prompt", ReplyCtx: "r-new"})
+	second := waitSchedulerResumeSession(t, agent.nextStarted)
+	waitSchedulerResumePrompt(t, second, "new prompt")
+	calls := agent.calls()
+	if len(calls) != 2 || calls[1] != "stored-session-id" {
+		t.Fatalf("StartSession calls = %q, want second call to resume stored id", calls)
+	}
+	if prompts := first.promptsSnapshot(); len(prompts) != 1 {
+		t.Fatalf("old session prompts changed after explicit resume: %q", prompts)
+	}
+	if prompts := second.promptsSnapshot(); len(prompts) != 1 || !strings.Contains(prompts[0], "new prompt") || strings.Contains(prompts[0], "old prompt") {
+		t.Fatalf("second prompts = %q, want one new prompt and no replay", prompts)
+	}
+	ctxs := agent.ctxs()
+	if len(ctxs) != 2 {
+		t.Fatalf("StartSession ctx count = %d", len(ctxs))
+	}
+	if ctxs[0] == e.ctx || ctxs[1] == e.ctx {
+		t.Fatal("StartSession used Engine lifetime context; want scheduler per-run context")
+	}
+}
+
+func TestUnsafeResumeCloseErrorKeepsSessionIDAndDoesNotFreshStart(t *testing.T) {
+	agent := &stubStartSessionAgent{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e := &Engine{
+		agent:             agent,
+		sessions:          NewSessionManager(""),
+		ctx:               ctx,
+		i18n:              NewI18n("en"),
+		interactiveStates: make(map[string]*interactiveState),
+		closingSessions:   make(map[string]chan struct{}),
+		unsafeResume:      make(map[string]bool),
+		display:           DisplayCfg{},
+	}
+	key := "test:unsafe-close-error"
+	session := e.sessions.GetOrCreateActive(key)
+	session.SetAgentSessionID("kept-session-id", "stub")
+	e.markUnsafeResume(key)
+	p := &stubPlatformEngine{n: "test"}
+
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
+	if state.agentSession != nil {
+		t.Fatal("unsafe resume must fail closed without starting a fresh agent")
+	}
+	if got := session.GetAgentSessionID(); got != "kept-session-id" {
+		t.Fatalf("agent session id = %q, want metadata retained", got)
+	}
+	agent.mu.Lock()
+	calls := append([]string(nil), agent.calls...)
+	agent.mu.Unlock()
+	if len(calls) != 0 {
+		t.Fatalf("StartSession calls = %q, want none while previous close is unsafe", calls)
+	}
+	if !e.peekUnsafeResume(key) {
+		t.Fatal("unsafe marker was consumed; retry must remain blocked until close is confirmed")
+	}
+}
+
+func TestEngineStopReturnsWhenSchedulerRunDoesNotExit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(6_300, 0)), 10, 6*time.Hour, 30*time.Minute)
+	started := make(chan struct{}, 1)
+	if got := scheduler.Submit(ProjectTask{ID: "stubborn", SessionKey: "scope-a", Run: func(context.Context) TaskResult {
+		started <- struct{}{}
+		select {}
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit stubborn = %+v", got)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stubborn task did not start")
+	}
+	e := &Engine{
+		agent:                       &stubAgent{},
+		ctx:                         ctx,
+		cancel:                      cancel,
+		i18n:                        NewI18n("en"),
+		interactiveStates:           make(map[string]*interactiveState),
+		projectScheduler:            scheduler,
+		projectSchedulerStopTimeout: 20 * time.Millisecond,
+	}
+	start := time.Now()
+	err := e.Stop()
+	if err == nil {
+		t.Fatal("Engine.Stop returned nil; want scheduler timeout error")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Engine.Stop took %s, want bounded stop", elapsed)
+	}
+	if !strings.Contains(err.Error(), "project scheduler stop") {
+		t.Fatalf("Engine.Stop error = %v, want project scheduler stop context", err)
+	}
+}
+
+func TestCloseErrorKeepsSessionIDAndBlocksFreshStart(t *testing.T) {
+	agent := &stubStartSessionAgent{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e := &Engine{
+		agent:             agent,
+		sessions:          NewSessionManager(""),
+		ctx:               ctx,
+		i18n:              NewI18n("en"),
+		interactiveStates: make(map[string]*interactiveState),
+		closingSessions:   make(map[string]chan struct{}),
+		unsafeResume:      make(map[string]bool),
+		display:           DisplayCfg{},
+	}
+	key := "test:close-error"
+	session := e.sessions.GetOrCreateActive(key)
+	session.SetAgentSessionID("kept-after-close-error", "stub")
+	p := &stubPlatformEngine{n: "test"}
+	closing := newControllableSession("kept-after-close-error")
+	closing.closeErr = fmt.Errorf("process may still be alive")
+	e.closeAgentSessionAsync(key, closing, p, "ctx")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !e.peekUnsafeResume(key) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !e.peekUnsafeResume(key) {
+		t.Fatal("close error must mark unsafe resume")
+	}
+	if got := session.GetAgentSessionID(); got != "kept-after-close-error" {
+		t.Fatalf("agent session id = %q, want retained", got)
+	}
+	agent.mu.Lock()
+	calls := append([]string(nil), agent.calls...)
+	agent.mu.Unlock()
+	if len(calls) != 0 {
+		t.Fatalf("StartSession calls = %q, want none after close error", calls)
+	}
+}
+
+func TestCloseTimeoutKeepsSessionIDAndBlocksFreshStart(t *testing.T) {
+	agent := &stubStartSessionAgent{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e := &Engine{
+		agent:                    agent,
+		sessions:                 NewSessionManager(""),
+		ctx:                      ctx,
+		i18n:                     NewI18n("en"),
+		interactiveStates:        make(map[string]*interactiveState),
+		closingSessions:          make(map[string]chan struct{}),
+		unsafeResume:             make(map[string]bool),
+		display:                  DisplayCfg{},
+		agentSessionCloseTimeout: 20 * time.Millisecond,
+	}
+	key := "test:close-timeout"
+	session := e.sessions.GetOrCreateActive(key)
+	session.SetAgentSessionID("kept-after-close-timeout", "stub")
+	p := &stubPlatformEngine{n: "test"}
+	closing := newControllableSession("kept-after-close-timeout")
+	closing.closeDelay = 120 * time.Millisecond
+	e.closeAgentSessionAsync(key, closing, p, "ctx")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !e.peekUnsafeResume(key) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !e.peekUnsafeResume(key) {
+		t.Fatal("close timeout must mark unsafe resume while close is unconfirmed")
+	}
+	if got := session.GetAgentSessionID(); got != "kept-after-close-timeout" {
+		t.Fatalf("agent session id = %q, want retained", got)
+	}
+	agent.mu.Lock()
+	calls := append([]string(nil), agent.calls...)
+	agent.mu.Unlock()
+	if len(calls) != 0 {
+		t.Fatalf("StartSession calls = %q, want none while close timeout is unconfirmed", calls)
+	}
+}
+
+func TestCmdNewPendingCancelDoesNotResetSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(6_400, 0)), 10, 6*time.Hour, 30*time.Minute)
+	started := make(chan struct{}, 1)
+	if got := scheduler.Submit(ProjectTask{ID: "stubborn", SessionKey: "test:pending-new", Run: func(context.Context) TaskResult {
+		started <- struct{}{}
+		select {}
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit stubborn = %+v", got)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stubborn task did not start")
+	}
+	e := &Engine{
+		agent:                         &stubAgent{},
+		sessions:                      NewSessionManager(""),
+		ctx:                           ctx,
+		cancel:                        cancel,
+		i18n:                          NewI18n("en"),
+		interactiveStates:             make(map[string]*interactiveState),
+		closingSessions:               make(map[string]chan struct{}),
+		unsafeResume:                  make(map[string]bool),
+		projectScheduler:              scheduler,
+		projectSchedulerCancelTimeout: 20 * time.Millisecond,
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer stopCancel()
+		scheduler.Stop(stopCtx)
+	})
+	key := "test:pending-new"
+	old := e.sessions.GetOrCreateActive(key)
+	old.SetAgentSessionID("must-stay", "stub")
+	old.AddHistory("user", "keep history")
+	oldID := old.ID
+	p := &stubPlatformEngine{n: "test"}
+
+	e.cmdNew(p, &Message{SessionKey: key, Platform: "test", ReplyCtx: "ctx"}, nil)
+	after := e.sessions.GetOrCreateActive(key)
+	if after.ID != oldID {
+		t.Fatalf("active session id = %q, want old %q when cancel is pending", after.ID, oldID)
+	}
+	if got := after.GetAgentSessionID(); got != "must-stay" {
+		t.Fatalf("agent session id = %q, want retained", got)
+	}
+	if len(after.GetHistory(0)) == 0 {
+		t.Fatal("history was cleared even though cancel is pending")
+	}
+	if snap := scheduler.Snapshot(); snap.Active == nil || snap.Active.ID != "stubborn" {
+		t.Fatalf("scheduler snapshot = %+v, want old active retained", snap)
+	}
+}
+
+type closeBarrierAgent struct {
+	mu       sync.Mutex
+	sessions []*closeBarrierSession
+	starts   []string
+}
+
+func (a *closeBarrierAgent) Name() string { return "close-barrier" }
+func (a *closeBarrierAgent) StartSession(_ context.Context, sessionID string) (AgentSession, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	s := newCloseBarrierSession(fmt.Sprintf("close-barrier-%d", len(a.sessions)+1))
+	a.sessions = append(a.sessions, s)
+	a.starts = append(a.starts, sessionID)
+	return s, nil
+}
+func (a *closeBarrierAgent) ListSessions(context.Context) ([]AgentSessionInfo, error) {
+	return nil, nil
+}
+func (a *closeBarrierAgent) Stop() error     { return nil }
+func (a *closeBarrierAgent) startCount() int { a.mu.Lock(); defer a.mu.Unlock(); return len(a.starts) }
+func (a *closeBarrierAgent) sessionAt(i int) *closeBarrierSession {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sessions[i]
+}
+
+type closeBarrierSession struct {
+	id         string
+	events     chan Event
+	closed     chan struct{}
+	closeDelay time.Duration
+	closeErr   error
+	closeOnce  sync.Once
+	alive      atomic.Bool
+	mu         sync.Mutex
+	prompts    []string
+}
+
+func newCloseBarrierSession(id string) *closeBarrierSession {
+	s := &closeBarrierSession{id: id, events: make(chan Event), closed: make(chan struct{})}
+	s.alive.Store(true)
+	return s
+}
+func (s *closeBarrierSession) Send(prompt string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.mu.Lock()
+	s.prompts = append(s.prompts, prompt)
+	s.mu.Unlock()
+	<-s.closed
+	return context.Canceled
+}
+func (s *closeBarrierSession) RespondPermission(string, PermissionResult) error { return nil }
+func (s *closeBarrierSession) Events() <-chan Event                             { return s.events }
+func (s *closeBarrierSession) CurrentSessionID() string                         { return s.id }
+func (s *closeBarrierSession) Alive() bool                                      { return s.alive.Load() }
+func (s *closeBarrierSession) Close() error {
+	if s.closeDelay > 0 {
+		time.Sleep(s.closeDelay)
+	}
+	s.closeOnce.Do(func() {
+		s.alive.Store(false)
+		close(s.closed)
+		close(s.events)
+	})
+	return s.closeErr
+}
+func (s *closeBarrierSession) promptCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.prompts)
+}
+
+func waitCloseBarrierStartCount(t *testing.T, agent *closeBarrierAgent, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if agent.startCount() >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("StartSession count = %d, want >= %d", agent.startCount(), want)
+}
+
+func waitCloseBarrierPrompt(t *testing.T, s *closeBarrierSession) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if s.promptCount() > 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for close barrier Send")
+}
+
+func TestCloseTimeoutHoldsProjectSlotUntilLateCloseConfirmed(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(7_100, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	agent := &closeBarrierAgent{}
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	e.projectScheduler = scheduler
+	e.agentSessionCloseTimeout = 20 * time.Millisecond
+	e.projectSchedulerStopTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { _ = e.Stop() })
+
+	e.handleMessage(platform, &Message{SessionKey: "test:a", Platform: "test", MessageID: "a1", UserID: "u", UserName: "u", Content: "hold a", ReplyCtx: "ra"})
+	waitCloseBarrierStartCount(t, agent, 1)
+	first := agent.sessionAt(0)
+	first.closeDelay = 120 * time.Millisecond
+	waitCloseBarrierPrompt(t, first)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	_ = scheduler.CancelSessionContext(ctx, "test:a", CancelStop)
+	e.handleMessage(platform, &Message{SessionKey: "test:b", Platform: "test", MessageID: "b1", UserID: "u", UserName: "u", Content: "queued b", ReplyCtx: "rb"})
+
+	time.Sleep(60 * time.Millisecond)
+	if got := agent.startCount(); got != 1 {
+		t.Fatalf("StartSession count before close confirmation = %d, want only original A", got)
+	}
+	waitCloseBarrierStartCount(t, agent, 2)
+	if got := e.sessions.GetOrCreateActive("test:a").GetAgentSessionID(); got != "close-barrier-1" {
+		t.Fatalf("A session id = %q, want retained close-barrier-1", got)
+	}
+}
+
+func TestCloseErrorHoldsProjectSlotAndNewDoesNotClearMetadata(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(7_200, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	agent := &closeBarrierAgent{}
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	e.projectScheduler = scheduler
+	e.agentSessionCloseTimeout = 20 * time.Millisecond
+	e.projectSchedulerCancelTimeout = 20 * time.Millisecond
+	e.projectSchedulerStopTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { _ = e.Stop() })
+
+	e.handleMessage(platform, &Message{SessionKey: "test:a", Platform: "test", MessageID: "a1", UserID: "u", UserName: "u", Content: "hold a", ReplyCtx: "ra"})
+	waitCloseBarrierStartCount(t, agent, 1)
+	first := agent.sessionAt(0)
+	first.closeErr = fmt.Errorf("close failed; process may still be alive")
+	waitCloseBarrierPrompt(t, first)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	result := scheduler.CancelSessionContext(ctx, "test:a", CancelStop)
+	if !result.Pending {
+		t.Fatalf("CancelSessionContext result = %+v, want pending after close error", result)
+	}
+	e.handleMessage(platform, &Message{SessionKey: "test:b", Platform: "test", MessageID: "b1", UserID: "u", UserName: "u", Content: "queued b", ReplyCtx: "rb"})
+	old := e.sessions.GetOrCreateActive("test:a")
+	old.AddHistory("user", "keep me")
+	oldID := old.ID
+	e.cmdNew(platform, &Message{SessionKey: "test:a", Platform: "test", ReplyCtx: "ra-new"}, nil)
+
+	time.Sleep(60 * time.Millisecond)
+	if got := agent.startCount(); got != 1 {
+		t.Fatalf("StartSession count after close error = %d, want only original A", got)
+	}
+	after := e.sessions.GetOrCreateActive("test:a")
+	if after.ID != oldID {
+		t.Fatalf("/new changed active session from %q to %q while close unconfirmed", oldID, after.ID)
+	}
+	if got := after.GetAgentSessionID(); got != "close-barrier-1" {
+		t.Fatalf("/new cleared agent session id = %q, want close-barrier-1", got)
+	}
+	if len(after.GetHistory(0)) == 0 {
+		t.Fatal("/new cleared history while close unconfirmed")
+	}
+}
+
+func TestLateCloseClearDoesNotRemoveNewUnsafeGeneration(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e := &Engine{
+		agent:                    &stubAgent{},
+		sessions:                 NewSessionManager(""),
+		ctx:                      ctx,
+		i18n:                     NewI18n("en"),
+		interactiveStates:        make(map[string]*interactiveState),
+		closingSessions:          make(map[string]chan struct{}),
+		unsafeResume:             make(map[string]bool),
+		agentSessionCloseTimeout: 20 * time.Millisecond,
+	}
+	key := "test:late-clear"
+	closing := newControllableSession("old-close")
+	closing.closeDelay = 80 * time.Millisecond
+	e.closeAgentSessionAsync(key, closing, nil, nil)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !e.peekUnsafeResume(key) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !e.peekUnsafeResume(key) {
+		t.Fatal("timeout close should mark unsafe")
+	}
+	e.markUnsafeResume(key) // newer unsafe generation that old close completion must not clear
+	time.Sleep(120 * time.Millisecond)
+	if !e.peekUnsafeResume(key) {
+		t.Fatal("late nil from old close cleared a newer unsafe marker")
+	}
+}
+
+func TestCmdCompressQueuesBehindOtherProjectActiveTurn(t *testing.T) {
+	// Catches: manual /compress sending /compact directly to an idle existing
+	// AgentSession while another scope occupies the project physical slot.
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("compress-project-busy")
+	agent := &stubCompressorAgent{cmd: "/compact"}
+	scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(9_000, 0)), 10, 6*time.Hour, 30*time.Minute)
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(scheduler))
+	t.Cleanup(func() { _ = e.Stop() })
+
+	activeStarted := make(chan struct{}, 1)
+	releaseActive := make(chan struct{})
+	if got := scheduler.Submit(ProjectTask{ID: "active-other", Source: TaskSourceInteractive, SessionKey: "test:other:user", Cleanup: func() {}, Run: func(context.Context) TaskResult {
+		activeStarted <- struct{}{}
+		<-releaseActive
+		return TaskResult{State: TaskStateCompleted}
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit active = %+v", got)
+	}
+	select {
+	case <-activeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active task did not start")
+	}
+
+	key := "test:compress:user"
+	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	e.cmdCompress(p, &Message{SessionKey: key, Content: "/compress", ReplyCtx: "ctx"})
+	time.Sleep(50 * time.Millisecond)
+	sess.sendMu.Lock()
+	callsBeforeRelease := append([]string(nil), sess.sendCalls...)
+	sess.sendMu.Unlock()
+	if len(callsBeforeRelease) != 0 {
+		t.Fatalf("compress sent while another project task active: %v", callsBeforeRelease)
+	}
+
+	close(releaseActive)
+	deadline := time.After(2 * time.Second)
+	for {
+		sess.sendMu.Lock()
+		calls := append([]string(nil), sess.sendCalls...)
+		sess.sendMu.Unlock()
+		if len(calls) > 0 {
+			if calls[0] != "/compact" {
+				t.Fatalf("first compress Send = %q, want /compact", calls[0])
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for queued compress to start")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+}
+
+type closeBlockingCompressSession struct {
+	id           string
+	events       chan Event
+	sendStarted  chan struct{}
+	closeCalled  chan struct{}
+	releaseClose chan error
+	alive        atomic.Bool
+	sendOnce     sync.Once
+	closeOnce    sync.Once
+}
+
+func newCloseBlockingCompressSession(id string) *closeBlockingCompressSession {
+	s := &closeBlockingCompressSession{
+		id:           id,
+		events:       make(chan Event),
+		sendStarted:  make(chan struct{}),
+		closeCalled:  make(chan struct{}),
+		releaseClose: make(chan error, 1),
+	}
+	s.alive.Store(true)
+	return s
+}
+func (s *closeBlockingCompressSession) Send(string, string, []ImageAttachment, []FileAttachment) error {
+	s.sendOnce.Do(func() { close(s.sendStarted) })
+	<-s.closeCalled
+	return context.Canceled
+}
+func (s *closeBlockingCompressSession) RespondPermission(string, PermissionResult) error { return nil }
+func (s *closeBlockingCompressSession) Events() <-chan Event                             { return s.events }
+func (s *closeBlockingCompressSession) CurrentSessionID() string                         { return s.id }
+func (s *closeBlockingCompressSession) Alive() bool                                      { return s.alive.Load() }
+func (s *closeBlockingCompressSession) Close() error {
+	s.closeOnce.Do(func() { close(s.closeCalled) })
+	err := <-s.releaseClose
+	s.alive.Store(false)
+	close(s.events)
+	return err
+}
+
+func TestCmdCompressThirtyMinuteTimeoutClosesBeforeReleasingSlot(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(9_500, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	p := &stubPlatformEngine{n: "test"}
+	sess := newCloseBlockingCompressSession("compress-timeout")
+	agent := &stubCompressorAgent{cmd: "/compact"}
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(scheduler))
+	e.agentSessionCloseTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { _ = e.Stop() })
+
+	key := "test:compress-timeout:user"
+	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	e.cmdCompress(p, &Message{SessionKey: key, Content: "/compress", ReplyCtx: "ctx"})
+	select {
+	case <-sess.sendStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("compress Send did not start")
+	}
+
+	nextStarted := make(chan struct{}, 1)
+	if got := scheduler.Submit(ProjectTask{ID: "next", Source: TaskSourceInteractive, SessionKey: "test:other:user", Cleanup: func() {}, Run: func(context.Context) TaskResult {
+		nextStarted <- struct{}{}
+		return TaskResult{State: TaskStateCompleted}
+	}}); got.Status != SubmitQueued {
+		t.Fatalf("submit next = %+v, want queued", got)
+	}
+
+	clock.Advance(30 * time.Minute)
+	select {
+	case <-sess.closeCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("compress timeout did not start Close")
+	}
+	select {
+	case <-nextStarted:
+		t.Fatal("next task started before compress Close confirmation")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	sess.releaseClose <- nil
+	select {
+	case <-nextStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("next task did not start after compress Close confirmation")
+	}
+}
+
+func TestCmdCompressTimeoutCloseErrorKeepsPhysicalSlotUntilStop(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(9_600, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	p := &stubPlatformEngine{n: "test"}
+	sess := newCloseBlockingCompressSession("compress-close-error")
+	agent := &stubCompressorAgent{cmd: "/compact"}
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(scheduler))
+	e.agentSessionCloseTimeout = 20 * time.Millisecond
+	e.projectSchedulerStopTimeout = 50 * time.Millisecond
+
+	key := "test:compress-close-error:user"
+	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	e.cmdCompress(p, &Message{SessionKey: key, Content: "/compress", ReplyCtx: "ctx"})
+	select {
+	case <-sess.sendStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("compress Send did not start")
+	}
+	nextStarted := make(chan struct{}, 1)
+	if got := scheduler.Submit(ProjectTask{ID: "next-after-error", Source: TaskSourceInteractive, SessionKey: "test:other:user", Cleanup: func() {}, Run: func(context.Context) TaskResult {
+		nextStarted <- struct{}{}
+		return TaskResult{State: TaskStateCompleted}
+	}}); got.Status != SubmitQueued {
+		t.Fatalf("submit next = %+v, want queued", got)
+	}
+	clock.Advance(30 * time.Minute)
+	select {
+	case <-sess.closeCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("compress timeout did not start Close")
+	}
+	sess.releaseClose <- fmt.Errorf("close failed")
+	select {
+	case <-nextStarted:
+		t.Fatal("next task started after close error; physical slot must stay blocked")
+	case <-time.After(100 * time.Millisecond):
+	}
+	start := time.Now()
+	_ = e.Stop()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Engine.Stop took %s after compress close error, want bounded", elapsed)
+	}
+}
+
+// 固定事件已被 select 取出、随后取消先于分发的交错，不依赖 select 随机命中。
+func TestCompressSelectedTerminalAfterCancellationDoesNotSucceedOrDrain(t *testing.T) {
+	for _, event := range []Event{{Type: EventResult, Content: "stale-compress-success"}, {Type: EventError, Error: fmt.Errorf("stale-event-error")}} {
+		t.Run(string(event.Type), func(t *testing.T) {
+			p := &stubPlatformEngine{n: "test"}
+			e := NewEngine("test", &stubCompressorAgent{cmd: "/compact"}, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+			t.Cleanup(func() { _ = e.Stop() })
+			key := "test:cancel-compress"
+			sess := newCloseBlockingCompressSession("cancel-selected")
+			state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+			e.interactiveMu.Lock()
+			e.interactiveStates[key] = state
+			e.interactiveMu.Unlock()
+			session := e.sessions.GetOrCreateActive(key)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			sess.releaseClose <- nil
+			unlocked := false
+			parts := []string{}
+			stopped := e.handleCompressEvent(ctx, event, state, session, e.sessions, key, p, "ctx", &unlocked, false, 0, &parts)
+			if !stopped {
+				t.Fatal("cancelled event did not stop dispatch")
+			}
+			if unlocked {
+				t.Fatal("cancelled event entered legacy drain")
+			}
+			for _, msg := range p.getSent() {
+				if strings.Contains(msg, "stale-compress-success") || strings.Contains(msg, e.i18n.T(MsgCompressDone)) || strings.Contains(msg, "stale-event-error") {
+					t.Fatalf("cancelled terminal emitted stale output: %s", msg)
+				}
+			}
+			select {
+			case <-sess.closeCalled:
+			default:
+				t.Fatal("cancelled event did not enter Close barrier")
+			}
+		})
+	}
+}
+
+type psSendRecordingSession struct {
+	stubAgentSession
+	sendCalls int
+}
+
+func (s *psSendRecordingSession) Send(string, string, []ImageAttachment, []FileAttachment) error {
+	s.sendCalls++
+	return nil
+}
+
+func startBusyProjectTaskForCommandTest(t *testing.T, scheduler *ProjectScheduler, sessionKey string) chan struct{} {
+	t.Helper()
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	if got := scheduler.Submit(ProjectTask{ID: "busy", SessionKey: sessionKey, Run: func(ctx context.Context) TaskResult {
+		started <- struct{}{}
+		select {
+		case <-release:
+			return TaskResult{State: TaskStateCompleted}
+		case <-ctx.Done():
+			return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+		}
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit busy task = %+v", got)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for busy project task")
+	}
+	return release
+}
+
+func TestBusyProjectAllowsQueriesAndCancellationOnly(t *testing.T) {
+	scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(7_000, 0)), 10, 6*time.Hour, 30*time.Minute)
+	busyRelease := startBusyProjectTaskForCommandTest(t, scheduler, "test:busy-owner")
+	defer func() {
+		close(busyRelease)
+		scheduler.Stop(context.Background())
+	}()
+
+	agent := &stubAgent{}
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(scheduler))
+	t.Cleanup(func() { _ = e.Stop() })
+
+	msg := &Message{SessionKey: "test:caller", Platform: "test", UserID: "user", UserName: "user", ReplyCtx: "ctx"}
+
+	if !e.handleCommand(platform, msg, "/status") {
+		t.Fatal("/status was not handled while project busy")
+	}
+	if sent := platform.getSent(); len(sent) != 1 {
+		t.Fatalf("/status sent = %v, want one query reply", sent)
+	}
+
+	platform.clearSent()
+	if !e.handleCommand(platform, msg, "/queue") {
+		t.Fatal("/queue was not handled while project busy")
+	}
+	if sent := platform.getSent(); len(sent) != 1 || strings.Contains(sent[0], "test:busy-owner") || strings.Contains(sent[0], "test:caller") {
+		t.Fatalf("/queue sent = %v, want one脱敏队列回复", sent)
+	}
+
+	platform.clearSent()
+	if !e.handleCommand(platform, msg, "/model doubao-seed-2.1-pro") {
+		t.Fatal("/model mutation was not handled as busy rejection")
+	}
+	if sent := platform.getSent(); len(sent) != 1 || !strings.Contains(sent[0], "project_busy_mutation_rejected") {
+		t.Fatalf("/model busy reply = %v, want fixed reason", sent)
+	}
+
+	platform.clearSent()
+	if !e.handleCommand(platform, msg, "/unknown-busy-command") {
+		t.Fatal("unknown busy command must be handled locally, not fall through to Agent")
+	}
+	if sent := platform.getSent(); len(sent) != 1 || !strings.Contains(sent[0], "project_busy_mutation_rejected") {
+		t.Fatalf("unknown busy reply = %v, want fixed reason", sent)
+	}
+}
+
+func TestBusyProjectCustomSkillPromptQueuesButExecAndPsReject(t *testing.T) {
+	scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(7_100, 0)), 10, 6*time.Hour, 30*time.Minute)
+	busyRelease := startBusyProjectTaskForCommandTest(t, scheduler, "test:busy-owner")
+	defer func() {
+		close(busyRelease)
+		scheduler.Stop(context.Background())
+	}()
+
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(scheduler))
+	e.adminFrom = "*"
+	e.commands.Add("ask", "", "prompt {{args}}", "", "", "config")
+	e.commands.Add("hostexec", "", "", "printf should-not-run", "", "config")
+	skillRoot := t.TempDir()
+	if err := os.Mkdir(filepath.Join(skillRoot, "unit-skill"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillRoot, "unit-skill", "SKILL.md"), []byte("---\ndescription: unit\n---\nDo skill"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.skills.SetDirs([]string{skillRoot})
+	t.Cleanup(func() { _ = e.Stop() })
+	msg := &Message{SessionKey: "test:caller", Platform: "test", UserID: "admin", UserName: "admin", ReplyCtx: "ctx"}
+
+	if !e.handleCommand(platform, msg, "/ask hello") {
+		t.Fatal("prompt custom command was not handled")
+	}
+	if snap := scheduler.Snapshot(); snap.WaitingCount != 1 || snap.Waiting[0].SessionKey != "test:caller" {
+		t.Fatalf("snapshot after custom prompt = %+v, want queued prompt through scheduler", snap)
+	}
+
+	if !e.handleCommand(platform, msg, "/unit-skill") {
+		t.Fatal("skill command was not handled")
+	}
+	if snap := scheduler.Snapshot(); snap.WaitingCount != 2 || snap.Waiting[1].SessionKey != "test:caller" {
+		t.Fatalf("snapshot after skill = %+v, want second queued prompt through scheduler", snap)
+	}
+
+	platform.clearSent()
+	if !e.handleCommand(platform, msg, "/hostexec") {
+		t.Fatal("custom exec was not handled as busy rejection")
+	}
+	if sent := platform.getSent(); len(sent) != 1 || !strings.Contains(sent[0], "project_busy_mutation_rejected") {
+		t.Fatalf("custom exec busy reply = %v, want fixed reason", sent)
+	}
+	if snap := scheduler.Snapshot(); snap.WaitingCount != 2 {
+		t.Fatalf("custom exec changed scheduler queue: %+v", snap)
+	}
+
+	platform.clearSent()
+	key := "test:caller"
+	session := e.sessions.GetOrCreateActive(key)
+	lockGen, ok := session.TryLock()
+	if !ok {
+		t.Fatal("failed to set busy session lock")
+	}
+	defer session.Unlock(lockGen)
+	recording := &psSendRecordingSession{}
+	e.interactiveStates[key] = &interactiveState{agentSession: recording}
+	if !e.handleCommand(platform, msg, "/ps more context") {
+		t.Fatal("/ps was not handled as busy rejection")
+	}
+	if recording.sendCalls != 0 {
+		t.Fatalf("/ps called agent Send %d times; busy /ps must not supplement active stdin", recording.sendCalls)
+	}
+	if sent := platform.getSent(); len(sent) != 1 || !strings.Contains(sent[0], "project_busy_mutation_rejected") {
+		t.Fatalf("/ps busy reply = %v, want fixed reason", sent)
+	}
+}
+
+func TestBusyMutationLeaseBlocksConcurrentAgentSubmission(t *testing.T) {
+	scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(7_200, 0)), 10, 6*time.Hour, 30*time.Minute)
+	defer scheduler.Stop(context.Background())
+	release, ok := scheduler.TryBeginLocalMutation(context.Background())
+	if !ok {
+		t.Fatal("TryBeginLocalMutation on idle scheduler failed")
+	}
+	started := make(chan struct{}, 1)
+	got := scheduler.Submit(ProjectTask{ID: "agent", SessionKey: "test:agent", Run: func(context.Context) TaskResult {
+		started <- struct{}{}
+		return TaskResult{State: TaskStateCompleted}
+	}})
+	if got.Status != SubmitRejectedBusy {
+		t.Fatalf("Submit during mutation lease = %+v, want rejected_busy", got)
+	}
+	select {
+	case <-started:
+		t.Fatal("task started while mutation lease was held")
+	default:
+	}
+	release()
+	got = scheduler.Submit(ProjectTask{ID: "agent", SessionKey: "test:agent", Run: func(context.Context) TaskResult {
+		started <- struct{}{}
+		return TaskResult{State: TaskStateCompleted}
+	}})
+	if got.Status != SubmitStarted {
+		t.Fatalf("Submit after mutation lease release = %+v, want started", got)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for post-lease task")
+	}
+}
+
+func TestBusyHandleCommandRawPrefixRejectedBeforeCanonicalDispatch(t *testing.T) {
+	scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(8_000, 0)), 10, 6*time.Hour, 30*time.Minute)
+	busyRelease := startBusyProjectTaskForCommandTest(t, scheduler, "test:busy-owner")
+	defer func() {
+		close(busyRelease)
+		scheduler.Stop(context.Background())
+	}()
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubModelModeAgent{}, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(scheduler))
+	t.Cleanup(func() { _ = e.Stop() })
+	msg := &Message{SessionKey: "test:caller", Platform: "test", UserID: "user", UserName: "user", ReplyCtx: "ctx"}
+
+	for _, raw := range []string{"/sta", "/mo list"} {
+		platform.clearSent()
+		if !e.handleCommand(platform, msg, raw) {
+			t.Fatalf("%s must be handled locally while busy", raw)
+		}
+		if sent := platform.getSent(); len(sent) != 1 || !strings.Contains(sent[0], ProjectBusyMutationRejectedReason) {
+			t.Fatalf("%s busy reply = %v, want fixed rejection reason", raw, sent)
+		}
+	}
+}
+
+func TestBusyCardActionsRejectSharedMutations(t *testing.T) {
+	scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(8_100, 0)), 10, 6*time.Hour, 30*time.Minute)
+	busyRelease := startBusyProjectTaskForCommandTest(t, scheduler, "test:busy-owner")
+	defer func() {
+		close(busyRelease)
+		scheduler.Stop(context.Background())
+	}()
+
+	t.Run("model", func(t *testing.T) {
+		agent := &stubModelModeAgent{model: "old"}
+		e := NewEngine("test", agent, []Platform{&stubPlatformEngine{n: "test"}}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(scheduler))
+		t.Cleanup(func() { _ = e.Stop() })
+		card := e.handleCardNav("act:/model new-model", "test:caller-model")
+		if card == nil {
+			t.Fatal("expected model card after rejected card action")
+		}
+		if agent.model != "old" {
+			t.Fatalf("busy card /model changed model to %q", agent.model)
+		}
+	})
+
+	t.Run("dir", func(t *testing.T) {
+		temp := t.TempDir()
+		d1 := filepath.Join(temp, "a")
+		d2 := filepath.Join(temp, "b")
+		for _, d := range []string{d1, d2} {
+			if err := os.Mkdir(d, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		dataDir := t.TempDir()
+		agent := &stubWorkDirAgent{workDir: d1}
+		e := NewEngine("test", agent, []Platform{&stubPlatformEngine{n: "test"}}, dataDir, LangEnglish, WithProjectScheduler(scheduler))
+		e.SetDirHistory(NewDirHistory(dataDir))
+		e.dirHistory.Add("test", d1)
+		e.dirHistory.Add("test", d2)
+		t.Cleanup(func() { _ = e.Stop() })
+		card := e.handleCardNav("act:/dir select 2", "test:caller-dir")
+		if card == nil {
+			t.Fatal("expected dir card after rejected card action")
+		}
+		if agent.workDir != d1 {
+			t.Fatalf("busy card /dir changed workDir to %q, want %q", agent.workDir, d1)
+		}
+	})
+
+	t.Run("heartbeat", func(t *testing.T) {
+		hs := NewHeartbeatScheduler("")
+		e := NewEngine("test", &stubAgent{}, []Platform{&stubPlatformEngine{n: "test"}}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(scheduler))
+		e.SetHeartbeatScheduler(hs)
+		hs.Register("test", HeartbeatConfig{Enabled: true, SessionKey: "test:heartbeat", IntervalMins: 30}, e, "")
+		t.Cleanup(func() { _ = e.Stop(); hs.Stop() })
+		card := e.handleCardNav("act:/heartbeat pause", "test:caller-heartbeat")
+		if card == nil {
+			t.Fatal("expected heartbeat card after rejected card action")
+		}
+		if status := hs.Status("test"); status == nil || status.Paused {
+			t.Fatalf("busy card /heartbeat pause changed status: %+v", status)
+		}
+	})
+}
+
+func TestAbandonedLocalMutationBeginDoesNotLeakLease(t *testing.T) {
+	scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(8_200, 0)), 10, 6*time.Hour, 30*time.Minute)
+	resp := make(chan localMutationLease)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	accepted := make(chan struct{})
+	go func() {
+		scheduler.commands <- beginLocalMutationCommand{ctx: ctx, resp: resp}
+		close(accepted)
+	}()
+	select {
+	case <-accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("begin command was not accepted by scheduler owner")
+	}
+
+	result := make(chan SubmitResult, 1)
+	go func() {
+		result <- scheduler.Submit(ProjectTask{ID: "after-abandoned", SessionKey: "test:after", Run: func(context.Context) TaskResult {
+			return TaskResult{State: TaskStateCompleted}
+		}})
+	}()
+	select {
+	case got := <-result:
+		if got.Status != SubmitStarted {
+			t.Fatalf("submit after abandoned begin = %+v, want started", got)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("submit blocked after abandoned begin; owner likely leaked or blocked on local mutation lease")
+	}
+	scheduler.Stop(context.Background())
 }
