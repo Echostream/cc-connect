@@ -105,6 +105,13 @@ type schedulerLoop struct {
 
 	expiryTimer SchedulerTimer
 	runTimer    SchedulerTimer
+
+	completed uint64
+	failed    uint64
+	expired   uint64
+	timedOut  uint64
+	cancelled uint64
+	rejected  uint64
 }
 
 func NewProjectScheduler(clock SchedulerClock, maxWaiting int, waitingTTL, runTimeout time.Duration) *ProjectScheduler {
@@ -326,19 +333,24 @@ func (l *schedulerLoop) handleCommand(cmd schedulerCommand) bool {
 
 func (l *schedulerLoop) handleSubmitWithOptions(task ProjectTask, options SubmitOptions) SubmitResult {
 	if l.stopped {
+		l.recordRejected()
 		return SubmitResult{Status: SubmitRejectedStopped}
 	}
 	if l.localMutation {
+		l.recordRejected()
 		return SubmitResult{Status: SubmitRejectedBusy}
 	}
 	if options.OnlyIfIdle && (l.active != nil || len(l.waiting) > 0) {
+		l.recordRejected()
 		return SubmitResult{Status: SubmitRejectedBusy}
 	}
 	task = l.normalizeTask(task)
 	if l.active != nil && len(l.waiting) >= l.maxWaiting {
+		l.recordRejected()
 		return SubmitResult{Status: SubmitRejectedFull}
 	}
 	if !l.reserveNotificationSlot(&task) {
+		l.recordRejected()
 		return SubmitResult{Status: SubmitRejectedNotificationBacklog}
 	}
 	if l.active == nil {
@@ -363,6 +375,7 @@ func (l *schedulerLoop) handleRunFinished(result TaskResult) bool {
 	} else {
 		result = normalizeTaskResult(result)
 	}
+	l.recordTerminal(result.State)
 	active.completion.finish(result, l.finishEvents)
 	l.active = nil
 	if len(l.cancelWaiters) > 0 {
@@ -430,6 +443,7 @@ func (l *schedulerLoop) handleCancelSession(c cancelSessionCommand) {
 	for _, task := range l.waiting {
 		if task.SessionKey == c.sessionKey {
 			result.WaitingCancelled++
+			l.recordTerminal(TaskStateCancelled)
 			newTaskCompletion(task, l.notificationSlots).finish(TaskResult{State: TaskStateCancelled}, l.finishEvents)
 			continue
 		}
@@ -579,6 +593,7 @@ func (l *schedulerLoop) dropExpiredWaiting() {
 	kept := l.waiting[:0]
 	for _, task := range l.waiting {
 		if !task.ExpiresAt.IsZero() && !now.Before(task.ExpiresAt) {
+			l.recordTerminal(TaskStateExpired)
 			newTaskCompletion(task, l.notificationSlots).finish(TaskResult{State: TaskStateExpired}, l.finishEvents)
 			continue
 		}
@@ -589,6 +604,7 @@ func (l *schedulerLoop) dropExpiredWaiting() {
 
 func (l *schedulerLoop) cancelWaiting() {
 	for _, task := range l.waiting {
+		l.recordTerminal(TaskStateCancelled)
 		newTaskCompletion(task, l.notificationSlots).finish(TaskResult{State: TaskStateCancelled}, l.finishEvents)
 	}
 	l.waiting = nil
@@ -643,6 +659,12 @@ func (l *schedulerLoop) snapshot() SchedulerSnapshot {
 		WaitingCount:         len(l.waiting),
 		NotificationPending:  l.notificationSlots.pending(),
 		NotificationCapacity: l.notificationSlots.capacity(),
+		Completed:            l.completed,
+		Failed:               l.failed,
+		Expired:              l.expired,
+		TimedOut:             l.timedOut,
+		Cancelled:            l.cancelled,
+		Rejected:             l.rejected,
 	}
 	if l.active != nil {
 		snap.ActiveCount = 1
@@ -656,6 +678,25 @@ func (l *schedulerLoop) snapshot() SchedulerSnapshot {
 		}
 	}
 	return snap
+}
+
+func (l *schedulerLoop) recordRejected() {
+	l.rejected++
+}
+
+func (l *schedulerLoop) recordTerminal(state string) {
+	switch state {
+	case TaskStateCompleted:
+		l.completed++
+	case TaskStateFailed:
+		l.failed++
+	case TaskStateExpired:
+		l.expired++
+	case TaskStateTimedOut:
+		l.timedOut++
+	case TaskStateCancelled:
+		l.cancelled++
+	}
 }
 
 func taskSnapshot(task ProjectTask) SchedulerTaskSnapshot {

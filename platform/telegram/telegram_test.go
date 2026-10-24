@@ -1358,3 +1358,40 @@ func TestProgressStyleProviderInterface(t *testing.T) {
 		t.Fatalf("ProgressStyle() = %q, want compact", got)
 	}
 }
+
+func TestPlatformHealthLifecycleIsThreadSafeAndLowCardinality(t *testing.T) {
+	pAny, err := New(map[string]any{
+		"token":               "123:token",
+		"dm_allow_from":       "42",
+		"allow_chat":          "-100",
+		"group_member_policy": "all",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	p := pAny.(*Platform)
+	info := p.PlatformHealth()
+	if info.Name != "telegram" || info.Connected || info.Degraded || info.DegradedReason != "starting" {
+		t.Fatalf("initial health = %+v", info)
+	}
+	p.notifyUnavailable(errors.New("CANARY raw network/token detail"))
+	info = p.PlatformHealth()
+	if info.Connected || !info.Degraded || info.DegradedReason != "connect_failed" || strings.Contains(info.DegradedReason, "CANARY") {
+		t.Fatalf("degraded health = %+v", info)
+	}
+	p.markReady()
+	p.mu.Lock()
+	p.bot = newStubTelegramBot()
+	p.mu.Unlock()
+	info = p.PlatformHealth()
+	if !info.Connected || info.Degraded || info.DegradedReason != "" {
+		t.Fatalf("connected health = %+v", info)
+	}
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	info = p.PlatformHealth()
+	if info.Connected || info.Degraded || info.DegradedReason != "stopped" {
+		t.Fatalf("stopped health = %+v", info)
+	}
+}

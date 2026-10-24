@@ -4352,7 +4352,7 @@ func (p *Platform) PlatformHealth() core.PlatformHealthInfo {
 	if st.Degraded {
 		info.Connected = false
 		info.Degraded = true
-		info.DegradedReason = fmt.Sprintf("bot open_id unknown: %s", st.LastError)
+		info.DegradedReason = "bot_open_id_unresolved"
 		info.DegradedSince = st.Since
 	}
 	return info

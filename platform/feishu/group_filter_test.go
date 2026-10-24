@@ -88,8 +88,8 @@ func TestPlatformHealth_ReportsDegradedAfterStartupFailure(t *testing.T) {
 	if info.Name != "feishu" {
 		t.Fatalf("info.Name = %q, want feishu", info.Name)
 	}
-	if !strings.Contains(info.DegradedReason, "i/o timeout") {
-		t.Fatalf("info.DegradedReason = %q, want substring 'i/o timeout'", info.DegradedReason)
+	if info.DegradedReason != "bot_open_id_unresolved" {
+		t.Fatalf("info.DegradedReason = %q, want low-cardinality bot_open_id_unresolved", info.DegradedReason)
 	}
 	if info.DegradedSince.IsZero() {
 		t.Fatal("info.DegradedSince should be set when degraded")
@@ -329,4 +329,16 @@ func TestPlatformHealth_ImplementsCoreInterface(t *testing.T) {
 	// Compile-time guarantee that *Platform still satisfies
 	// core.PlatformHealth after our changes.
 	var _ core.PlatformHealth = (*Platform)(nil)
+}
+func TestPlatformHealthUsesLowCardinalityReason(t *testing.T) {
+	p := &Platform{platformName: "feishu"}
+	p.markGroupFilterDegraded(errors.New("CANARY raw CLI/token detail"))
+
+	info := p.PlatformHealth()
+	if !info.Degraded || info.DegradedReason != "bot_open_id_unresolved" {
+		t.Fatalf("degraded health = %+v, want low-cardinality bot_open_id_unresolved", info)
+	}
+	if strings.Contains(info.DegradedReason, "CANARY") {
+		t.Fatalf("health reason leaked raw error: %q", info.DegradedReason)
+	}
 }

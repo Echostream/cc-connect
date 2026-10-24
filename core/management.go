@@ -2,15 +2,21 @@ package core
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +41,136 @@ type ProjectSettingsUpdate struct {
 	WorkspaceBaseDir     *string
 }
 
+type managementBridgeStatusDTO struct {
+	Enabled         bool   `json:"enabled"`
+	Port            int    `json:"port"`
+	Path            string `json:"path"`
+	TokenConfigured bool   `json:"token_configured"`
+}
+
+type managementSchedulerStatusDTO struct {
+	Active            int    `json:"active"`
+	Waiting           int    `json:"waiting"`
+	Expired           uint64 `json:"expired"`
+	TimedOut          uint64 `json:"timed_out"`
+	Cancelled         uint64 `json:"cancelled"`
+	Rejected          uint64 `json:"rejected"`
+	Completed         uint64 `json:"completed"`
+	Failed            uint64 `json:"failed"`
+	ActiveSessionHash string `json:"active_session_hash,omitempty"`
+}
+
+type managementStatusProjectDTO struct {
+	Name      string                       `json:"name"`
+	Scheduler managementSchedulerStatusDTO `json:"scheduler"`
+}
+
+type managementDegradedPlatformDTO struct {
+	Name   string    `json:"name"`
+	Reason string    `json:"reason"`
+	Since  time.Time `json:"since,omitempty"`
+}
+
+type managementProjectSettingsDTO struct {
+	Language            string   `json:"language"`
+	AdminFromConfigured bool     `json:"admin_from_configured"`
+	DisabledCommands    []string `json:"disabled_commands"`
+}
+
+type managementHeartbeatDTO struct {
+	Enabled      bool   `json:"enabled"`
+	Paused       bool   `json:"paused"`
+	IntervalMins int    `json:"interval_mins"`
+	SessionHash  string `json:"session_hash,omitempty"`
+}
+
+type managementProjectDetailDTO struct {
+	Name                string                       `json:"name"`
+	AgentType           string                       `json:"agent_type"`
+	Platforms           []map[string]any             `json:"platforms"`
+	SessionsCount       int                          `json:"sessions_count"`
+	ActiveSessionHashes []string                     `json:"active_session_hashes"`
+	Scheduler           managementSchedulerStatusDTO `json:"scheduler"`
+	Heartbeat           *managementHeartbeatDTO      `json:"heartbeat,omitempty"`
+	Settings            managementProjectSettingsDTO `json:"settings"`
+	WorkDirConfigured   bool                         `json:"work_dir_configured"`
+	AgentMode           string                       `json:"agent_mode"`
+}
+
+type managementSessionSummaryDTO struct {
+	ID                 string    `json:"id"`
+	Name               string    `json:"name"`
+	SessionHash        string    `json:"session_hash,omitempty"`
+	AgentType          string    `json:"agent_type"`
+	Active             bool      `json:"active"`
+	Live               bool      `json:"live"`
+	HistoryCount       int       `json:"history_count"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
+	LastMessageRole    string    `json:"last_message_role,omitempty"`
+	LastMessageAt      time.Time `json:"last_message_at,omitempty"`
+	Platform           string    `json:"platform,omitempty"`
+	UserNameConfigured bool      `json:"user_name_configured"`
+	ChatNameConfigured bool      `json:"chat_name_configured"`
+}
+
+type managementSessionDetailDTO struct {
+	ID                     string           `json:"id"`
+	Name                   string           `json:"name"`
+	SessionHash            string           `json:"session_hash,omitempty"`
+	AgentSessionConfigured bool             `json:"agent_session_configured"`
+	AgentType              string           `json:"agent_type"`
+	Active                 bool             `json:"active"`
+	Live                   bool             `json:"live"`
+	HistoryCount           int              `json:"history_count"`
+	CreatedAt              time.Time        `json:"created_at"`
+	UpdatedAt              time.Time        `json:"updated_at"`
+	History                []map[string]any `json:"history"`
+	Platform               string           `json:"platform,omitempty"`
+}
+
+type managementHeartbeatStatusDTO struct {
+	Enabled             bool   `json:"enabled"`
+	Paused              bool   `json:"paused"`
+	IntervalMins        int    `json:"interval_mins,omitempty"`
+	OnlyWhenIdle        bool   `json:"only_when_idle,omitempty"`
+	SessionHash         string `json:"session_hash,omitempty"`
+	Silent              bool   `json:"silent"`
+	RunCount            int    `json:"run_count"`
+	ErrorCount          int    `json:"error_count"`
+	SkippedBusy         int    `json:"skipped_busy"`
+	LastErrorConfigured bool   `json:"last_error_configured"`
+	LastRun             string `json:"last_run,omitempty"`
+}
+
+type managementGlobalProviderDTO struct {
+	Name             string   `json:"name"`
+	BaseURL          string   `json:"base_url,omitempty"`
+	Model            string   `json:"model,omitempty"`
+	Thinking         string   `json:"thinking,omitempty"`
+	APIKeyConfigured bool     `json:"api_key_configured"`
+	EnvConfigured    bool     `json:"env_configured"`
+	AgentTypes       []string `json:"agent_types,omitempty"`
+	Models           []struct {
+		Model string `json:"model"`
+		Alias string `json:"alias,omitempty"`
+	} `json:"models,omitempty"`
+	Endpoints                  map[string]string             `json:"endpoints,omitempty"`
+	AgentModels                map[string]string             `json:"agent_models,omitempty"`
+	AgentModelLists            map[string][]GlobalModelEntry `json:"agent_model_lists,omitempty"`
+	CodexConfigured            bool                          `json:"codex_configured"`
+	CodexHTTPHeadersConfigured bool                          `json:"codex_http_headers_configured"`
+}
+
+type managementWorkspaceBindingDTO struct {
+	ChannelHash           string    `json:"channel_hash"`
+	ChannelNameConfigured bool      `json:"channel_name_configured"`
+	WorkspaceConfigured   bool      `json:"workspace_configured"`
+	BoundAt               time.Time `json:"bound_at"`
+	Active                bool      `json:"active,omitempty"`
+	LastActivity          time.Time `json:"last_activity,omitempty"`
+}
+
 // ManagementServer provides an HTTP REST API for external management tools
 // (web dashboards, TUI clients, GUI desktop apps, Mac tray apps, etc.).
 type ManagementServer struct {
@@ -43,6 +179,8 @@ type ManagementServer struct {
 	corsOrigins []string
 	server      *http.Server
 	startedAt   time.Time
+	hashSalt    []byte
+	hashReady   bool
 
 	mu      sync.RWMutex
 	engines map[string]*Engine // project name → engine
@@ -77,12 +215,16 @@ type ManagementServer struct {
 
 // NewManagementServer creates a new management API server.
 func NewManagementServer(port int, token string, corsOrigins []string) *ManagementServer {
+	salt := make([]byte, 32)
+	_, err := rand.Read(salt)
 	return &ManagementServer{
 		port:        port,
 		token:       token,
 		corsOrigins: corsOrigins,
 		engines:     make(map[string]*Engine),
 		startedAt:   time.Now(),
+		hashSalt:    salt,
+		hashReady:   err == nil,
 	}
 }
 
@@ -148,10 +290,10 @@ type GlobalProviderInfo struct {
 		Model string `json:"model"`
 		Alias string `json:"alias,omitempty"`
 	} `json:"models,omitempty"`
-	Endpoints       map[string]string              `json:"endpoints,omitempty"`
-	AgentModels     map[string]string              `json:"agent_models,omitempty"`
-	AgentModelLists map[string][]GlobalModelEntry   `json:"agent_model_lists,omitempty"`
-	Codex           *GlobalCodexConfig              `json:"codex,omitempty"`
+	Endpoints       map[string]string             `json:"endpoints,omitempty"`
+	AgentModels     map[string]string             `json:"agent_models,omitempty"`
+	AgentModelLists map[string][]GlobalModelEntry `json:"agent_model_lists,omitempty"`
+	Codex           *GlobalCodexConfig            `json:"codex,omitempty"`
 }
 
 // GlobalModelEntry is a model entry inside AgentModelLists.
@@ -312,11 +454,13 @@ func (m *ManagementServer) withStaticFallback(apiMux *http.ServeMux) http.Handle
 
 func (m *ManagementServer) wrap(handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		m.setCORS(w, r)
 		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+			if !m.handleCORSPreflight(w, r) {
+				mgmtError(w, http.StatusUnauthorized, "unauthorized: invalid CORS preflight")
+			}
 			return
 		}
+		m.setCORS(w, r)
 		if !m.authenticate(r) {
 			mgmtError(w, http.StatusUnauthorized, "unauthorized: missing or invalid token")
 			return
@@ -326,34 +470,125 @@ func (m *ManagementServer) wrap(handler http.HandlerFunc) http.HandlerFunc {
 }
 
 func (m *ManagementServer) authenticate(r *http.Request) bool {
-	if m.token == "" {
-		return true
+	if strings.TrimSpace(m.token) == "" || !m.hashReady {
+		return false
 	}
-	// Bearer token
-	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-		return subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(m.token)) == 1
+	if r.URL != nil && r.URL.RawQuery != "" {
+		values, err := url.ParseQuery(r.URL.RawQuery)
+		if err != nil {
+			return false
+		}
+		if _, ok := values["token"]; ok {
+			return false
+		}
 	}
-	// Query param
-	if t := r.URL.Query().Get("token"); t != "" {
-		return subtle.ConstantTimeCompare([]byte(t), []byte(m.token)) == 1
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 {
+		return false
+	}
+	auth := values[0]
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return false
+	}
+	provided := strings.TrimPrefix(auth, "Bearer ")
+	if provided == "" || provided != strings.TrimSpace(provided) || strings.Contains(provided, ",") || strings.ContainsAny(provided, "\t\n\r ") {
+		return false
+	}
+	providedDigest := sha256.Sum256([]byte(provided))
+	expectedDigest := sha256.Sum256([]byte(m.token))
+	return subtle.ConstantTimeCompare(providedDigest[:], expectedDigest[:]) == 1
+}
+
+func (m *ManagementServer) hashIdentifier(value string) string {
+	if value == "" || !m.hashReady {
+		return ""
+	}
+	mac := hmac.New(sha256.New, m.hashSalt)
+	_, _ = mac.Write([]byte(value))
+	sum := mac.Sum(nil)
+	return "hmac-sha256:" + hex.EncodeToString(sum[:16])
+}
+
+func (m *ManagementServer) setCORS(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if origin == "" || !m.isAllowedCORSOrigin(origin) {
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+	w.Header().Set("Access-Control-Max-Age", "86400")
+}
+
+func (m *ManagementServer) handleCORSPreflight(w http.ResponseWriter, r *http.Request) bool {
+	if strings.TrimSpace(m.token) == "" || !m.hashReady {
+		return false
+	}
+	if r.URL != nil && r.URL.RawQuery != "" {
+		values, err := url.ParseQuery(r.URL.RawQuery)
+		if err != nil {
+			return false
+		}
+		if _, ok := values["token"]; ok {
+			return false
+		}
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" || !m.isAllowedCORSOrigin(origin) {
+		return false
+	}
+	method := r.Header.Get("Access-Control-Request-Method")
+	if !isAllowedCORSMethod(method) {
+		return false
+	}
+	if !areAllowedCORSHeaders(r.Header.Values("Access-Control-Request-Headers")) {
+		return false
+	}
+	m.setCORS(w, r)
+	w.WriteHeader(http.StatusNoContent)
+	return true
+}
+
+func (m *ManagementServer) isAllowedCORSOrigin(origin string) bool {
+	if origin == "" || len(m.corsOrigins) == 0 {
+		return false
+	}
+	for _, allowed := range m.corsOrigins {
+		if allowed == origin || allowed == "*" {
+			return true
+		}
 	}
 	return false
 }
 
-func (m *ManagementServer) setCORS(w http.ResponseWriter, r *http.Request) {
-	if len(m.corsOrigins) == 0 {
-		return
+func isAllowedCORSMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodPost, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
 	}
-	origin := r.Header.Get("Origin")
-	for _, o := range m.corsOrigins {
-		if o == "*" || o == origin {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-			w.Header().Set("Access-Control-Max-Age", "86400")
-			break
+}
+
+func areAllowedCORSHeaders(values []string) bool {
+	if len(values) == 0 {
+		return true
+	}
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			header := strings.ToLower(strings.TrimSpace(part))
+			if header == "" {
+				continue
+			}
+			switch header {
+			case "authorization", "content-type":
+				continue
+			default:
+				return false
+			}
 		}
 	}
+	return true
 }
 
 // ── Response helpers ──────────────────────────────────────────
@@ -395,6 +630,66 @@ func (m *ManagementServer) handleAgents(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func (m *ManagementServer) schedulerStatusDTO(snapshot SchedulerSnapshot) managementSchedulerStatusDTO {
+	dto := managementSchedulerStatusDTO{
+		Active:    snapshot.ActiveCount,
+		Waiting:   snapshot.WaitingCount,
+		Expired:   snapshot.Expired,
+		TimedOut:  snapshot.TimedOut,
+		Cancelled: snapshot.Cancelled,
+		Rejected:  snapshot.Rejected,
+		Completed: snapshot.Completed,
+		Failed:    snapshot.Failed,
+	}
+	if snapshot.Active != nil {
+		dto.ActiveSessionHash = m.hashIdentifier(snapshot.Active.SessionKey)
+	}
+	return dto
+}
+
+func sanitizeGlobalProvider(info GlobalProviderInfo) managementGlobalProviderDTO {
+	dto := managementGlobalProviderDTO{
+		Name: info.Name, BaseURL: info.BaseURL, Model: info.Model, Thinking: info.Thinking,
+		APIKeyConfigured: info.APIKey != "", EnvConfigured: len(info.Env) > 0,
+		AgentTypes: info.AgentTypes, Models: info.Models, Endpoints: info.Endpoints,
+		AgentModels: info.AgentModels, AgentModelLists: info.AgentModelLists,
+		CodexConfigured: info.Codex != nil,
+	}
+	if info.Codex != nil {
+		dto.CodexHTTPHeadersConfigured = len(info.Codex.HTTPHeaders) > 0
+	}
+	return dto
+}
+
+func sanitizeGlobalProviders(providers []GlobalProviderInfo) []managementGlobalProviderDTO {
+	result := make([]managementGlobalProviderDTO, len(providers))
+	for i, provider := range providers {
+		result[i] = sanitizeGlobalProvider(provider)
+	}
+	return result
+}
+
+func sanitizeCCSwitchProviders(providers []CCSwitchProviderInfo) []managementGlobalProviderDTO {
+	result := make([]managementGlobalProviderDTO, len(providers))
+	for i, provider := range providers {
+		result[i] = sanitizeGlobalProvider(GlobalProviderInfo{
+			Name: provider.Name, BaseURL: provider.BaseURL, Model: provider.Model, APIKey: provider.APIKey,
+		})
+	}
+	return result
+}
+
+func platformFromSessionKey(sessionKey string) string {
+	if sessionKey == "" {
+		return ""
+	}
+	parts := splitSessionKey(sessionKey)
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[0]
+}
+
 func (m *ManagementServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		mgmtError(w, http.StatusMethodNotAllowed, "GET only")
@@ -405,8 +700,14 @@ func (m *ManagementServer) handleStatus(w http.ResponseWriter, r *http.Request) 
 	defer m.mu.RUnlock()
 
 	platformSet := make(map[string]bool)
-	var degradedEntries []map[string]any
-	for _, e := range m.engines {
+	var degradedEntries []managementDegradedPlatformDTO
+	projects := make([]managementStatusProjectDTO, 0, len(m.engines))
+	for name, e := range m.engines {
+		schedulerSnapshot := e.projectScheduler.Snapshot()
+		projects = append(projects, managementStatusProjectDTO{
+			Name:      name,
+			Scheduler: m.schedulerStatusDTO(schedulerSnapshot),
+		})
 		for _, p := range e.platforms {
 			platformSet[p.Name()] = true
 			// Issue #1618: surface per-platform degraded state in the
@@ -414,12 +715,11 @@ func (m *ManagementServer) handleStatus(w http.ResponseWriter, r *http.Request) 
 			if ph, ok := p.(PlatformHealth); ok {
 				info := ph.PlatformHealth()
 				if info.Degraded {
-					entry := map[string]any{
-						"name":    info.Name,
-						"reason":  info.DegradedReason,
-						"since":   info.DegradedSince,
-					}
-					degradedEntries = append(degradedEntries, entry)
+					degradedEntries = append(degradedEntries, managementDegradedPlatformDTO{
+						Name:   info.Name,
+						Reason: sanitizePlatformHealthReason(info.DegradedReason),
+						Since:  info.DegradedSince,
+					})
 				}
 			}
 		}
@@ -441,14 +741,14 @@ func (m *ManagementServer) handleStatus(w http.ResponseWriter, r *http.Request) 
 		"projects_count":      len(m.engines),
 		"bridge_adapters":     adapters,
 		"degraded_platforms":  degradedEntries,
+		"projects":            projects,
 	}
 	if m.bridgeServer != nil {
-		resp["bridge"] = map[string]any{
-			"enabled":   true,
-			"port":      m.bridgeServer.port,
-			"path":      m.bridgeServer.path,
-			"token":     m.bridgeServer.token,
-			"token_set": m.bridgeServer.token != "",
+		resp["bridge"] = managementBridgeStatusDTO{
+			Enabled:         true,
+			Port:            m.bridgeServer.port,
+			Path:            m.bridgeServer.path,
+			TokenConfigured: m.bridgeServer.token != "",
 		}
 	}
 	mgmtJSON(w, http.StatusOK, resp)
@@ -508,19 +808,7 @@ func (m *ManagementServer) handleConfig(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if m.configFilePath == "" {
-		mgmtError(w, http.StatusNotFound, "config file path not set")
-		return
-	}
-	data, err := os.ReadFile(m.configFilePath)
-	if err != nil {
-		mgmtError(w, http.StatusInternalServerError, "read config: "+err.Error())
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	mgmtError(w, http.StatusForbidden, "raw config is disabled")
 }
 
 func (m *ManagementServer) handleGlobalSettings(w http.ResponseWriter, r *http.Request) {
@@ -671,7 +959,7 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 				if info.Degraded {
 					entry["connected"] = false
 					entry["degraded"] = true
-					entry["degraded_reason"] = info.DegradedReason
+					entry["degraded_reason"] = sanitizePlatformHealthReason(info.DegradedReason)
 					if !info.DegradedSince.IsZero() {
 						entry["degraded_since"] = info.DegradedSince
 					}
@@ -686,25 +974,31 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 		e.interactiveMu.Lock()
 		keys := make([]string, 0, len(e.interactiveStates))
 		for k := range e.interactiveStates {
-			keys = append(keys, k)
+			if hashed := m.hashIdentifier(k); hashed != "" {
+				keys = append(keys, hashed)
+			}
 		}
 		e.interactiveMu.Unlock()
+		sort.Strings(keys)
 
-		data := map[string]any{
-			"name":                name,
-			"agent_type":          e.agent.Name(),
-			"platforms":           platInfos,
-			"sessions_count":      sessCount,
-			"active_session_keys": keys,
+		schedulerSnapshot := e.projectScheduler.Snapshot()
+
+		data := managementProjectDetailDTO{
+			Name:                name,
+			AgentType:           e.agent.Name(),
+			Platforms:           platInfos,
+			SessionsCount:       sessCount,
+			ActiveSessionHashes: keys,
+			Scheduler:           m.schedulerStatusDTO(schedulerSnapshot),
 		}
 
 		if m.heartbeatScheduler != nil {
 			if st := m.heartbeatScheduler.Status(name); st != nil {
-				data["heartbeat"] = map[string]any{
-					"enabled":       st.Enabled,
-					"paused":        st.Paused,
-					"interval_mins": st.IntervalMins,
-					"session_key":   st.SessionKey,
+				data.Heartbeat = &managementHeartbeatDTO{
+					Enabled:      st.Enabled,
+					Paused:       st.Paused,
+					IntervalMins: st.IntervalMins,
+					SessionHash:  m.hashIdentifier(st.SessionKey),
 				}
 			}
 		}
@@ -713,10 +1007,10 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 		adminFrom := e.adminFrom
 		e.userRolesMu.RUnlock()
 
-		data["settings"] = map[string]any{
-			"language":          string(e.i18n.CurrentLang()),
-			"admin_from":        adminFrom,
-			"disabled_commands": e.GetDisabledCommands(),
+		data.Settings = managementProjectSettingsDTO{
+			Language:            string(e.i18n.CurrentLang()),
+			AdminFromConfigured: adminFrom != "",
+			DisabledCommands:    e.GetDisabledCommands(),
 		}
 
 		var workDir string
@@ -727,16 +1021,8 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 		if am, ok := e.agent.(interface{ GetMode() string }); ok {
 			agentMode = am.GetMode()
 		}
-		data["work_dir"] = workDir
-		data["agent_mode"] = agentMode
-
-		if m.getProjectConfig != nil {
-			if extra := m.getProjectConfig(name); extra != nil {
-				for k, v := range extra {
-					data[k] = v
-				}
-			}
-		}
+		data.WorkDirConfigured = workDir != ""
+		data.AgentMode = agentMode
 
 		mgmtJSON(w, http.StatusOK, data)
 		return
@@ -998,7 +1284,14 @@ func (m *ManagementServer) handleProjectWorkspaces(w http.ResponseWriter, r *htt
 			mgmtError(w, http.StatusMethodNotAllowed, "DELETE only")
 			return
 		}
-		e.workspaceBindings.Unbind(projectKey, rest)
+		channelKey := rest
+		for key := range e.workspaceBindings.ListByProject(projectKey) {
+			if m.hashIdentifier(key) == rest {
+				channelKey = key
+				break
+			}
+		}
+		e.workspaceBindings.Unbind(projectKey, channelKey)
 		mgmtOK(w, "workspace binding removed")
 		return
 	}
@@ -1006,43 +1299,27 @@ func (m *ManagementServer) handleProjectWorkspaces(w http.ResponseWriter, r *htt
 	switch r.Method {
 	case http.MethodGet:
 		bindings := e.workspaceBindings.ListByProject(projectKey)
-		bound := make(map[string]bool, len(bindings))
-		list := make([]map[string]any, 0, len(bindings))
+		list := make([]managementWorkspaceBindingDTO, 0, len(bindings))
 		for channelKey, b := range bindings {
-			entry := map[string]any{
-				"channel_key":  channelKey,
-				"channel_name": b.ChannelName,
-				"workspace":    b.Workspace,
-				"bound_at":     b.BoundAt.Time,
+			entry := managementWorkspaceBindingDTO{
+				ChannelHash:           m.hashIdentifier(channelKey),
+				ChannelNameConfigured: b.ChannelName != "",
+				WorkspaceConfigured:   b.Workspace != "",
+				BoundAt:               b.BoundAt.Time,
 			}
-			if ws := e.workspacePool.Get(b.Workspace); ws != nil {
-				entry["active"] = ws.HasActiveTurn()
-				entry["last_activity"] = ws.LastActivity()
-			}
-			list = append(list, entry)
-			bound[normalizeWorkspacePath(b.Workspace)] = true
-		}
-
-		var suggestions []string
-		if e.baseDir != "" {
-			if entries, err := os.ReadDir(e.baseDir); err == nil {
-				for _, ent := range entries {
-					if !ent.IsDir() {
-						continue
-					}
-					candidate := filepath.Join(e.baseDir, ent.Name())
-					if bound[normalizeWorkspacePath(candidate)] {
-						continue
-					}
-					suggestions = append(suggestions, candidate)
+			if e.workspacePool != nil {
+				if ws := e.workspacePool.Get(b.Workspace); ws != nil {
+					entry.Active = ws.HasActiveTurn()
+					entry.LastActivity = ws.LastActivity()
 				}
 			}
+			list = append(list, entry)
 		}
 
 		mgmtJSON(w, http.StatusOK, map[string]any{
-			"base_dir":    e.baseDir,
-			"bindings":    list,
-			"suggestions": suggestions,
+			"base_dir_configured": e.baseDir != "",
+			"bindings":            list,
+			"suggestions_count":   0,
 		})
 
 	case http.MethodPost:
@@ -1070,7 +1347,7 @@ func (m *ManagementServer) handleProjectWorkspaces(w http.ResponseWriter, r *htt
 			channelName = channelKey
 		}
 		e.workspaceBindings.Bind(projectKey, channelKey, channelName, workspace)
-		mgmtJSON(w, http.StatusCreated, map[string]any{"message": "workspace bound", "workspace": workspace})
+		mgmtJSON(w, http.StatusCreated, map[string]any{"message": "workspace bound", "workspace_configured": workspace != ""})
 
 	default:
 		mgmtError(w, http.StatusMethodNotAllowed, "GET or POST only")
@@ -1143,59 +1420,51 @@ func (m *ManagementServer) handleProjectSessions(w http.ResponseWriter, r *http.
 
 		idToKey, activeIDs := e.sessions.SessionKeyMap()
 		stored := e.sessions.AllSessions()
-		sessions := make([]map[string]any, 0, len(stored))
-		for _, s := range stored {
-			s.mu.Lock()
-			histCount := len(s.History)
-			var lastMsg map[string]any
+		sessions := make([]managementSessionSummaryDTO, 0, len(stored))
+		for _, sess := range stored {
+			sess.mu.Lock()
+			histCount := len(sess.History)
+			info := managementSessionSummaryDTO{
+				ID:           sess.ID,
+				Name:         sess.Name,
+				AgentType:    sess.AgentType,
+				Active:       activeIDs[sess.ID],
+				HistoryCount: histCount,
+				CreatedAt:    sess.CreatedAt,
+				UpdatedAt:    sess.UpdatedAt,
+			}
 			if histCount > 0 {
-				last := s.History[histCount-1]
-				preview := last.Content
-				if len(preview) > 200 {
-					preview = preview[:200]
-				}
-				lastMsg = map[string]any{
-					"role":      last.Role,
-					"content":   preview,
-					"timestamp": last.Timestamp,
-				}
+				last := sess.History[histCount-1]
+				info.LastMessageRole = last.Role
+				info.LastMessageAt = last.Timestamp
 			}
-			info := map[string]any{
-				"id":            s.ID,
-				"name":          s.Name,
-				"session_key":   idToKey[s.ID],
-				"agent_type":    s.AgentType,
-				"active":        activeIDs[s.ID],
-				"history_count": histCount,
-				"created_at":    s.CreatedAt,
-				"updated_at":    s.UpdatedAt,
-				"last_message":  lastMsg,
-			}
-			s.mu.Unlock()
+			sess.mu.Unlock()
 
-			sessionKey := idToKey[s.ID]
+			sessionKey := idToKey[sess.ID]
+			info.SessionHash = m.hashIdentifier(sessionKey)
 			_, live := activeKeys[sessionKey]
-			info["live"] = live
-			if p, ok := activeKeys[sessionKey]; ok {
-				info["platform"] = p
-			} else if len(sessionKey) > 0 {
-				parts := splitSessionKey(sessionKey)
-				if len(parts) > 0 {
-					info["platform"] = parts[0]
-				}
+			info.Live = live
+			if platformName, ok := activeKeys[sessionKey]; ok {
+				info.Platform = platformName
+			} else {
+				info.Platform = platformFromSessionKey(sessionKey)
 			}
-
 			if meta := e.sessions.GetUserMeta(sessionKey); meta != nil {
-				info["user_name"] = meta.UserName
-				info["chat_name"] = meta.ChatName
+				info.UserNameConfigured = meta.UserName != ""
+				info.ChatNameConfigured = meta.ChatName != ""
 			}
-
 			sessions = append(sessions, info)
 		}
 
+		activeHashes := make(map[string]string, len(activeKeys))
+		for key, platformName := range activeKeys {
+			if hashed := m.hashIdentifier(key); hashed != "" {
+				activeHashes[hashed] = platformName
+			}
+		}
 		mgmtJSON(w, http.StatusOK, map[string]any{
-			"sessions":    sessions,
-			"active_keys": activeKeys,
+			"sessions":      sessions,
+			"active_hashes": activeHashes,
 		})
 
 	case http.MethodPost:
@@ -1247,9 +1516,9 @@ func (m *ManagementServer) handleProjectSessionDetail(w http.ResponseWriter, r *
 		histJSON := make([]map[string]any, len(hist))
 		for i, h := range hist {
 			histJSON[i] = map[string]any{
-				"role":      h.Role,
-				"content":   h.Content,
-				"timestamp": h.Timestamp,
+				"role":               h.Role,
+				"content_configured": h.Content != "",
+				"timestamp":          h.Timestamp,
 			}
 		}
 
@@ -1261,27 +1530,21 @@ func (m *ManagementServer) handleProjectSessionDetail(w http.ResponseWriter, r *
 		e.interactiveMu.Unlock()
 
 		s.mu.Lock()
-		data := map[string]any{
-			"id":               s.ID,
-			"name":             s.Name,
-			"session_key":      sessionKey,
-			"agent_session_id": s.AgentSessionID,
-			"agent_type":       s.AgentType,
-			"active":           activeIDs[s.ID],
-			"live":             live,
-			"history_count":    len(s.History),
-			"created_at":       s.CreatedAt,
-			"updated_at":       s.UpdatedAt,
-			"history":          histJSON,
+		data := managementSessionDetailDTO{
+			ID:                     s.ID,
+			Name:                   s.Name,
+			SessionHash:            m.hashIdentifier(sessionKey),
+			AgentSessionConfigured: s.AgentSessionID != "",
+			AgentType:              s.AgentType,
+			Active:                 activeIDs[s.ID],
+			Live:                   live,
+			HistoryCount:           len(s.History),
+			CreatedAt:              s.CreatedAt,
+			UpdatedAt:              s.UpdatedAt,
+			History:                histJSON,
+			Platform:               platformFromSessionKey(sessionKey),
 		}
 		s.mu.Unlock()
-
-		if len(sessionKey) > 0 {
-			parts := splitSessionKey(sessionKey)
-			if len(parts) > 0 {
-				data["platform"] = parts[0]
-			}
-		}
 
 		mgmtJSON(w, http.StatusOK, data)
 
@@ -1608,20 +1871,20 @@ func (m *ManagementServer) handleProjectHeartbeat(w http.ResponseWriter, r *http
 			mgmtJSON(w, http.StatusOK, map[string]any{"enabled": false})
 			return
 		}
-		data := map[string]any{
-			"enabled":        st.Enabled,
-			"paused":         st.Paused,
-			"interval_mins":  st.IntervalMins,
-			"only_when_idle": st.OnlyWhenIdle,
-			"session_key":    st.SessionKey,
-			"silent":         st.Silent,
-			"run_count":      st.RunCount,
-			"error_count":    st.ErrorCount,
-			"skipped_busy":   st.SkippedBusy,
-			"last_error":     st.LastError,
+		data := managementHeartbeatStatusDTO{
+			Enabled:             st.Enabled,
+			Paused:              st.Paused,
+			IntervalMins:        st.IntervalMins,
+			OnlyWhenIdle:        st.OnlyWhenIdle,
+			SessionHash:         m.hashIdentifier(st.SessionKey),
+			Silent:              st.Silent,
+			RunCount:            st.RunCount,
+			ErrorCount:          st.ErrorCount,
+			SkippedBusy:         st.SkippedBusy,
+			LastErrorConfigured: st.LastError != "",
 		}
 		if !st.LastRun.IsZero() {
-			data["last_run"] = st.LastRun.Format(time.RFC3339)
+			data.LastRun = st.LastRun.Format(time.RFC3339)
 		}
 		mgmtJSON(w, http.StatusOK, data)
 
@@ -1898,15 +2161,19 @@ func (m *ManagementServer) handleGlobalProviders(w http.ResponseWriter, r *http.
 	switch r.Method {
 	case http.MethodGet:
 		if m.listGlobalProviders == nil {
-			mgmtJSON(w, http.StatusOK, map[string]any{"providers": []any{}})
+			mgmtJSON(w, http.StatusOK, map[string]any{"providers": []managementGlobalProviderDTO{}, "available": false})
 			return
 		}
 		providers, err := m.listGlobalProviders()
 		if err != nil {
-			mgmtError(w, http.StatusInternalServerError, err.Error())
+			mgmtJSON(w, http.StatusOK, map[string]any{
+				"providers": []managementGlobalProviderDTO{},
+				"available": false,
+				"error":     "providers_unavailable",
+			})
 			return
 		}
-		mgmtJSON(w, http.StatusOK, map[string]any{"providers": providers})
+		mgmtJSON(w, http.StatusOK, map[string]any{"providers": sanitizeGlobalProviders(providers), "available": true})
 
 	case http.MethodPost:
 		if m.addGlobalProvider == nil {
@@ -2048,10 +2315,10 @@ func (m *ManagementServer) handleCCSwitchProviders(w http.ResponseWriter, r *htt
 		}
 		providers, err := m.listCCSwitchProviders()
 		if err != nil {
-			mgmtJSON(w, http.StatusOK, map[string]any{"providers": []any{}, "available": false, "error": err.Error()})
+			mgmtJSON(w, http.StatusOK, map[string]any{"providers": []managementGlobalProviderDTO{}, "available": false, "error": "cc_switch_unavailable"})
 			return
 		}
-		mgmtJSON(w, http.StatusOK, map[string]any{"providers": providers, "available": true})
+		mgmtJSON(w, http.StatusOK, map[string]any{"providers": sanitizeCCSwitchProviders(providers), "available": true})
 
 	case http.MethodPost:
 		if m.listCCSwitchProviders == nil || m.addGlobalProvider == nil {
@@ -2118,10 +2385,10 @@ func (m *ManagementServer) handleCCSwitchProviders(w http.ResponseWriter, r *htt
 // applying per-agent-type overrides for base_url, model, and models.
 func resolveGlobalProviderForAgent(g GlobalProviderInfo, agentType string) ProviderConfig {
 	pc := ProviderConfig{
-		Name:   g.Name,
-		APIKey: g.APIKey,
+		Name:    g.Name,
+		APIKey:  g.APIKey,
 		BaseURL: g.BaseURL,
-		Model:  g.Model,
+		Model:   g.Model,
 	}
 	if ep, ok := g.Endpoints[agentType]; ok && ep != "" {
 		pc.BaseURL = ep

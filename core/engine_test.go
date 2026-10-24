@@ -649,6 +649,27 @@ func waitDeleteModePhase(t *testing.T, e *Engine, sessionKey, targetPhase string
 	t.Fatalf("timed out waiting for delete mode phase %q", targetPhase)
 }
 
+func waitDeleteModeResultCard(t *testing.T, e *Engine, p *stubCardPlatform, sessionKey string) *Card {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		dm := e.getDeleteModeState(sessionKey)
+		refreshed := p.getRefreshedCards()
+		if dm != nil && dm.phase == "result" && len(refreshed) > 0 {
+			return refreshed[len(refreshed)-1]
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	dm := e.getDeleteModeState(sessionKey)
+	refreshed := p.getRefreshedCards()
+	phase := "<nil>"
+	if dm != nil {
+		phase = dm.phase
+	}
+	t.Fatalf("timed out waiting for delete mode result card: phase=%s refreshed=%d", phase, len(refreshed))
+	return nil
+}
+
 type stubProviderAgent struct {
 	stubAgent
 	providers []ProviderConfig
@@ -4205,15 +4226,10 @@ func TestDeleteMode_ConfirmAndSubmitDeletesSelectedSessions(t *testing.T) {
 	}
 	// Submit is now async; the returned card is a "deleting" indicator.
 	// Wait for the background goroutine to complete and push the result card.
-	waitDeleteModePhase(t, e, msg.SessionKey, "result")
+	pushedCard := waitDeleteModeResultCard(t, e, p, msg.SessionKey)
 	if got, want := strings.Join(agent.deleted, ","), "session-1,session-3"; got != want {
 		t.Fatalf("deleted = %q, want %q", got, want)
 	}
-	refreshed := p.getRefreshedCards()
-	if len(refreshed) == 0 {
-		t.Fatal("expected refreshed result card via RefreshCard")
-	}
-	pushedCard := refreshed[len(refreshed)-1]
 	if !strings.Contains(pushedCard.RenderText(), "Session deleted: One") {
 		t.Fatalf("result text = %q, want delete result", pushedCard.RenderText())
 	}
@@ -4242,13 +4258,8 @@ func TestDeleteMode_SubmitReportsMissingSelectedSessions(t *testing.T) {
 	if resultCard == nil {
 		t.Fatal("expected deleting card after submit")
 	}
-	// Wait for async deletion to complete.
-	waitDeleteModePhase(t, e, msg.SessionKey, "result")
-	refreshed := p.getRefreshedCards()
-	if len(refreshed) == 0 {
-		t.Fatal("expected refreshed result card via RefreshCard")
-	}
-	pushedCard := refreshed[len(refreshed)-1]
+	// Wait for async deletion to complete and publish the result card.
+	pushedCard := waitDeleteModeResultCard(t, e, p, msg.SessionKey)
 	resultText := pushedCard.RenderText()
 	if !strings.Contains(resultText, "Session deleted: One") {
 		t.Fatalf("result text = %q, want deleted session line", resultText)
@@ -4344,15 +4355,11 @@ func TestDeleteMode_SubmitBlocksActiveSession(t *testing.T) {
 	if resultCard == nil {
 		t.Fatal("expected deleting card")
 	}
-	// Wait for async deletion to complete.
-	waitDeleteModePhase(t, e, msg.SessionKey, "result")
+	// Wait for async deletion to complete and publish the result card.
+	pushedCard := waitDeleteModeResultCard(t, e, p, msg.SessionKey)
 	if len(agent.deleted) != 0 {
 		t.Fatalf("deleted = %v, want none", agent.deleted)
 	}
-	if len(p.getRefreshedCards()) == 0 {
-		t.Fatal("expected refreshed result card via RefreshCard")
-	}
-	pushedCard := p.getRefreshedCards()[len(p.getRefreshedCards())-1]
 	if !strings.Contains(pushedCard.RenderText(), "Cannot delete the currently active session") {
 		t.Fatalf("result text = %q, want active-session warning", pushedCard.RenderText())
 	}
@@ -4420,16 +4427,11 @@ func TestDeleteMode_FormSubmitShowsConfirmThenDeletes(t *testing.T) {
 	if resultCard == nil {
 		t.Fatal("expected deleting card after submit")
 	}
-	// Wait for async deletion to complete.
-	waitDeleteModePhase(t, e, msg.SessionKey, "result")
+	// Wait for async deletion to complete and publish the result card.
+	pushedCard := waitDeleteModeResultCard(t, e, p, msg.SessionKey)
 	if got, want := strings.Join(agent.deleted, ","), "session-1,session-3"; got != want {
 		t.Fatalf("deleted = %q, want %q", got, want)
 	}
-	refreshed := p.getRefreshedCards()
-	if len(refreshed) == 0 {
-		t.Fatal("expected pushed result card via RefreshCard")
-	}
-	pushedCard := refreshed[len(refreshed)-1]
 	if !strings.Contains(pushedCard.RenderText(), "Session deleted: One") {
 		t.Fatalf("result text = %q, want delete result", pushedCard.RenderText())
 	}
@@ -17512,4 +17514,753 @@ func TestAbandonedLocalMutationBeginDoesNotLeakLease(t *testing.T) {
 		t.Fatal("submit blocked after abandoned begin; owner likely leaked or blocked on local mutation lease")
 	}
 	scheduler.Stop(context.Background())
+}
+
+type attachmentLifecycleAgent struct {
+	name      string
+	workDir   string
+	startGate chan struct{}
+	mu        sync.Mutex
+	starts    int
+	sessions  []*attachmentLifecycleSession
+}
+
+func newAttachmentLifecycleAgent(workDir string) *attachmentLifecycleAgent {
+	return &attachmentLifecycleAgent{name: "attachment-lifecycle", workDir: workDir}
+}
+
+func (a *attachmentLifecycleAgent) Name() string       { return a.name }
+func (a *attachmentLifecycleAgent) GetWorkDir() string { return a.workDir }
+func (a *attachmentLifecycleAgent) StartSession(ctx context.Context, _ string) (AgentSession, error) {
+	if a.startGate != nil {
+		select {
+		case <-a.startGate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	s := newAttachmentLifecycleSession()
+	a.mu.Lock()
+	a.starts++
+	a.sessions = append(a.sessions, s)
+	a.mu.Unlock()
+	return s, nil
+}
+func (a *attachmentLifecycleAgent) ListSessions(context.Context) ([]AgentSessionInfo, error) {
+	return nil, nil
+}
+func (a *attachmentLifecycleAgent) Stop() error { return nil }
+func (a *attachmentLifecycleAgent) startCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.starts
+}
+func (a *attachmentLifecycleAgent) lastSession() *attachmentLifecycleSession {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.sessions) == 0 {
+		return nil
+	}
+	return a.sessions[len(a.sessions)-1]
+}
+
+type attachmentLifecycleSession struct {
+	events    chan Event
+	mu        sync.Mutex
+	sends     []attachmentSendRecord
+	blockSend chan struct{}
+}
+
+type attachmentSendRecord struct {
+	messageID string
+	images    []ImageAttachment
+	files     []FileAttachment
+}
+
+func newAttachmentLifecycleSession() *attachmentLifecycleSession {
+	return &attachmentLifecycleSession{events: make(chan Event, 8)}
+}
+func (s *attachmentLifecycleSession) Send(_ string, messageID string, images []ImageAttachment, files []FileAttachment) error {
+	if s.blockSend != nil {
+		<-s.blockSend
+	}
+	rec := attachmentSendRecord{messageID: messageID, images: cloneImageAttachments(images), files: cloneFileAttachments(files)}
+	s.mu.Lock()
+	s.sends = append(s.sends, rec)
+	s.mu.Unlock()
+	s.events <- Event{Type: EventResult, Content: "ok", Done: true}
+	return nil
+}
+func (s *attachmentLifecycleSession) RespondPermission(string, PermissionResult) error { return nil }
+func (s *attachmentLifecycleSession) Events() <-chan Event                             { return s.events }
+func (s *attachmentLifecycleSession) CurrentSessionID() string                         { return "attachment-session" }
+func (s *attachmentLifecycleSession) Alive() bool                                      { return true }
+func (s *attachmentLifecycleSession) Close() error                                     { return nil }
+func (s *attachmentLifecycleSession) sendRecords() []attachmentSendRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]attachmentSendRecord, len(s.sends))
+	copy(out, s.sends)
+	return out
+}
+
+func cloneImageAttachments(in []ImageAttachment) []ImageAttachment {
+	out := make([]ImageAttachment, len(in))
+	for i := range in {
+		out[i] = in[i]
+		out[i].Data = append([]byte(nil), in[i].Data...)
+	}
+	return out
+}
+
+func cloneFileAttachments(in []FileAttachment) []FileAttachment {
+	out := make([]FileAttachment, len(in))
+	for i := range in {
+		out[i] = in[i]
+		out[i].Data = append([]byte(nil), in[i].Data...)
+	}
+	return out
+}
+
+func waitAttachmentCondition(t *testing.T, pred func() bool, desc string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if pred() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", desc)
+}
+
+func TestAttachmentStageFailureDoesNotStartAgentAndRepliesOnce(t *testing.T) {
+	workDir := t.TempDir()
+	agent := newAttachmentLifecycleAgent(workDir)
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+
+	msg := &Message{
+		SessionKey: "test:attachment-fail",
+		Platform:   "test",
+		MessageID:  "bad-attachment",
+		UserID:     "u",
+		UserName:   "user",
+		Files:      []FileAttachment{{FileName: "empty.txt", MimeType: "text/plain", Data: nil}},
+		ReplyCtx:   "ctx",
+	}
+	e.handleMessage(platform, msg)
+
+	if got := agent.startCount(); got != 0 {
+		t.Fatalf("agent starts = %d, want 0 when staging fails", got)
+	}
+	if got := len(platform.getSent()); got != 1 {
+		t.Fatalf("replies = %d (%q), want exactly one actionable attachment failure", got, platform.getSent())
+	}
+	if msg.Staged != nil {
+		t.Fatalf("failed stage left Message.Staged = %#v", msg.Staged)
+	}
+	if len(msg.Files) != 1 || len(msg.Files[0].Data) != 0 {
+		t.Fatalf("failed stage should not take ownership or mutate raw attachment, files=%+v", msg.Files)
+	}
+}
+
+func TestEngineStagesAttachmentsBeforeSubmitAndActiveReadAllOnly(t *testing.T) {
+	workDir := t.TempDir()
+	agent := newAttachmentLifecycleAgent(workDir)
+	agent.startGate = make(chan struct{})
+	platform := &stubPlatformEngine{n: "test"}
+	clock := newFakeSchedulerClock(time.Unix(12_000, 0))
+	e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish, WithProjectScheduler(NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)))
+	t.Cleanup(func() { _ = e.Stop() })
+
+	first := &Message{SessionKey: "test:stage", Platform: "test", MessageID: "m1", UserID: "u", UserName: "user", Content: "first", Files: []FileAttachment{{FileName: "first.txt", MimeType: "text/plain", Data: []byte("first-bytes")}}, ReplyCtx: "r1"}
+	second := &Message{SessionKey: "test:stage", Platform: "test", MessageID: "m2", UserID: "u", UserName: "user", Content: "second", Files: []FileAttachment{{FileName: "second.txt", MimeType: "text/plain", Data: []byte("second-bytes")}}, ReplyCtx: "r2"}
+	e.handleMessage(platform, first)
+	waitAttachmentCondition(t, func() bool { return first.Staged != nil && len(first.Files) == 0 }, "first staged and raw bytes released")
+	e.handleMessage(platform, second)
+	waitAttachmentCondition(t, func() bool { return second.Staged != nil && len(second.Files) == 0 }, "second queued staged and raw bytes released")
+	if agent.startCount() != 0 {
+		t.Fatalf("agent started before gate released; waiting task must not read staged bytes early")
+	}
+
+	close(agent.startGate)
+	waitAttachmentCondition(t, func() bool {
+		s := agent.lastSession()
+		return s != nil && len(s.sendRecords()) >= 2
+	}, "both active sends")
+	records := agent.lastSession().sendRecords()
+	if len(records) != 2 {
+		t.Fatalf("send records = %d, want 2", len(records))
+	}
+	if got := string(records[0].files[0].Data); got != "first-bytes" {
+		t.Fatalf("first send bytes = %q", got)
+	}
+	if got := string(records[1].files[0].Data); got != "second-bytes" {
+		t.Fatalf("second send bytes = %q", got)
+	}
+	waitAttachmentCondition(t, func() bool {
+		_, err1 := os.Stat(first.Staged.Entries()[0].Path)
+		_, err2 := os.Stat(second.Staged.Entries()[0].Path)
+		return os.IsNotExist(err1) && os.IsNotExist(err2)
+	}, "scheduler terminal cleanup removed staged files")
+}
+
+func TestExternalPreStagedMessageRejectedWithoutCleaningForeignStage(t *testing.T) {
+	workDir := t.TempDir()
+	foreignMsg := &Message{MessageID: "foreign", Files: []FileAttachment{{FileName: "foreign.txt", MimeType: "text/plain", Data: []byte("foreign")}}}
+	foreignStage := mustStage(t, workDir, foreignMsg, DefaultMaxAttachmentSize)
+	foreignPath := foreignStage.Entries()[0].Path
+
+	agent := newAttachmentLifecycleAgent(workDir)
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+
+	msg := &Message{SessionKey: "test:external-stage", Platform: "test", MessageID: "external", UserID: "u", UserName: "user", Content: "hello", Staged: foreignStage, ReplyCtx: "ctx"}
+	e.handleMessage(platform, msg)
+
+	if got := agent.startCount(); got != 0 {
+		t.Fatalf("agent starts = %d, want 0 for external pre-staged message", got)
+	}
+	if _, err := os.Stat(foreignPath); err != nil {
+		t.Fatalf("engine must not cleanup foreign staged object, stat %q: %v", foreignPath, err)
+	}
+	if got := len(platform.getSent()); got != 1 {
+		t.Fatalf("replies = %d (%q), want one rejection", got, platform.getSent())
+	}
+}
+
+func TestRejectedAttachmentSubmissionsCleanupStagedFiles(t *testing.T) {
+	workDir := t.TempDir()
+	platform := &stubPlatformEngine{n: "test"}
+
+	t.Run("rejected_full", func(t *testing.T) {
+		clock := newFakeSchedulerClock(time.Unix(12_100, 0))
+		scheduler := NewProjectScheduler(clock, 0, 6*time.Hour, 30*time.Minute)
+		gate := make(chan struct{})
+		started := make(chan struct{}, 1)
+		if got := scheduler.Submit(ProjectTask{ID: "active", SessionKey: "other", Run: func(context.Context) TaskResult {
+			started <- struct{}{}
+			<-gate
+			return TaskResult{State: TaskStateCompleted}
+		}}); got.Status != SubmitStarted {
+			t.Fatalf("active submit = %+v", got)
+		}
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("active task did not start")
+		}
+		defer close(gate)
+
+		agent := newAttachmentLifecycleAgent(workDir)
+		e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish, WithProjectScheduler(scheduler))
+		msg := &Message{SessionKey: "test:reject-full", Platform: "test", MessageID: "reject-full", UserID: "u", UserName: "user", Content: "full", Files: []FileAttachment{{FileName: "full.txt", MimeType: "text/plain", Data: []byte("full")}}, ReplyCtx: "r"}
+		e.handleMessage(platform, msg)
+		if msg.Staged == nil {
+			t.Fatal("message was not staged before full rejection")
+		}
+		if _, err := os.Stat(msg.Staged.Entries()[0].Path); !os.IsNotExist(err) {
+			t.Fatalf("rejected_full did not cleanup staged file, stat err=%v", err)
+		}
+	})
+
+	t.Run("rejected_stopped", func(t *testing.T) {
+		scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(12_200, 0)), 10, 6*time.Hour, 30*time.Minute)
+		scheduler.Stop(context.Background())
+		agent := newAttachmentLifecycleAgent(workDir)
+		e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish, WithProjectScheduler(scheduler))
+		msg := &Message{SessionKey: "test:reject-stopped", Platform: "test", MessageID: "reject-stopped", UserID: "u", UserName: "user", Content: "stopped", Files: []FileAttachment{{FileName: "stopped.txt", MimeType: "text/plain", Data: []byte("stopped")}}, ReplyCtx: "r"}
+		e.handleMessage(platform, msg)
+		if msg.Staged == nil {
+			t.Fatal("message was not staged before stopped rejection")
+		}
+		if _, err := os.Stat(msg.Staged.Entries()[0].Path); !os.IsNotExist(err) {
+			t.Fatalf("rejected_stopped did not cleanup staged file, stat err=%v", err)
+		}
+	})
+}
+
+func TestActiveReadAllFailureDoesNotCallSendAndCleansStagedFile(t *testing.T) {
+	workDir := t.TempDir()
+	agent := newAttachmentLifecycleAgent(workDir)
+	agent.startGate = make(chan struct{})
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+
+	msg := &Message{SessionKey: "test:tamper", Platform: "test", MessageID: "tamper", UserID: "u", UserName: "user", Content: "tamper", Files: []FileAttachment{{FileName: "tamper.txt", MimeType: "text/plain", Data: []byte("good")}}, ReplyCtx: "r"}
+	e.handleMessage(platform, msg)
+	waitAttachmentCondition(t, func() bool { return msg.Staged != nil }, "message staged")
+	path := msg.Staged.Entries()[0].Path
+	if err := os.WriteFile(path, []byte("bad"), 0o644); err != nil {
+		t.Fatalf("tamper staged file: %v", err)
+	}
+	close(agent.startGate)
+	waitAttachmentCondition(t, func() bool { return len(platform.getSent()) > 0 }, "attachment failure reply")
+	if s := agent.lastSession(); s != nil && len(s.sendRecords()) != 0 {
+		t.Fatalf("Send was called after ReadAll failure: %+v", s.sendRecords())
+	}
+	waitAttachmentCondition(t, func() bool {
+		_, err := os.Stat(path)
+		return os.IsNotExist(err)
+	}, "cleanup after read failure")
+}
+
+func TestSendAttachmentSlicesReleasedAfterSendReturns(t *testing.T) {
+	workDir := t.TempDir()
+	agent := newAttachmentLifecycleAgent(workDir)
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+
+	msg := &Message{SessionKey: "test:release", Platform: "test", MessageID: "release", UserID: "u", UserName: "user", Content: "release", Files: []FileAttachment{{FileName: "release.txt", MimeType: "text/plain", Data: []byte("release-bytes")}}, ReplyCtx: "r"}
+	e.handleMessage(platform, msg)
+	waitAttachmentCondition(t, func() bool {
+		s := agent.lastSession()
+		return s != nil && len(s.sendRecords()) == 1
+	}, "send record")
+	// The production release hook clears the local slice passed to Send after Send
+	// returns. The cloned record above proves Send saw the bytes; the original
+	// message remains byte-free and the staged file is removed at terminal cleanup.
+	if len(msg.Files) != 0 || msg.Staged == nil {
+		t.Fatalf("message retained raw files or did not stage: files=%d staged=%v", len(msg.Files), msg.Staged != nil)
+	}
+	waitAttachmentCondition(t, func() bool {
+		_, err := os.Stat(msg.Staged.Entries()[0].Path)
+		return os.IsNotExist(err)
+	}, "cleanup after send")
+}
+
+func TestSlashBangAndPureAttachmentEnterSchedulerNotLocalCommandsOrEmptyDrop(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{name: "slash", content: "/status"},
+		{name: "bang", content: "!echo unsafe"},
+		{name: "pure", content: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			workDir := t.TempDir()
+			agent := newAttachmentLifecycleAgent(workDir)
+			platform := &stubPlatformEngine{n: "test"}
+			e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish)
+			t.Cleanup(func() { _ = e.Stop() })
+
+			msg := &Message{SessionKey: "test:" + tc.name, Platform: "test", MessageID: "msg-" + tc.name, UserID: "u", UserName: "user", Content: tc.content, Files: []FileAttachment{{FileName: tc.name + ".txt", MimeType: "text/plain", Data: []byte(tc.name + "-bytes")}}, ReplyCtx: "r"}
+			e.handleMessage(platform, msg)
+			waitAttachmentCondition(t, func() bool {
+				s := agent.lastSession()
+				return s != nil && len(s.sendRecords()) == 1
+			}, "attachment message sent to agent")
+			if msg.Staged == nil || len(msg.Files) != 0 {
+				t.Fatalf("message not staged or raw bytes retained: staged=%v files=%d", msg.Staged != nil, len(msg.Files))
+			}
+			if records := agent.lastSession().sendRecords(); len(records[0].files) != 1 || string(records[0].files[0].Data) != tc.name+"-bytes" {
+				t.Fatalf("agent files = %+v, want one staged file", records[0].files)
+			}
+		})
+	}
+}
+
+func TestProactiveProjectTaskStagesAttachmentsAndRejectsExternalStaged(t *testing.T) {
+	workDir := t.TempDir()
+	agent := newAttachmentLifecycleAgent(workDir)
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+
+	req := projectAgentTaskRequest{
+		ID:         "proactive-attachment",
+		Source:     TaskSourceTimer,
+		SessionKey: "test:proactive",
+		Platform:   platform,
+		Message:    Message{SessionKey: "test:proactive", Platform: "test", MessageID: "proactive-msg", UserID: "timer", UserName: "timer", Content: "timer", Files: []FileAttachment{{FileName: "timer.txt", MimeType: "text/plain", Data: []byte("timer-bytes")}}, ReplyCtx: "r"},
+		Agent:      agent,
+		Sessions:   e.sessions,
+	}
+	if err := e.submitProjectAgentTaskAndWait(req); err != nil {
+		t.Fatalf("submitProjectAgentTaskAndWait with attachment returned error: %v", err)
+	}
+	if req.Message.Staged != nil || len(req.Message.Files) != 1 {
+		t.Fatal("request value should not be treated as ownership authority after copy")
+	}
+	waitAttachmentCondition(t, func() bool {
+		s := agent.lastSession()
+		return s != nil && len(s.sendRecords()) == 1
+	}, "proactive send")
+	if got := string(agent.lastSession().sendRecords()[0].files[0].Data); got != "timer-bytes" {
+		t.Fatalf("proactive send bytes = %q", got)
+	}
+
+	foreignMsg := &Message{MessageID: "foreign-proactive", Files: []FileAttachment{{FileName: "foreign.txt", MimeType: "text/plain", Data: []byte("foreign")}}}
+	foreignStage := mustStage(t, workDir, foreignMsg, DefaultMaxAttachmentSize)
+	foreignPath := foreignStage.Entries()[0].Path
+	req.Message = Message{SessionKey: "test:proactive", Platform: "test", MessageID: "external-proactive", Content: "external", Staged: foreignStage, ReplyCtx: "r"}
+	if err := e.submitProjectAgentTaskAndWait(req); err == nil {
+		t.Fatal("external pre-staged proactive message was accepted")
+	}
+	if _, err := os.Stat(foreignPath); err != nil {
+		t.Fatalf("foreign proactive stage was cleaned or lost: %v", err)
+	}
+}
+
+func assertNoAttachmentStageFiles(t *testing.T, workDir string) {
+	t.Helper()
+	root := filepath.Join(workDir, ".cc-connect", "attachments")
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return
+	}
+	var files []string
+	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk attachment stage root: %v", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("staged attachment files remain after rejected submit: %v", files)
+	}
+}
+
+func TestProactiveAttachmentRejectedBusyAndNotificationBacklogCleanup(t *testing.T) {
+	t.Run("rejected_busy", func(t *testing.T) {
+		workDir := t.TempDir()
+		clock := newFakeSchedulerClock(time.Unix(12_300, 0))
+		scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+		gate := make(chan struct{})
+		started := make(chan struct{}, 1)
+		if got := scheduler.Submit(ProjectTask{ID: "active", Run: func(context.Context) TaskResult {
+			started <- struct{}{}
+			<-gate
+			return TaskResult{State: TaskStateCompleted}
+		}}); got.Status != SubmitStarted {
+			t.Fatalf("active submit = %+v", got)
+		}
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("active task did not start")
+		}
+		defer close(gate)
+		agent := newAttachmentLifecycleAgent(workDir)
+		e := NewEngine("test", agent, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish, WithProjectScheduler(scheduler))
+		err := e.submitProjectAgentTaskAndWait(projectAgentTaskRequest{ID: "busy-attachment", Source: TaskSourceHeartbeat, SessionKey: "test:busy", Platform: e.platforms[0], Message: Message{SessionKey: "test:busy", Platform: "test", MessageID: "busy-msg", Content: "busy", Files: []FileAttachment{{FileName: "busy.txt", MimeType: "text/plain", Data: []byte("busy")}}}, Agent: agent, Sessions: e.sessions, OnlyIfIdle: true})
+		if !errors.Is(err, errProjectSchedulerBusy) {
+			t.Fatalf("busy err = %v, want errProjectSchedulerBusy", err)
+		}
+		assertNoAttachmentStageFiles(t, workDir)
+	})
+
+	t.Run("rejected_notification_backlog", func(t *testing.T) {
+		workDir := t.TempDir()
+		clock := newFakeSchedulerClock(time.Unix(12_400, 0))
+		scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+		started := make(chan string, 32)
+		callbackEntered := make(chan string, 32)
+		blockCallbacks := make(chan struct{})
+		submitBatch := func(prefix string, release <-chan struct{}) {
+			for i := 0; i < 11; i++ {
+				id := fmt.Sprintf("%s-%02d", prefix, i)
+				got := scheduler.Submit(ProjectTask{ID: id, Run: func(context.Context) TaskResult {
+					started <- id
+					<-release
+					return TaskResult{State: TaskStateCompleted}
+				}, OnFinish: func(TaskResult) { callbackEntered <- id; <-blockCallbacks }})
+				if i == 0 && got.Status != SubmitStarted {
+					t.Fatalf("submit %s = %+v, want started", id, got)
+				}
+				if i > 0 && got.Status != SubmitQueued {
+					t.Fatalf("submit %s = %+v, want queued", id, got)
+				}
+			}
+		}
+		firstRelease := make(chan struct{})
+		submitBatch("first", firstRelease)
+		close(firstRelease)
+		for i := 0; i < 11; i++ {
+			waitStarted(t, started)
+		}
+		if got := waitFinishStart(t, callbackEntered); got == "" {
+			t.Fatal("callback did not start")
+		}
+		secondRelease := make(chan struct{})
+		submitBatch("second", secondRelease)
+		close(secondRelease)
+		for i := 0; i < 11; i++ {
+			waitStarted(t, started)
+		}
+		if snap := waitSnapshot(t, scheduler); snap.NotificationPending != snap.NotificationCapacity {
+			t.Fatalf("notification backlog not full: %+v", snap)
+		}
+		agent := newAttachmentLifecycleAgent(workDir)
+		e := NewEngine("test", agent, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish, WithProjectScheduler(scheduler))
+		err := e.submitProjectAgentTaskAndWait(projectAgentTaskRequest{ID: "notify-attachment", Source: TaskSourceHeartbeat, SessionKey: "test:notify", Platform: e.platforms[0], Message: Message{SessionKey: "test:notify", Platform: "test", MessageID: "notify-msg", Content: "notify", Files: []FileAttachment{{FileName: "notify.txt", MimeType: "text/plain", Data: []byte("notify")}}}, Agent: agent, Sessions: e.sessions})
+		if err == nil || !strings.Contains(err.Error(), "notification backlog") {
+			t.Fatalf("notification backlog err = %v", err)
+		}
+		assertNoAttachmentStageFiles(t, workDir)
+		close(blockCallbacks)
+		scheduler.Stop(context.Background())
+	})
+}
+
+type blockedSendAgent struct {
+	workDir string
+	session *blockedSendSession
+}
+
+func newBlockedSendAgent(workDir string) *blockedSendAgent {
+	return &blockedSendAgent{workDir: workDir, session: newBlockedSendSession()}
+}
+func (a *blockedSendAgent) Name() string       { return "blocked-send" }
+func (a *blockedSendAgent) GetWorkDir() string { return a.workDir }
+func (a *blockedSendAgent) StartSession(context.Context, string) (AgentSession, error) {
+	return a.session, nil
+}
+func (a *blockedSendAgent) ListSessions(context.Context) ([]AgentSessionInfo, error) { return nil, nil }
+func (a *blockedSendAgent) Stop() error                                              { return nil }
+
+type blockedSendSession struct {
+	events        chan Event
+	unblockFirst  chan struct{}
+	firstStarted  chan struct{}
+	secondStarted chan struct{}
+	mu            sync.Mutex
+	sends         int
+}
+
+func newBlockedSendSession() *blockedSendSession {
+	return &blockedSendSession{
+		events:        make(chan Event, 4),
+		unblockFirst:  make(chan struct{}),
+		firstStarted:  make(chan struct{}),
+		secondStarted: make(chan struct{}),
+	}
+}
+func (s *blockedSendSession) Send(_ string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.mu.Lock()
+	s.sends++
+	call := s.sends
+	s.mu.Unlock()
+	if call == 1 {
+		close(s.firstStarted)
+		<-s.unblockFirst
+		return nil
+	}
+	if call == 2 {
+		close(s.secondStarted)
+		return nil
+	}
+	return nil
+}
+func (s *blockedSendSession) RespondPermission(string, PermissionResult) error { return nil }
+func (s *blockedSendSession) Events() <-chan Event                             { return s.events }
+func (s *blockedSendSession) CurrentSessionID() string                         { return "blocked-send-session" }
+func (s *blockedSendSession) Alive() bool                                      { return true }
+func (s *blockedSendSession) Close() error                                     { return nil }
+
+func TestBlockedSendEventTerminalDoesNotCleanupOrStartNextBeforeSendReturns(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		trigger func(*blockedSendSession)
+	}{
+		{name: "event_error", trigger: func(s *blockedSendSession) {
+			s.events <- Event{Type: EventError, Error: errors.New("boom before send returned")}
+		}},
+		{name: "channel_closed", trigger: func(s *blockedSendSession) { close(s.events) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workDir := t.TempDir()
+			agent := newBlockedSendAgent(workDir)
+			platform := &stubPlatformEngine{n: "test"}
+			clock := newFakeSchedulerClock(time.Unix(12_500, 0))
+			scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+			e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish, WithProjectScheduler(scheduler))
+			t.Cleanup(func() {
+				select {
+				case <-agent.session.unblockFirst:
+				default:
+					close(agent.session.unblockFirst)
+				}
+				_ = e.Stop()
+			})
+
+			first := &Message{SessionKey: "test:" + tc.name, Platform: "test", MessageID: "blocked-1-" + tc.name, UserID: "u", UserName: "user", Content: "first", Files: []FileAttachment{{FileName: "first.txt", MimeType: "text/plain", Data: []byte("first")}}, ReplyCtx: "r1"}
+			second := &Message{SessionKey: first.SessionKey, Platform: "test", MessageID: "blocked-2-" + tc.name, UserID: "u", UserName: "user", Content: "second", Files: []FileAttachment{{FileName: "second.txt", MimeType: "text/plain", Data: []byte("second")}}, ReplyCtx: "r2"}
+			e.handleMessage(platform, first)
+			waitAttachmentCondition(t, func() bool { return first.Staged != nil }, "first staged")
+			firstPath := first.Staged.Entries()[0].Path
+			select {
+			case <-agent.session.firstStarted:
+			case <-time.After(2 * time.Second):
+				t.Fatal("first Send did not start")
+			}
+			e.handleMessage(platform, second)
+			waitAttachmentCondition(t, func() bool { return second.Staged != nil }, "second staged and queued")
+
+			tc.trigger(agent.session)
+			select {
+			case <-agent.session.secondStarted:
+				t.Fatal("next turn started before first Send returned")
+			case <-time.After(100 * time.Millisecond):
+			}
+			if _, err := os.Stat(firstPath); err != nil {
+				t.Fatalf("first staged file cleaned before first Send returned: %v", err)
+			}
+
+			close(agent.session.unblockFirst)
+			select {
+			case <-agent.session.secondStarted:
+			case <-time.After(2 * time.Second):
+				t.Fatal("next turn did not start after first Send returned")
+			}
+			waitAttachmentCondition(t, func() bool {
+				_, err := os.Stat(firstPath)
+				return os.IsNotExist(err)
+			}, "first staged cleanup after Send returned")
+		})
+	}
+}
+
+func TestBlockedSendEventResultDoesNotCleanupOrStartNextBeforeSendReturns(t *testing.T) {
+	workDir := t.TempDir()
+	agent := newBlockedSendAgent(workDir)
+	platform := &stubPlatformEngine{n: "test"}
+	clock := newFakeSchedulerClock(time.Unix(12_600, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish, WithProjectScheduler(scheduler))
+	e.SetAutoCompressConfig(true, 1<<30, time.Hour)
+	t.Cleanup(func() {
+		select {
+		case <-agent.session.unblockFirst:
+		default:
+			close(agent.session.unblockFirst)
+		}
+		_ = e.Stop()
+	})
+	first := &Message{SessionKey: "test:event-result", Platform: "test", MessageID: "result-1", UserID: "u", UserName: "user", Content: "first", Files: []FileAttachment{{FileName: "first.txt", MimeType: "text/plain", Data: []byte("first")}}, ReplyCtx: "r1"}
+	second := &Message{SessionKey: first.SessionKey, Platform: "test", MessageID: "result-2", UserID: "u", UserName: "user", Content: "second", Files: []FileAttachment{{FileName: "second.txt", MimeType: "text/plain", Data: []byte("second")}}, ReplyCtx: "r2"}
+	e.handleMessage(platform, first)
+	waitAttachmentCondition(t, func() bool { return first.Staged != nil }, "first staged")
+	firstPath := first.Staged.Entries()[0].Path
+	select {
+	case <-agent.session.firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Send did not start")
+	}
+	e.handleMessage(platform, second)
+	waitAttachmentCondition(t, func() bool { return second.Staged != nil }, "second staged and queued")
+	agent.session.events <- Event{Type: EventResult, Content: "ok", Done: true}
+	select {
+	case <-agent.session.secondStarted:
+		t.Fatal("next turn started before first Send returned after EventResult")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := os.Stat(firstPath); err != nil {
+		t.Fatalf("first staged file cleaned before first Send returned after EventResult: %v", err)
+	}
+	close(agent.session.unblockFirst)
+	select {
+	case <-agent.session.secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("next turn did not start after first Send returned")
+	}
+	waitAttachmentCondition(t, func() bool { _, err := os.Stat(firstPath); return os.IsNotExist(err) }, "first staged cleanup after EventResult Send returned")
+}
+
+type closeUnblocksAgent struct {
+	workDir string
+	session *closeUnblocksSession
+}
+
+func newCloseUnblocksAgent(workDir string) *closeUnblocksAgent {
+	return &closeUnblocksAgent{workDir: workDir, session: newCloseUnblocksSession()}
+}
+func (a *closeUnblocksAgent) Name() string       { return "close-unblocks" }
+func (a *closeUnblocksAgent) GetWorkDir() string { return a.workDir }
+func (a *closeUnblocksAgent) StartSession(context.Context, string) (AgentSession, error) {
+	return a.session, nil
+}
+func (a *closeUnblocksAgent) ListSessions(context.Context) ([]AgentSessionInfo, error) {
+	return nil, nil
+}
+func (a *closeUnblocksAgent) Stop() error { return nil }
+
+type closeUnblocksSession struct {
+	events       chan Event
+	closeCalled  chan struct{}
+	forceUnblock chan struct{}
+	sendStarted  chan struct{}
+	closeOnce    sync.Once
+	sendOnce     sync.Once
+}
+
+func newCloseUnblocksSession() *closeUnblocksSession {
+	return &closeUnblocksSession{events: make(chan Event), closeCalled: make(chan struct{}), forceUnblock: make(chan struct{}), sendStarted: make(chan struct{})}
+}
+func (s *closeUnblocksSession) Send(_ string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.sendOnce.Do(func() { close(s.sendStarted) })
+	select {
+	case <-s.closeCalled:
+		return nil
+	case <-s.forceUnblock:
+		return nil
+	}
+}
+func (s *closeUnblocksSession) RespondPermission(string, PermissionResult) error { return nil }
+func (s *closeUnblocksSession) Events() <-chan Event                             { return s.events }
+func (s *closeUnblocksSession) CurrentSessionID() string                         { return "close-unblocks-session" }
+func (s *closeUnblocksSession) Alive() bool                                      { return true }
+func (s *closeUnblocksSession) Close() error {
+	s.closeOnce.Do(func() { close(s.closeCalled) })
+	return nil
+}
+
+func TestEngineStopClosesCooperativeSendBeforeWaitingForSchedulerDeadline(t *testing.T) {
+	workDir := t.TempDir()
+	agent := newCloseUnblocksAgent(workDir)
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish)
+	t.Cleanup(func() {
+		select {
+		case <-agent.session.forceUnblock:
+		default:
+			close(agent.session.forceUnblock)
+		}
+	})
+	msg := &Message{SessionKey: "test:stop-close", Platform: "test", MessageID: "stop-close", UserID: "u", UserName: "user", Content: "stop", Files: []FileAttachment{{FileName: "stop.txt", MimeType: "text/plain", Data: []byte("stop")}}, ReplyCtx: "r"}
+	e.handleMessage(platform, msg)
+	waitAttachmentCondition(t, func() bool { return msg.Staged != nil }, "message staged")
+	stagedPath := msg.Staged.Entries()[0].Path
+	select {
+	case <-agent.session.sendStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Send did not start")
+	}
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- e.Stop() }()
+	select {
+	case <-agent.session.closeCalled:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Engine.Stop did not initiate Close before waiting for scheduler deadline")
+	}
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Engine.Stop returned error after cooperative Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Engine.Stop did not finish after cooperative Close unblocked Send")
+	}
+	waitAttachmentCondition(t, func() bool { _, err := os.Stat(stagedPath); return os.IsNotExist(err) }, "staged cleanup after Stop cooperative Close")
 }

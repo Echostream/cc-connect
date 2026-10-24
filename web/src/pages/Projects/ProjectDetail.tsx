@@ -14,6 +14,7 @@ import {
 import { listProviders, addProvider, removeProvider, activateProvider, type Provider, listGlobalProviders, type GlobalProvider, saveProviderRefs } from '@/api/providers';
 import { getHeartbeat, pauseHeartbeat, resumeHeartbeat, triggerHeartbeat, setHeartbeatInterval, type HeartbeatStatus } from '@/api/heartbeat';
 import { restartSystem } from '@/api/status';
+import api from '@/api/client';
 import { formatTime, cn } from '@/lib/utils';
 import PlatformSetupQR from './PlatformSetupQR';
 import PlatformManualForm from './PlatformManualForm';
@@ -156,8 +157,8 @@ export default function ProjectDetail() {
     new Promise<void>((resolve) => {
       const start = Date.now();
       const poll = () => {
-        fetch('/api/v1/status')
-          .then((r) => { if (r.ok) resolve(); else throw new Error(); })
+        api.get('/status')
+          .then(() => { resolve(); })
           .catch(() => {
             if (Date.now() - start > maxMs) { resolve(); return; }
             setTimeout(poll, 500);
@@ -404,9 +405,9 @@ export default function ProjectDetail() {
             <p className="text-sm text-gray-500 dark:text-gray-400">
               {project.sessions_count} {t('nav.sessions').toLowerCase()}
             </p>
-            {project.active_session_keys?.length > 0 && (
+            {(project.active_session_hashes?.length || 0) > 0 && (
               <div className="mt-2 flex flex-wrap gap-1">
-                {project.active_session_keys.map((k) => (
+                {(project.active_session_hashes || []).map((k) => (
                   <Badge key={k} variant="default">{k}</Badge>
                 ))}
               </div>
@@ -657,16 +658,16 @@ export default function ProjectDetail() {
                       >
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-2">
-                            <span className="text-sm font-medium text-gray-900 dark:text-white">{b.channel_name}</span>
+                            <span className="text-sm font-medium text-gray-900 dark:text-white">{b.channel_name_configured ? '[configured]' : b.channel_hash}</span>
                             <Badge variant={b.active ? 'success' : 'default'}>
                               {b.active ? t('projects.workspaceActive', 'active') : t('projects.workspaceIdle', 'idle')}
                             </Badge>
                           </div>
                           <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5 truncate">
-                            <Folder size={11} className="inline mr-1" />{b.workspace}
+                            <Folder size={11} className="inline mr-1" />{b.workspace_configured ? '[configured]' : ''}
                           </p>
                         </div>
-                        <Button size="sm" variant="ghost" className="text-gray-400 hover:text-red-500 shrink-0 ml-3" onClick={() => handleUnbindWorkspace(b.channel_key)}>
+                        <Button size="sm" variant="ghost" className="text-gray-400 hover:text-red-500 shrink-0 ml-3" onClick={() => handleUnbindWorkspace(b.channel_hash || '')}>
                           <Trash2 size={14} />
                         </Button>
                       </div>

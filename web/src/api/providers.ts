@@ -15,15 +15,18 @@ export interface Provider {
 export interface CodexConfig {
   wire_api?: string;
   http_headers?: Record<string, string>;
+  codex_http_headers_configured?: boolean;
 }
 
 export interface GlobalProvider {
   name: string;
   api_key?: string;
+  api_key_configured?: boolean;
   base_url?: string;
   model?: string;
   thinking?: string;
   env?: Record<string, string>;
+  env_configured?: boolean;
   agent_types?: string[];
   models?: ProviderModel[];
   endpoints?: Record<string, string>;
@@ -91,6 +94,7 @@ export interface CCSwitchProvider {
   name: string;
   app_type: string;
   api_key?: string;
+  api_key_configured?: boolean;
   base_url?: string;
   model?: string;
   is_current: boolean;

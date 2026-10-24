@@ -348,7 +348,7 @@ export default function ChatView() {
           setMessages(detail.history.map((h, i) => ({
             id: `hist-${i}`,
             role: h.role as 'user' | 'assistant',
-            content: h.content,
+            content: h.content_configured === false ? '' : '[redacted]',
             format: 'markdown',
             timestamp: h.timestamp,
           })));
@@ -382,7 +382,7 @@ export default function ChatView() {
         setMessages(detail.history.map((h, i) => ({
           id: `hist-${i}`,
           role: h.role as 'user' | 'assistant',
-          content: h.content,
+          content: h.content_configured === false ? '' : '[redacted]',
           format: 'markdown',
           timestamp: h.timestamp,
         })));

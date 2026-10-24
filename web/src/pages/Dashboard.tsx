@@ -153,7 +153,7 @@ export default function Dashboard() {
                 <Badge className="text-xs mb-2">{sess.project}</Badge>
                 {sess.last_message && (
                   <p className="text-xs text-gray-400 truncate mb-2">
-                    {sess.last_message.content.slice(0, 60)}
+                    {(sess.last_message.content_configured === false ? '' : '[redacted]').slice(0, 60)}
                   </p>
                 )}
                 <div className="flex items-center gap-1 text-xs text-gray-400">

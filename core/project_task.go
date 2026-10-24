@@ -48,7 +48,9 @@ type TaskResult struct {
 //
 // Cleanup 由 Scheduler 在已接受任务进入 completed、expired、timed_out、
 // cancelled 或 failed 终态后恰好调用一次；Submit 返回 rejected_* 时任务未被
-// Scheduler 接管，调用方仍持有附件等临时资源并负责自行清理。OnFinish 是可选的
+// Scheduler 接管，调用方仍持有附件等临时资源并负责自行清理。Cleanup 不返回
+// error；调用方若适配带 error 的资源 Cleanup，必须在闭包内记录固定 reason/task_id
+// 的安全日志，不能把 path、文件名或底层错误原样外泄。OnFinish 是可选的
 // 终态发布钩子，必须只依赖 TaskResult，不承担附件释放职责。带非 nil OnFinish
 // 的任务在 Submit 时预留有界通知槽；若通知 backlog 已满，会返回
 // SubmitRejectedNotificationBacklog，且同样不接管资源。
@@ -98,6 +100,12 @@ type SchedulerSnapshot struct {
 	WaitingCount         int
 	NotificationPending  int
 	NotificationCapacity int
+	Completed            uint64
+	Failed               uint64
+	Expired              uint64
+	TimedOut             uint64
+	Cancelled            uint64
+	Rejected             uint64
 	Active               *SchedulerTaskSnapshot
 	Waiting              []SchedulerTaskSnapshot
 }

@@ -144,21 +144,14 @@ func checkCLIAuth(ctx context.Context, bin string, args []string, label string) 
 
 	start := time.Now()
 	cmd := exec.CommandContext(tctx, bin, args...)
-	out, err := cmd.CombinedOutput()
+	_, err := cmd.CombinedOutput()
 	latency := time.Since(start)
 
 	if err != nil {
-		detail := strings.TrimSpace(string(out))
-		if detail == "" {
-			detail = err.Error()
-		}
-		if len(detail) > 120 {
-			detail = detail[:120] + "..."
-		}
 		return []DoctorCheckResult{{
 			Name:    fmt.Sprintf("%s Auth", label),
 			Status:  DoctorWarn,
-			Detail:  detail,
+			Detail:  "auth_check_failed",
 			Latency: latency,
 		}}
 	}
@@ -185,7 +178,7 @@ func checkPlatforms(platforms []Platform) []DoctorCheckResult {
 			info := ph.PlatformHealth()
 			if info.Degraded {
 				check.Status = DoctorWarn
-				check.Detail = "degraded: " + info.DegradedReason
+				check.Detail = "degraded: " + sanitizePlatformHealthReason(info.DegradedReason)
 				if !info.DegradedSince.IsZero() {
 					check.Detail += " (since " + info.DegradedSince.Format(time.RFC3339) + ")"
 				}
@@ -204,6 +197,18 @@ func checkPlatforms(platforms []Platform) []DoctorCheckResult {
 		})
 	}
 	return results
+}
+
+func sanitizePlatformHealthReason(reason string) string {
+	switch reason {
+	case "bot_open_id_unresolved", "connect_failed", "connection_lost", "reconnect_failed", "starting", "stopped", "not_connected":
+		return reason
+	default:
+		if reason == "" {
+			return "degraded"
+		}
+		return "degraded"
+	}
 }
 
 func checkSystem(ctx context.Context) []DoctorCheckResult {

@@ -111,7 +111,7 @@ export default function SessionDrawer({ open, onClose, sessions, currentSessionI
                       ) : (
                         <Bot size={9} className="inline mr-0.5 -mt-0.5 opacity-60" />
                       )}
-                      {s.last_message.content.replace(/\n/g, ' ').slice(0, 80)}
+                      {(s.last_message.content_configured === false ? '' : '[redacted]').slice(0, 80)}
                     </p>
                   )}
 

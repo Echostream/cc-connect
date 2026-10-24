@@ -17,6 +17,7 @@ export interface ProjectDetail {
   name: string;
   agent_type: string;
   work_dir?: string;
+  work_dir_configured?: boolean;
   agent_mode?: string;
   show_context_indicator?: boolean;
   show_workdir_indicator?: boolean;
@@ -26,17 +27,20 @@ export interface ProjectDetail {
   platform_configs?: PlatformConfigInfo[];
   platforms: { type: string; connected: boolean }[];
   sessions_count: number;
-  active_session_keys: string[];
+  active_session_keys?: string[];
+  active_session_hashes?: string[];
   workspace_mode?: string;
   workspace_base_dir?: string;
   heartbeat: {
     enabled: boolean;
     paused: boolean;
     interval_mins: number;
-    session_key: string;
+    session_key?: string;
+    session_hash?: string;
   };
   settings: {
-    admin_from: string;
+    admin_from?: string;
+    admin_from_configured?: boolean;
     language: string;
     disabled_commands: string[];
   };
@@ -47,6 +51,7 @@ export interface ProjectSettingsUpdate {
   admin_from?: string;
   disabled_commands?: string[];
   work_dir?: string;
+  work_dir_configured?: boolean;
   mode?: string;
   agent_type?: string;
   show_context_indicator?: boolean;
@@ -59,9 +64,12 @@ export interface ProjectSettingsUpdate {
 }
 
 export interface WorkspaceBinding {
-  channel_key: string;
-  channel_name: string;
-  workspace: string;
+  channel_key?: string;
+  channel_hash?: string;
+  channel_name?: string;
+  channel_name_configured?: boolean;
+  workspace?: string;
+  workspace_configured?: boolean;
   bound_at: string;
   active?: boolean;
   last_activity?: string;
@@ -81,10 +89,10 @@ export const deleteProject = (name: string) =>
   api.delete<{ message: string; restart_required: boolean }>(`/projects/${name}`);
 
 export const listWorkspaces = (name: string) =>
-  api.get<{ base_dir: string; bindings: WorkspaceBinding[]; suggestions?: string[] }>(`/projects/${name}/workspaces`);
+  api.get<{ base_dir?: string; base_dir_configured?: boolean; bindings: WorkspaceBinding[]; suggestions?: string[]; suggestions_count?: number }>(`/projects/${name}/workspaces`);
 
 export const bindWorkspace = (name: string, body: { channel_key: string; channel_name?: string; workspace: string }) =>
-  api.post<{ message: string; workspace: string }>(`/projects/${name}/workspaces`, body);
+  api.post<{ message: string; workspace?: string; workspace_configured?: boolean }>(`/projects/${name}/workspaces`, body);
 
 export const unbindWorkspace = (name: string, channelKey: string) =>
   api.delete(`/projects/${name}/workspaces/${encodeURIComponent(channelKey)}`);

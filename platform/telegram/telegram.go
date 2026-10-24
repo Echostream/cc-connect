@@ -125,6 +125,7 @@ type Platform struct {
 	stopping            bool
 	generation          uint64
 	unavailableNotified bool
+	unavailableSince    time.Time
 	everConnected       bool
 	newBot              botFactory
 	newBackoffTimer     func(time.Duration) backoffTimer
@@ -819,6 +820,7 @@ func (p *Platform) markReady() {
 	defer p.mu.Unlock()
 	p.everConnected = true
 	p.unavailableNotified = false
+	p.unavailableSince = time.Time{}
 }
 
 func (p *Platform) notifyUnavailable(err error) {
@@ -830,6 +832,9 @@ func (p *Platform) notifyUnavailable(err error) {
 		return
 	}
 	p.unavailableNotified = true
+	if p.unavailableSince.IsZero() {
+		p.unavailableSince = time.Now()
+	}
 	handler = p.lifecycleHandler
 	p.mu.Unlock()
 
@@ -1754,6 +1759,30 @@ func (p *Platform) Stop() error {
 		cancel()
 	}
 	return nil
+}
+
+func (p *Platform) PlatformHealth() core.PlatformHealthInfo {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	info := core.PlatformHealthInfo{Name: p.Name()}
+	if p.stopping {
+		info.Connected = false
+		info.DegradedReason = "stopped"
+		return info
+	}
+	if p.bot != nil {
+		info.Connected = true
+		return info
+	}
+	info.Connected = false
+	if p.unavailableNotified {
+		info.Degraded = true
+		info.DegradedReason = "connect_failed"
+		info.DegradedSince = p.unavailableSince
+		return info
+	}
+	info.DegradedReason = "starting"
+	return info
 }
 
 // RegisterCommands registers bot commands with Telegram for the command menu.

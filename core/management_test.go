@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -211,8 +213,8 @@ func TestMgmt_AuthQueryParam(t *testing.T) {
 	_, ts, _ := testManagementServer(t, "qp-token")
 
 	r := mgmtGet(t, ts.URL+"/api/v1/status?token=qp-token", "")
-	if !r.OK {
-		t.Fatalf("expected success with query param token, got: %s", r.Error)
+	if r.OK {
+		t.Fatal("expected query param token to be rejected")
 	}
 }
 
@@ -220,8 +222,8 @@ func TestMgmt_NoAuthRequired(t *testing.T) {
 	_, ts, _ := testManagementServer(t, "")
 
 	r := mgmtGet(t, ts.URL+"/api/v1/status", "")
-	if !r.OK {
-		t.Fatalf("expected success without token when no token configured, got: %s", r.Error)
+	if r.OK {
+		t.Fatal("expected empty management token to fail closed")
 	}
 }
 
@@ -242,7 +244,7 @@ func TestMgmt_Status(t *testing.T) {
 	}
 }
 
-func TestMgmt_StatusIncludesBridgeToken(t *testing.T) {
+func TestMgmt_StatusDoesNotIncludeBridgeToken(t *testing.T) {
 	mgmt, ts, _ := testManagementServer(t, "tok")
 	mgmt.SetBridgeServer(NewBridgeServer(9810, "bridge-secret", "/bridge/ws", nil))
 
@@ -253,10 +255,11 @@ func TestMgmt_StatusIncludesBridgeToken(t *testing.T) {
 
 	var data struct {
 		Bridge struct {
-			Enabled bool   `json:"enabled"`
-			Port    int    `json:"port"`
-			Path    string `json:"path"`
-			Token   string `json:"token"`
+			Enabled         bool   `json:"enabled"`
+			Port            int    `json:"port"`
+			Path            string `json:"path"`
+			TokenConfigured bool   `json:"token_configured"`
+			Token           string `json:"token"`
 		} `json:"bridge"`
 	}
 	if err := json.Unmarshal(r.Data, &data); err != nil {
@@ -265,8 +268,11 @@ func TestMgmt_StatusIncludesBridgeToken(t *testing.T) {
 	if !data.Bridge.Enabled {
 		t.Fatal("expected bridge to be enabled")
 	}
-	if data.Bridge.Token != "bridge-secret" {
-		t.Fatalf("expected bridge token, got %q", data.Bridge.Token)
+	if !data.Bridge.TokenConfigured {
+		t.Fatal("expected bridge token_configured=true")
+	}
+	if data.Bridge.Token != "" {
+		t.Fatalf("bridge token leaked: %q", data.Bridge.Token)
 	}
 }
 
@@ -442,12 +448,12 @@ func TestMgmt_Config(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", resp.StatusCode)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "title") {
-		t.Fatalf("expected TOML content, got: %s", body)
+	if strings.Contains(string(body), "title") {
+		t.Fatalf("raw TOML leaked: %s", body)
 	}
 }
 
@@ -745,7 +751,7 @@ func TestMgmt_CronExecByID_ProjectMissingIsBadRequest(t *testing.T) {
 }
 
 func TestMgmt_CORS(t *testing.T) {
-	mgmt := NewManagementServer(0, "", []string{"http://localhost:3000"})
+	mgmt := NewManagementServer(0, "cors-token", []string{"http://localhost:3000"})
 	mgmt.RegisterEngine("p", NewEngine("p", &stubAgent{}, nil, "", LangEnglish))
 
 	mux := http.NewServeMux()
@@ -755,6 +761,8 @@ func TestMgmt_CORS(t *testing.T) {
 
 	req, _ := http.NewRequest("OPTIONS", ts.URL+"/api/v1/status", nil)
 	req.Header.Set("Origin", "http://localhost:3000")
+	req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	req.Header.Set("Access-Control-Request-Headers", "authorization")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -2022,7 +2030,7 @@ func TestMgmt_Config_NoPathSet(t *testing.T) {
 	if r.OK {
 		t.Fatal("expected error when configFilePath is empty")
 	}
-	if !strings.Contains(r.Error, "not set") {
+	if !strings.Contains(r.Error, "raw config is disabled") {
 		t.Fatalf("error = %q", r.Error)
 	}
 }
@@ -2602,11 +2610,15 @@ func TestMgmt_GlobalProviders_GetError(t *testing.T) {
 		return nil, errors.New("db connection lost")
 	})
 	r := mgmtGet(t, ts.URL+"/api/v1/providers", "tok")
-	if r.OK {
-		t.Fatal("expected error from list")
+	if !r.OK {
+		t.Fatalf("expected safe DTO response, got error: %s", r.Error)
 	}
-	if !strings.Contains(r.Error, "db connection lost") {
-		t.Fatalf("error = %q", r.Error)
+	var data map[string]any
+	if err := json.Unmarshal(r.Data, &data); err != nil {
+		t.Fatalf("unmarshal providers response: %v", err)
+	}
+	if data["error"] != "providers_unavailable" || data["available"] != false {
+		t.Fatalf("provider error DTO = %#v", data)
 	}
 }
 
@@ -3053,8 +3065,9 @@ func TestMgmt_ProjectWorkspaces_ListBindUnbind(t *testing.T) {
 		t.Fatalf("list workspaces: %s", r.Error)
 	}
 	var listed struct {
-		Bindings    []map[string]any `json:"bindings"`
-		Suggestions []string         `json:"suggestions"`
+		Bindings          []map[string]any `json:"bindings"`
+		SuggestionsCount  int              `json:"suggestions_count"`
+		BaseDirConfigured bool             `json:"base_dir_configured"`
 	}
 	if err := json.Unmarshal(r.Data, &listed); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -3062,8 +3075,8 @@ func TestMgmt_ProjectWorkspaces_ListBindUnbind(t *testing.T) {
 	if len(listed.Bindings) != 0 {
 		t.Fatalf("bindings = %#v, want empty", listed.Bindings)
 	}
-	if len(listed.Suggestions) != 1 || !strings.HasSuffix(listed.Suggestions[0], "repo-a") {
-		t.Fatalf("suggestions = %#v, want [.../repo-a]", listed.Suggestions)
+	if !listed.BaseDirConfigured || listed.SuggestionsCount != 0 {
+		t.Fatalf("workspace DTO = %+v, want configured base dir and no raw suggestions", listed)
 	}
 
 	// Bind the suggested directory to a channel.
@@ -3086,11 +3099,11 @@ func TestMgmt_ProjectWorkspaces_ListBindUnbind(t *testing.T) {
 	if len(listed.Bindings) != 1 {
 		t.Fatalf("bindings = %#v, want 1 entry", listed.Bindings)
 	}
-	if listed.Bindings[0]["channel_key"] != "slack:C123" {
-		t.Fatalf("channel_key = %v, want slack:C123", listed.Bindings[0]["channel_key"])
+	if listed.Bindings[0]["channel_hash"] == "" || listed.Bindings[0]["channel_hash"] == "slack:C123" {
+		t.Fatalf("channel_hash = %v, want non-empty hash", listed.Bindings[0]["channel_hash"])
 	}
-	if len(listed.Suggestions) != 0 {
-		t.Fatalf("suggestions = %#v, want empty once bound", listed.Suggestions)
+	if listed.SuggestionsCount != 0 {
+		t.Fatalf("suggestions_count = %#v, want 0", listed.SuggestionsCount)
 	}
 
 	// Unbind and confirm it's gone.
@@ -3123,5 +3136,453 @@ func TestMgmt_ProjectWorkspaces_BindRejectsPathOutsideBaseDir(t *testing.T) {
 	}
 	if !strings.Contains(r.Error, "escapes base_dir") {
 		t.Fatalf("error = %q, want escapes base_dir", r.Error)
+	}
+}
+
+func mgmtRequest(t *testing.T, method, url string, token string, body any, mutate func(*http.Request)) (mgmtResponse, int, string) {
+	t.Helper()
+	var reader io.Reader
+	if body != nil {
+		var buf bytes.Buffer
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			t.Fatalf("encode %s body: %v", method, err)
+		}
+		reader = &buf
+	}
+	req, err := http.NewRequest(method, url, reader)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if mutate != nil {
+		mutate(req)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	defer resp.Body.Close()
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	var r mgmtResponse
+	if strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") && len(payload) > 0 {
+		if err := json.Unmarshal(payload, &r); err != nil {
+			t.Fatalf("decode response %q: %v", payload, err)
+		}
+	}
+	return r, resp.StatusCode, string(payload)
+}
+
+func TestManagementAuthFailsClosedWithoutToken(t *testing.T) {
+	_, ts, _ := testManagementServer(t, "")
+
+	for _, path := range []string{"/api/v1/status", "/api/v1/config"} {
+		r, code, _ := mgmtRequest(t, http.MethodGet, ts.URL+path, "", nil, nil)
+		if code != http.StatusUnauthorized || r.OK {
+			t.Fatalf("%s without configured token = code %d ok %v, want 401 false", path, code, r.OK)
+		}
+	}
+}
+
+func TestManagementAcceptsHeaderBearerOnly(t *testing.T) {
+	_, ts, _ := testManagementServer(t, "strict-token")
+	statusURL := ts.URL + "/api/v1/status"
+
+	if r, code, _ := mgmtRequest(t, http.MethodGet, statusURL, "strict-token", nil, nil); code != http.StatusOK || !r.OK {
+		t.Fatalf("valid bearer header = code %d ok %v err %q", code, r.OK, r.Error)
+	}
+
+	cases := []struct {
+		name   string
+		url    string
+		mutate func(*http.Request)
+	}{
+		{name: "query_only", url: statusURL + "?token=strict-token"},
+		{name: "query_even_with_valid_header", url: statusURL + "?token=bad", mutate: func(r *http.Request) { r.Header.Set("Authorization", "Bearer strict-token") }},
+		{name: "encoded_query_key", url: statusURL + "?to%6ben=strict-token", mutate: func(r *http.Request) { r.Header.Set("Authorization", "Bearer strict-token") }},
+		{name: "repeated_query_key", url: statusURL + "?token=&token=strict-token", mutate: func(r *http.Request) { r.Header.Set("Authorization", "Bearer strict-token") }},
+		{name: "malformed_query", url: statusURL + "?token=%zz", mutate: func(r *http.Request) { r.Header.Set("Authorization", "Bearer strict-token") }},
+		{name: "missing_header", url: statusURL},
+		{name: "empty_bearer", url: statusURL, mutate: func(r *http.Request) { r.Header.Set("Authorization", "Bearer ") }},
+		{name: "extra_leading_space", url: statusURL, mutate: func(r *http.Request) { r.Header.Set("Authorization", "Bearer  strict-token") }},
+		{name: "comma_value", url: statusURL, mutate: func(r *http.Request) { r.Header.Set("Authorization", "Bearer strict-token, Bearer strict-token") }},
+		{name: "multiple_headers", url: statusURL, mutate: func(r *http.Request) {
+			r.Header.Add("Authorization", "Bearer strict-token")
+			r.Header.Add("Authorization", "Bearer strict-token")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mutate := tc.mutate
+			if mutate == nil && !strings.Contains(tc.name, "query_only") && tc.name != "missing_header" {
+				mutate = func(r *http.Request) {}
+			}
+			r, code, _ := mgmtRequest(t, http.MethodGet, tc.url, "", nil, mutate)
+			if code != http.StatusUnauthorized || r.OK {
+				t.Fatalf("%s = code %d ok %v, want 401 false", tc.name, code, r.OK)
+			}
+		})
+	}
+	mgmt, _, _ := testManagementServer(t, "strict-token")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	req.Header.Set("Authorization", "Bearer strict-token ")
+	w := httptest.NewRecorder()
+	mgmt.wrap(mgmt.handleStatus)(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("direct trailing-space bearer code = %d, want 401", w.Code)
+	}
+}
+
+func TestManagementCORSOptionsRequiresAuth(t *testing.T) {
+	_, ts, _ := testManagementServer(t, "strict-token")
+
+	if r, code, _ := mgmtRequest(t, http.MethodOptions, ts.URL+"/api/v1/status", "", nil, nil); code != http.StatusUnauthorized || r.OK {
+		t.Fatalf("unauthenticated OPTIONS = code %d ok %v, want 401 false", code, r.OK)
+	}
+	if _, code, _ := mgmtRequest(t, http.MethodOptions, ts.URL+"/api/v1/status", "", nil, func(r *http.Request) {
+		r.Header.Set("Origin", "http://example.com")
+		r.Header.Set("Access-Control-Request-Method", http.MethodGet)
+		r.Header.Set("Access-Control-Request-Headers", "authorization")
+	}); code != http.StatusUnauthorized {
+		t.Fatalf("unconfigured preflight code = %d, want 401", code)
+	}
+}
+
+func TestStatusAndConfigContainNoSecretsOrRawTOML(t *testing.T) {
+	mgmt, ts, e := testManagementServer(t, "management-token-canary")
+	mgmt.SetBridgeServer(NewBridgeServer(9810, "CANARY-BRIDGE-TOKEN", "/bridge/ws", nil))
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "config.toml")
+	rawTOML := "[bridge]\ntoken = \"CANARY-BRIDGE-TOKEN\"\n[telegram]\ntoken = \"CANARY-BOT-TOKEN\"\n"
+	if err := os.WriteFile(cfgPath, []byte(rawTOML), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mgmt.SetConfigFilePath(cfgPath)
+	e.interactiveMu.Lock()
+	e.interactiveStates["telegram:-100123:owner-open-id"] = &interactiveState{}
+	e.interactiveMu.Unlock()
+	e.userRolesMu.Lock()
+	e.adminFrom = "owner-open-id"
+	e.userRolesMu.Unlock()
+
+	for _, path := range []string{"/api/v1/status", "/api/v1/config", "/api/v1/projects/test-project"} {
+		_, _, body := mgmtRequest(t, http.MethodGet, ts.URL+path, "management-token-canary", nil, nil)
+		for _, canary := range []string{"CANARY-BRIDGE-TOKEN", "CANARY-BOT-TOKEN", "management-token-canary", "owner-open-id", "telegram:-100123:owner-open-id", "token =", rawTOML} {
+			if strings.Contains(body, canary) {
+				t.Fatalf("%s leaked canary %q in body: %s", path, canary, body)
+			}
+		}
+	}
+	if _, code, body := mgmtRequest(t, http.MethodGet, ts.URL+"/api/v1/config", "management-token-canary", nil, nil); code != http.StatusForbidden || strings.Contains(body, "[bridge]") {
+		t.Fatalf("/config = code %d body %q, want 403 without raw TOML", code, body)
+	}
+}
+
+func TestStatusExposesCountersAndHashedKeysOnly(t *testing.T) {
+	_, ts, e := testManagementServer(t, "tok")
+	rawKey := "telegram:-100123:owner-open-id"
+	e.interactiveMu.Lock()
+	e.interactiveStates[rawKey] = &interactiveState{}
+	e.interactiveMu.Unlock()
+
+	r, code, body := mgmtRequest(t, http.MethodGet, ts.URL+"/api/v1/projects/test-project", "tok", nil, nil)
+	if code != http.StatusOK || !r.OK {
+		t.Fatalf("project detail failed code=%d body=%s", code, body)
+	}
+	if strings.Contains(body, rawKey) || strings.Contains(body, "active_session_keys") {
+		t.Fatalf("project detail leaked raw session key/schema: %s", body)
+	}
+	var first struct {
+		Data struct {
+			ActiveSessionHashes []string `json:"active_session_hashes"`
+			Scheduler           struct {
+				Active            int    `json:"active"`
+				Waiting           int    `json:"waiting"`
+				Expired           uint64 `json:"expired"`
+				TimedOut          uint64 `json:"timed_out"`
+				Cancelled         uint64 `json:"cancelled"`
+				Rejected          uint64 `json:"rejected"`
+				Completed         uint64 `json:"completed"`
+				Failed            uint64 `json:"failed"`
+				ActiveSessionHash string `json:"active_session_hash,omitempty"`
+			} `json:"scheduler"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(body), &first); err != nil {
+		t.Fatalf("unmarshal detail: %v", err)
+	}
+	if len(first.Data.ActiveSessionHashes) != 1 || first.Data.ActiveSessionHashes[0] == "" || first.Data.ActiveSessionHashes[0] == rawKey {
+		t.Fatalf("active_session_hashes = %#v", first.Data.ActiveSessionHashes)
+	}
+
+	_, _, body2 := mgmtRequest(t, http.MethodGet, ts.URL+"/api/v1/projects/test-project", "tok", nil, nil)
+	if !strings.Contains(body2, first.Data.ActiveSessionHashes[0]) {
+		t.Fatalf("same server hash not stable: first %q second %s", first.Data.ActiveSessionHashes[0], body2)
+	}
+
+	_, ts2, e2 := testManagementServer(t, "tok")
+	e2.interactiveMu.Lock()
+	e2.interactiveStates[rawKey] = &interactiveState{}
+	e2.interactiveMu.Unlock()
+	_, _, otherBody := mgmtRequest(t, http.MethodGet, ts2.URL+"/api/v1/projects/test-project", "tok", nil, nil)
+	if strings.Contains(otherBody, first.Data.ActiveSessionHashes[0]) {
+		t.Fatalf("different server reused same salted hash %q in body %s", first.Data.ActiveSessionHashes[0], otherBody)
+	}
+}
+
+type fakeRawHealthPlatform struct{ stubPlatformEngine }
+
+func (p fakeRawHealthPlatform) PlatformHealth() PlatformHealthInfo {
+	return PlatformHealthInfo{Name: p.Name(), Connected: false, Degraded: true, DegradedReason: "CANARY-RAW-HEALTH-REASON", DegradedSince: time.Unix(123, 0)}
+}
+
+func managementMapFromData(t *testing.T, raw json.RawMessage) map[string]any {
+	t.Helper()
+	var data map[string]any
+	if err := json.Unmarshal(raw, &data); err != nil {
+		t.Fatalf("unmarshal data: %v", err)
+	}
+	return data
+}
+
+func assertManagementKeys(t *testing.T, label string, got map[string]any, want ...string) {
+	t.Helper()
+	actual := make([]string, 0, len(got))
+	for k := range got {
+		actual = append(actual, k)
+	}
+	sort.Strings(actual)
+	expected := append([]string(nil), want...)
+	sort.Strings(expected)
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("%s keys = %v, want %v", label, actual, expected)
+	}
+}
+
+func TestManagementCORSPreflightAllowsBrowserRequestWithoutBearer(t *testing.T) {
+	mgmt := NewManagementServer(0, "cors-token", []string{"https://ui.example"})
+	mgmt.RegisterEngine("p", NewEngine("p", &stubAgent{}, nil, "", LangEnglish))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/status", mgmt.wrap(mgmt.handleStatus))
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	preflight := func(origin, method, headers string) int {
+		req, _ := http.NewRequest(http.MethodOptions, ts.URL+"/api/v1/status", nil)
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		if method != "" {
+			req.Header.Set("Access-Control-Request-Method", method)
+		}
+		if headers != "" {
+			req.Header.Set("Access-Control-Request-Headers", headers)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusNoContent && resp.Header.Get("Access-Control-Allow-Origin") != origin {
+			t.Fatalf("allow origin header = %q", resp.Header.Get("Access-Control-Allow-Origin"))
+		}
+		return resp.StatusCode
+	}
+	if code := preflight("https://ui.example", http.MethodGet, "authorization, content-type"); code != http.StatusNoContent {
+		t.Fatalf("valid preflight without bearer = %d, want 204", code)
+	}
+	for _, tc := range []struct{ origin, method, headers string }{
+		{"", http.MethodGet, "authorization"},
+		{"https://evil.example", http.MethodGet, "authorization"},
+		{"https://ui.example", http.MethodConnect, "authorization"},
+		{"https://ui.example", http.MethodGet, "x-secret"},
+		{"https://ui.example", "", "authorization"},
+	} {
+		if code := preflight(tc.origin, tc.method, tc.headers); code != http.StatusUnauthorized {
+			t.Fatalf("invalid preflight %+v = %d, want 401", tc, code)
+		}
+	}
+	if r, code, _ := mgmtRequest(t, http.MethodOptions, ts.URL+"/api/v1/status?token=cors-token", "", nil, func(r *http.Request) {
+		r.Header.Set("Origin", "https://ui.example")
+		r.Header.Set("Access-Control-Request-Method", http.MethodGet)
+		r.Header.Set("Access-Control-Request-Headers", "authorization")
+	}); code != http.StatusUnauthorized || r.OK {
+		t.Fatalf("preflight with query token = code %d ok %v, want 401 false", code, r.OK)
+	}
+}
+
+func TestManagementStatusExactSchemaHashesActiveAndSanitizesHealth(t *testing.T) {
+	_, ts, e := testManagementServer(t, "tok")
+	rawKey := "telegram:-100123:owner-open-id"
+	e.projectScheduler.Submit(ProjectTask{ID: "active-status", SessionKey: rawKey, Run: func(ctx context.Context) TaskResult {
+		<-ctx.Done()
+		return TaskResult{Err: ctx.Err()}
+	}})
+	t.Cleanup(func() { e.projectScheduler.Stop(context.Background()) })
+	e.platforms = []Platform{&fakeRawHealthPlatform{stubPlatformEngine{n: "fake-health"}}}
+
+	r, code, body := mgmtRequest(t, http.MethodGet, ts.URL+"/api/v1/status", "tok", nil, nil)
+	if code != http.StatusOK || !r.OK {
+		t.Fatalf("status failed code=%d body=%s", code, body)
+	}
+	if strings.Contains(body, rawKey) || strings.Contains(body, "CANARY-RAW-HEALTH-REASON") {
+		t.Fatalf("status leaked raw key or health reason: %s", body)
+	}
+	data := managementMapFromData(t, r.Data)
+	projects, ok := data["projects"].([]any)
+	if !ok || len(projects) != 1 {
+		t.Fatalf("projects = %#v", data["projects"])
+	}
+	project := projects[0].(map[string]any)
+	assertManagementKeys(t, "status.project", project, "name", "scheduler")
+	scheduler := project["scheduler"].(map[string]any)
+	assertManagementKeys(t, "status.project.scheduler", scheduler, "active", "active_session_hash", "cancelled", "completed", "expired", "failed", "rejected", "timed_out", "waiting")
+	if scheduler["active_session_hash"] == "" || scheduler["active_session_hash"] == rawKey {
+		t.Fatalf("active_session_hash = %#v", scheduler["active_session_hash"])
+	}
+	bridge := data["bridge"]
+	if bridge != nil {
+		assertManagementKeys(t, "status.bridge", bridge.(map[string]any), "enabled", "path", "port", "token_configured")
+	}
+	degraded := data["degraded_platforms"].([]any)
+	if len(degraded) != 1 {
+		t.Fatalf("degraded_platforms = %#v", degraded)
+	}
+	reason := degraded[0].(map[string]any)["reason"]
+	if reason != "degraded" {
+		t.Fatalf("sanitized degraded reason = %#v, want degraded", reason)
+	}
+}
+
+func TestManagementProjectDetailExactNestedSchema(t *testing.T) {
+	mgmt, ts, e := testManagementServer(t, "tok")
+	hs := NewHeartbeatScheduler("")
+	hs.Register("test-project", HeartbeatConfig{Enabled: true, IntervalMins: 5, SessionKey: "heartbeat:raw:key", Prompt: "prompt-body-canary"}, e, "")
+	hs.entries["test-project"].lastError = "CANARY-RAW-HEARTBEAT-ERROR"
+	mgmt.SetHeartbeatScheduler(hs)
+
+	r, code, body := mgmtRequest(t, http.MethodGet, ts.URL+"/api/v1/projects/test-project", "tok", nil, nil)
+	if code != http.StatusOK || !r.OK {
+		t.Fatalf("project detail failed code=%d body=%s", code, body)
+	}
+	for _, canary := range []string{"heartbeat:raw:key", "prompt-body-canary", "CANARY-RAW-HEARTBEAT-ERROR", "work_dir\""} {
+		if strings.Contains(body, canary) {
+			t.Fatalf("project detail leaked %q in %s", canary, body)
+		}
+	}
+	data := managementMapFromData(t, r.Data)
+	settings := data["settings"].(map[string]any)
+	assertManagementKeys(t, "project.settings", settings, "admin_from_configured", "disabled_commands", "language")
+	heartbeat := data["heartbeat"].(map[string]any)
+	assertManagementKeys(t, "project.heartbeat", heartbeat, "enabled", "interval_mins", "paused", "session_hash")
+	scheduler := data["scheduler"].(map[string]any)
+	assertManagementKeys(t, "project.scheduler", scheduler, "active", "cancelled", "completed", "expired", "failed", "rejected", "timed_out", "waiting")
+}
+
+func TestManagementSensitiveGETRoutesReturnDTOsWithoutRawValues(t *testing.T) {
+	mgmt, ts, e := testManagementServer(t, "tok")
+	rawSessionKey := "feishu:oc_CANARY_CHAT:ou_CANARY_USER"
+	s := e.sessions.GetOrCreateActive(rawSessionKey)
+	s.AgentSessionID = "agent-session-canary"
+	s.AddHistory("user", "prompt-body-canary")
+	s.AddHistory("assistant", "reply-body-canary")
+	e.sessions.UpdateUserMeta(rawSessionKey, "user-name-canary", "chat-name-canary")
+
+	hs := NewHeartbeatScheduler("")
+	hs.Register("test-project", HeartbeatConfig{Enabled: true, SessionKey: "heartbeat-raw-session-key", IntervalMins: 7, Prompt: "heartbeat-prompt-canary"}, e, "")
+	hs.entries["test-project"].lastError = "heartbeat-error-canary"
+	mgmt.SetHeartbeatScheduler(hs)
+
+	mgmt.SetListGlobalProviders(func() ([]GlobalProviderInfo, error) {
+		return []GlobalProviderInfo{{Name: "global", APIKey: "global-api-key-canary", Env: map[string]string{"SECRET_ENV": "env-canary"}, Codex: &GlobalCodexConfig{HTTPHeaders: map[string]string{"Authorization": "header-canary"}}}}, nil
+	})
+	e.multiWorkspace = true
+	e.baseDir = filepath.Join(t.TempDir(), "base-dir-canary")
+	if err := os.MkdirAll(filepath.Join(e.baseDir, "workspace-canary"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	e.workspaceBindings = NewWorkspaceBindingManager(filepath.Join(t.TempDir(), "bindings.json"))
+	e.workspaceBindings.Bind("project:test-project", "channel-key-canary", "channel-name-canary", filepath.Join(e.baseDir, "workspace-canary"))
+
+	paths := []string{
+		"/api/v1/projects/test-project/sessions",
+		"/api/v1/projects/test-project/sessions/" + s.ID,
+		"/api/v1/projects/test-project/heartbeat",
+		"/api/v1/providers",
+		"/api/v1/projects/test-project/workspaces",
+	}
+	for _, path := range paths {
+		_, code, body := mgmtRequest(t, http.MethodGet, ts.URL+path, "tok", nil, nil)
+		if code != http.StatusOK {
+			t.Fatalf("GET %s code=%d body=%s", path, code, body)
+		}
+		for _, canary := range []string{"oc_CANARY_CHAT", "ou_CANARY_USER", rawSessionKey, "prompt-body-canary", "reply-body-canary", "user-name-canary", "chat-name-canary", "agent-session-canary", "heartbeat-raw-session-key", "heartbeat-prompt-canary", "heartbeat-error-canary", "global-api-key-canary", "env-canary", "header-canary", "channel-key-canary", "channel-name-canary", "base-dir-canary", "workspace-canary"} {
+			if strings.Contains(body, canary) {
+				t.Fatalf("GET %s leaked %q in body %s", path, canary, body)
+			}
+		}
+	}
+}
+
+func TestManagementProviderErrorsDoNotEchoRawDetails(t *testing.T) {
+	mgmt, ts, _ := testManagementServer(t, "tok")
+	mgmt.SetListGlobalProviders(func() ([]GlobalProviderInfo, error) {
+		return nil, fmt.Errorf("provider path /tmp/provider-canary api_key=provider-error-token-canary header=provider-header-canary")
+	})
+	mgmt.SetListCCSwitchProviders(func() ([]CCSwitchProviderInfo, error) {
+		return nil, fmt.Errorf("ccswitch db /tmp/ccswitch-canary token=ccswitch-token-canary")
+	})
+
+	for _, path := range []string{"/api/v1/providers", "/api/v1/providers/cc-switch"} {
+		_, code, body := mgmtRequest(t, http.MethodGet, ts.URL+path, "tok", nil, nil)
+		if code != http.StatusOK && code != http.StatusServiceUnavailable {
+			t.Fatalf("GET %s code = %d body=%s", path, code, body)
+		}
+		for _, canary := range []string{"provider-canary", "provider-error-token-canary", "provider-header-canary", "ccswitch-canary", "ccswitch-token-canary", "/tmp/"} {
+			if strings.Contains(body, canary) {
+				t.Fatalf("GET %s leaked raw provider error canary %q in body %s", path, canary, body)
+			}
+		}
+		if !strings.Contains(body, "providers_unavailable") && !strings.Contains(body, "cc_switch_unavailable") {
+			t.Fatalf("GET %s body %s missing low-cardinality error code", path, body)
+		}
+	}
+}
+
+func TestManagementWebDoesNotFallbackToRawSensitiveFields(t *testing.T) {
+	files := []string{
+		"../web/src/pages/Chat/ChatList.tsx",
+		"../web/src/pages/Chat/ChatView.tsx",
+		"../web/src/pages/Chat/SessionDrawer.tsx",
+		"../web/src/pages/Dashboard.tsx",
+		"../web/src/pages/Projects/ProjectDetail.tsx",
+		"../web/src/pages/Sessions/SessionChat.tsx",
+		"../web/src/pages/Sessions/SessionList.tsx",
+	}
+	for _, file := range files {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		text := string(data)
+		for _, forbidden := range []string{
+			"content ||",
+			"|| (h.content_configured",
+			"active_session_keys || active_session_hashes",
+			"b.channel_key || b.channel_hash",
+			"{b.channel_name ||",
+			"{b.workspace ||",
+		} {
+			if strings.Contains(text, forbidden) {
+				t.Fatalf("%s contains raw-sensitive fallback pattern %q", file, forbidden)
+			}
+		}
 	}
 }

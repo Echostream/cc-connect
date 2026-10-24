@@ -103,7 +103,7 @@ export default function ChatList() {
                         ) : (
                           <Bot size={10} className="inline mr-1 -mt-0.5 opacity-60" />
                         )}
-                        {lastMsg.content.replace(/\n/g, ' ').slice(0, 120)}
+                        {(lastMsg.content_configured === false ? '' : '[redacted]').slice(0, 120)}
                       </p>
                     ) : (
                       <p className="text-xs text-gray-400 dark:text-gray-500 italic">

@@ -2054,6 +2054,12 @@ func TestCUJ_H2_TwoPlatformsConcurrentNoBleed(t *testing.T) {
 	pB := &stubPlatformEngine{n: "platB"}
 	agent := &cujAgent{}
 	e := NewEngine("test", agent, []Platform{pA, pB}, dir+"/sessions.json", LangEnglish)
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			_ = e.Stop()
+		}
+	})
 
 	// Fire 5 messages on each platform concurrently.
 	var wg sync.WaitGroup
@@ -2081,37 +2087,7 @@ func TestCUJ_H2_TwoPlatformsConcurrentNoBleed(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Wait for all turns to finish. Generous deadline so this stays green
-	// when the whole core package is run with `-race -parallel=N` on
-	// constrained CI hosts; the in-isolation run finishes < 2s.
-	deadline := time.After(30 * time.Second)
-	for {
-		histA := e.sessions.GetOrCreateActive("platA:userA").GetHistory(0)
-		histB := e.sessions.GetOrCreateActive("platB:userB").GetHistory(0)
-		// Each user sent 5 messages — expect each session to have ≥5 user
-		// entries when fully drained.
-		userA := 0
-		for _, h := range histA {
-			if h.Role == "user" {
-				userA++
-			}
-		}
-		userB := 0
-		for _, h := range histB {
-			if h.Role == "user" {
-				userB++
-			}
-		}
-		if userA >= 5 && userB >= 5 {
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("timed out: userA=%d userB=%d (some messages did not land)", userA, userB)
-		default:
-			time.Sleep(20 * time.Millisecond)
-		}
-	}
+	waitCUJH2AllTurnsComplete(t, e, pA, pB)
 
 	// Critical assertion: A's history must NOT contain B's content and
 	// vice versa.
@@ -2137,6 +2113,46 @@ func TestCUJ_H2_TwoPlatformsConcurrentNoBleed(t *testing.T) {
 	if len(pB.getSent()) == 0 {
 		t.Fatal("platB received no replies")
 	}
+	if err := e.Stop(); err != nil {
+		t.Fatalf("stop engine after H2 drain: %v", err)
+	}
+	stopped = true
+}
+
+func waitCUJH2AllTurnsComplete(t *testing.T, e *Engine, pA, pB *stubPlatformEngine) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		histA := e.sessions.GetOrCreateActive("platA:userA").GetHistory(0)
+		histB := e.sessions.GetOrCreateActive("platB:userB").GetHistory(0)
+		userA, assistantA := countCUJHistoryRoles(histA)
+		userB, assistantB := countCUJHistoryRoles(histB)
+		sentA := len(pA.getSent())
+		sentB := len(pB.getSent())
+		snap := e.projectScheduler.Snapshot()
+		if userA >= 5 && assistantA >= 5 && userB >= 5 && assistantB >= 5 && sentA >= 5 && sentB >= 5 && snap.ActiveCount == 0 && snap.WaitingCount == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	histA := e.sessions.GetOrCreateActive("platA:userA").GetHistory(0)
+	histB := e.sessions.GetOrCreateActive("platB:userB").GetHistory(0)
+	userA, assistantA := countCUJHistoryRoles(histA)
+	userB, assistantB := countCUJHistoryRoles(histB)
+	snap := e.projectScheduler.Snapshot()
+	t.Fatalf("timed out draining H2 turns: userA=%d assistantA=%d sentA=%d userB=%d assistantB=%d sentB=%d active=%d waiting=%d", userA, assistantA, len(pA.getSent()), userB, assistantB, len(pB.getSent()), snap.ActiveCount, snap.WaitingCount)
+}
+
+func countCUJHistoryRoles(hist []HistoryEntry) (users int, assistants int) {
+	for _, h := range hist {
+		switch h.Role {
+		case "user":
+			users++
+		case "assistant":
+			assistants++
+		}
+	}
+	return users, assistants
 }
 
 // ---------------------------------------------------------------------------

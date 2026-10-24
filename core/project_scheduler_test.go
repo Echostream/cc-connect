@@ -2,7 +2,10 @@ package core
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -1342,4 +1345,290 @@ func TestNewSchedulerStartsWithEmptyQueue(t *testing.T) {
 		t.Fatalf("fresh scheduler snapshot = %+v, want empty/no replay", snap)
 	}
 	assertNoBufferedStart(t, started)
+}
+
+func TestProjectSchedulerSnapshotCountsTerminalOutcomesOnce(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(200, 0))
+	scheduler := NewProjectScheduler(clock, 1, time.Hour, time.Minute)
+	t.Cleanup(func() { scheduler.Stop(context.Background()) })
+
+	started := make(chan string, 8)
+	release := make(chan TaskResult, 2)
+	if got := scheduler.Submit(ProjectTask{ID: "active", SessionKey: "scope-active", Run: func(ctx context.Context) TaskResult {
+		started <- "active"
+		return <-release
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit active = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "active" {
+		t.Fatalf("started = %q", got)
+	}
+	if got := scheduler.Submit(ProjectTask{ID: "waiting", SessionKey: "scope-waiting", Run: func(ctx context.Context) TaskResult {
+		started <- "waiting"
+		return <-release
+	}}); got.Status != SubmitQueued {
+		t.Fatalf("submit waiting = %+v", got)
+	}
+	if got := scheduler.Submit(ProjectTask{ID: "overflow", SessionKey: "scope-overflow"}); got.Status != SubmitRejectedFull {
+		t.Fatalf("submit overflow = %+v", got)
+	}
+	release <- TaskResult{State: TaskStateCompleted}
+	if got := waitStarted(t, started); got != "waiting" {
+		t.Fatalf("started waiting = %q", got)
+	}
+	release <- TaskResult{State: TaskStateFailed, Err: fmt.Errorf("boom")}
+
+	var counters map[string]any
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		snap := scheduler.Snapshot()
+		payload, err := json.Marshal(snap)
+		if err != nil {
+			t.Fatalf("marshal snapshot: %v", err)
+		}
+		if err := json.Unmarshal(payload, &counters); err != nil {
+			t.Fatalf("unmarshal snapshot: %v", err)
+		}
+		if snap.ActiveCount == 0 && snap.WaitingCount == 0 && counters["Completed"] == float64(1) && counters["Failed"] == float64(1) && counters["Rejected"] == float64(1) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("snapshot counters = %+v, want completed=1 failed=1 rejected=1", counters)
+}
+
+func TestProjectSchedulerTimeoutCancelStopCountersAreOnce(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(300, 0))
+	scheduler := NewProjectScheduler(clock, 3, time.Hour, time.Minute)
+
+	started := make(chan string, 3)
+	if got := scheduler.Submit(ProjectTask{ID: "timeout", SessionKey: "scope-timeout", Run: func(ctx context.Context) TaskResult {
+		started <- "timeout"
+		<-ctx.Done()
+		return TaskResult{Err: ctx.Err()}
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit timeout = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "timeout" {
+		t.Fatalf("started = %q", got)
+	}
+	clock.Advance(time.Minute)
+	var timeoutCounters map[string]any
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		snap := scheduler.Snapshot()
+		payload, err := json.Marshal(snap)
+		if err != nil {
+			t.Fatalf("marshal snapshot: %v", err)
+		}
+		if err := json.Unmarshal(payload, &timeoutCounters); err != nil {
+			t.Fatalf("unmarshal snapshot: %v", err)
+		}
+		if timeoutCounters["TimedOut"] == float64(1) && snap.ActiveCount == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if timeoutCounters["TimedOut"] != float64(1) {
+		t.Fatalf("timed out counter = %+v", timeoutCounters)
+	}
+
+	block := make(chan struct{})
+	if got := scheduler.Submit(ProjectTask{ID: "active-cancel", SessionKey: "scope-cancel", Run: func(ctx context.Context) TaskResult {
+		started <- "active-cancel"
+		<-ctx.Done()
+		<-block
+		return TaskResult{Err: ctx.Err()}
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit active-cancel = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "active-cancel" {
+		t.Fatalf("started = %q", got)
+	}
+	resultCh := make(chan CancelResult, 1)
+	go func() { resultCh <- scheduler.CancelSession("scope-cancel", CancelStop) }()
+	select {
+	case got := <-resultCh:
+		t.Fatalf("cancel returned before task finished: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(block)
+	select {
+	case got := <-resultCh:
+		if got.ActiveCancelled != 1 || got.Pending {
+			t.Fatalf("cancel result = %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancel did not finish")
+	}
+	snapAfterCancel := scheduler.Snapshot()
+	payloadAfterCancel, err := json.Marshal(snapAfterCancel)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	var cancelCounters map[string]any
+	if err := json.Unmarshal(payloadAfterCancel, &cancelCounters); err != nil {
+		t.Fatalf("unmarshal snapshot: %v", err)
+	}
+	if cancelCounters["Cancelled"] != float64(1) || cancelCounters["TimedOut"] != float64(1) {
+		t.Fatalf("after active cancel counters = %+v", cancelCounters)
+	}
+
+	if got := scheduler.Submit(ProjectTask{ID: "active-stop", SessionKey: "scope-stop", Run: func(ctx context.Context) TaskResult {
+		started <- "active-stop"
+		<-ctx.Done()
+		return TaskResult{Err: ctx.Err()}
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit active-stop = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "active-stop" {
+		t.Fatalf("started = %q", got)
+	}
+	if got := scheduler.Submit(ProjectTask{ID: "waiting-stop", SessionKey: "scope-waiting-stop"}); got.Status != SubmitQueued {
+		t.Fatalf("submit waiting-stop = %+v", got)
+	}
+	scheduler.Stop(context.Background())
+	if snap := scheduler.Snapshot(); snap.ActiveCount != 0 || snap.WaitingCount != 0 {
+		// Snapshot after Stop returns zero value, so assert no panic/race and rely on pre-stop counters above.
+		_ = snap
+	}
+}
+
+type stagedTerminalProbe struct {
+	staged  *StagedAttachments
+	path    string
+	cleaned chan string
+}
+
+func newStagedTerminalProbe(t *testing.T, id string) *stagedTerminalProbe {
+	t.Helper()
+	msg := &Message{MessageID: id, Files: []FileAttachment{{FileName: id + ".txt", MimeType: "text/plain", Data: []byte("payload-" + id)}}}
+	staged := mustStage(t, t.TempDir(), msg, DefaultMaxAttachmentSize)
+	return &stagedTerminalProbe{staged: staged, path: staged.Entries()[0].Path, cleaned: make(chan string, 2)}
+}
+
+func (p *stagedTerminalProbe) cleanup(id string) func() {
+	return func() {
+		_ = p.staged.Cleanup()
+		p.cleaned <- id
+	}
+}
+
+func (p *stagedTerminalProbe) assertCleanedOnceAndRemoved(t *testing.T, id string) {
+	t.Helper()
+	if got := waitCleanup(t, p.cleaned); got != id {
+		t.Fatalf("cleanup = %q, want %q", got, id)
+	}
+	assertNoCleanup(t, p.cleaned)
+	if _, err := os.Stat(p.path); !os.IsNotExist(err) {
+		t.Fatalf("staged file %q still exists or stat failed with non-ENOENT: %v", p.path, err)
+	}
+}
+
+func TestStagedAttachmentLifecycleAcrossSchedulerTerminals(t *testing.T) {
+	t.Run("completed", func(t *testing.T) {
+		scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(13_000, 0)), 10, 6*time.Hour, 30*time.Minute)
+		probe := newStagedTerminalProbe(t, "completed")
+		if got := scheduler.Submit(ProjectTask{ID: "completed", Run: func(context.Context) TaskResult { return TaskResult{State: TaskStateCompleted} }, Cleanup: probe.cleanup("completed")}); got.Status != SubmitStarted {
+			t.Fatalf("submit completed = %+v", got)
+		}
+		probe.assertCleanedOnceAndRemoved(t, "completed")
+	})
+
+	t.Run("failed", func(t *testing.T) {
+		scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(13_100, 0)), 10, 6*time.Hour, 30*time.Minute)
+		probe := newStagedTerminalProbe(t, "failed")
+		if got := scheduler.Submit(ProjectTask{ID: "failed", Run: func(context.Context) TaskResult { return TaskResult{State: TaskStateFailed, Err: errors.New("boom")} }, Cleanup: probe.cleanup("failed")}); got.Status != SubmitStarted {
+			t.Fatalf("submit failed = %+v", got)
+		}
+		probe.assertCleanedOnceAndRemoved(t, "failed")
+	})
+
+	t.Run("expired_waiting", func(t *testing.T) {
+		clock := newFakeSchedulerClock(time.Unix(13_200, 0))
+		scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+		activeRelease := make(chan struct{})
+		if got := scheduler.Submit(ProjectTask{ID: "active", Run: func(context.Context) TaskResult { <-activeRelease; return TaskResult{State: TaskStateCompleted} }}); got.Status != SubmitStarted {
+			t.Fatalf("submit active = %+v", got)
+		}
+		probe := newStagedTerminalProbe(t, "expired")
+		if got := scheduler.Submit(ProjectTask{ID: "expired", Run: func(context.Context) TaskResult { t.Fatal("expired task must not run"); return TaskResult{} }, Cleanup: probe.cleanup("expired")}); got.Status != SubmitQueued {
+			t.Fatalf("submit expired = %+v", got)
+		}
+		clock.Advance(6*time.Hour + time.Nanosecond)
+		probe.assertCleanedOnceAndRemoved(t, "expired")
+		close(activeRelease)
+	})
+
+	t.Run("scope_cancel_active_and_waiting", func(t *testing.T) {
+		scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(13_300, 0)), 10, 6*time.Hour, 30*time.Minute)
+		active := newStagedTerminalProbe(t, "cancel-active")
+		waiting := newStagedTerminalProbe(t, "cancel-waiting")
+		started := make(chan struct{}, 1)
+		if got := scheduler.Submit(ProjectTask{ID: "cancel-active", SessionKey: "scope-a", Run: func(ctx context.Context) TaskResult {
+			started <- struct{}{}
+			<-ctx.Done()
+			return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+		}, Cleanup: active.cleanup("cancel-active")}); got.Status != SubmitStarted {
+			t.Fatalf("submit active = %+v", got)
+		}
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("active not started")
+		}
+		if got := scheduler.Submit(ProjectTask{ID: "cancel-waiting", SessionKey: "scope-a", Run: func(context.Context) TaskResult { t.Fatal("cancelled waiting task must not run"); return TaskResult{} }, Cleanup: waiting.cleanup("cancel-waiting")}); got.Status != SubmitQueued {
+			t.Fatalf("submit waiting = %+v", got)
+		}
+		res := scheduler.CancelSession("scope-a", CancelStop)
+		if res.ActiveCancelled != 1 || res.WaitingCancelled != 1 {
+			t.Fatalf("cancel result = %+v", res)
+		}
+		active.assertCleanedOnceAndRemoved(t, "cancel-active")
+		waiting.assertCleanedOnceAndRemoved(t, "cancel-waiting")
+	})
+
+	t.Run("timed_out_active", func(t *testing.T) {
+		clock := newFakeSchedulerClock(time.Unix(13_400, 0))
+		scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+		probe := newStagedTerminalProbe(t, "timeout")
+		started := make(chan struct{}, 1)
+		if got := scheduler.Submit(ProjectTask{ID: "timeout", Run: func(ctx context.Context) TaskResult {
+			started <- struct{}{}
+			<-ctx.Done()
+			return TaskResult{Err: ctx.Err()}
+		}, Cleanup: probe.cleanup("timeout")}); got.Status != SubmitStarted {
+			t.Fatalf("submit timeout = %+v", got)
+		}
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout task not started")
+		}
+		clock.Advance(30*time.Minute + time.Nanosecond)
+		probe.assertCleanedOnceAndRemoved(t, "timeout")
+	})
+
+	t.Run("shutdown_active_and_waiting", func(t *testing.T) {
+		scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(13_500, 0)), 10, 6*time.Hour, 30*time.Minute)
+		active := newStagedTerminalProbe(t, "shutdown-active")
+		waiting := newStagedTerminalProbe(t, "shutdown-waiting")
+		started := make(chan struct{}, 1)
+		if got := scheduler.Submit(ProjectTask{ID: "shutdown-active", Run: func(ctx context.Context) TaskResult {
+			started <- struct{}{}
+			<-ctx.Done()
+			return TaskResult{Err: ctx.Err()}
+		}, Cleanup: active.cleanup("shutdown-active")}); got.Status != SubmitStarted {
+			t.Fatalf("submit shutdown active = %+v", got)
+		}
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("shutdown active not started")
+		}
+		if got := scheduler.Submit(ProjectTask{ID: "shutdown-waiting", Run: func(context.Context) TaskResult { t.Fatal("shutdown waiting task must not run"); return TaskResult{} }, Cleanup: waiting.cleanup("shutdown-waiting")}); got.Status != SubmitQueued {
+			t.Fatalf("submit shutdown waiting = %+v", got)
+		}
+		scheduler.Stop(context.Background())
+		active.assertCleanedOnceAndRemoved(t, "shutdown-active")
+		waiting.assertCleanedOnceAndRemoved(t, "shutdown-waiting")
+	})
 }

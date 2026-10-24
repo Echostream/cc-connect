@@ -126,7 +126,7 @@ export default function SessionList() {
                       ) : (
                         <Bot size={10} className="inline mr-1 -mt-0.5 opacity-60" />
                       )}
-                      {s.last_message.content.replace(/\n/g, ' ').slice(0, 100)}
+                      {(s.last_message.content_configured === false ? '' : '[redacted]').slice(0, 100)}
                     </p>
                   ) : (
                     <p className="text-xs text-gray-400 dark:text-gray-500 italic">{t('sessions.noMessages')}</p>

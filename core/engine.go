@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -1519,6 +1520,112 @@ func (e *Engine) AgentTypeName() string {
 }
 
 var errProjectSchedulerBusy = errors.New("project scheduler busy")
+var errExternalStagedAttachments = errors.New("external staged attachments are not accepted")
+var errRawAttachmentBypass = errors.New("raw attachment bytes bypassed staging")
+
+func messageHasImageFileAttachments(msg *Message) bool {
+	return msg != nil && (len(msg.Images) > 0 || len(msg.Files) > 0 || msg.Staged != nil)
+}
+
+func newAttachmentFailureTaskID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("att-%d", time.Now().UnixNano())
+	}
+	return "att-" + hex.EncodeToString(b[:])
+}
+
+func attachmentFailureUserMessage(taskID string) string {
+	return fmt.Sprintf("Attachment could not be processed. Please check the file type and size, then resend. task_id=%s", taskID)
+}
+
+func attachmentFailureTaskResult(err error) TaskResult {
+	return TaskResult{State: TaskStateFailed, Reason: "attachment_failed", Err: err}
+}
+
+func attachmentWorkDir(agent Agent, workspaceDir string) string {
+	if strings.TrimSpace(workspaceDir) != "" {
+		return workspaceDir
+	}
+	if wd, ok := agent.(interface{ GetWorkDir() string }); ok {
+		if dir := strings.TrimSpace(wd.GetWorkDir()); dir != "" {
+			return dir
+		}
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return wd
+}
+
+func (e *Engine) prepareMessageAttachmentsForSubmit(msg *Message, agent Agent, workspaceDir string) (*StagedAttachments, error) {
+	if msg == nil {
+		return nil, nil
+	}
+	if msg.Staged != nil {
+		return nil, errExternalStagedAttachments
+	}
+	if len(msg.Images) == 0 && len(msg.Files) == 0 {
+		return nil, nil
+	}
+	workDir := attachmentWorkDir(agent, workspaceDir)
+	if workDir == "" {
+		return nil, fmt.Errorf("attachment staging workdir unavailable")
+	}
+	return StageMessageAttachments(workDir, msg, DefaultMaxAttachmentSize)
+}
+
+func recordSanitizedAttachmentCleanupError(taskID string, err error) {
+	if err == nil {
+		return
+	}
+	slog.Warn("staged attachment cleanup failed", "task_id", taskID, "reason", "attachment_cleanup_failed")
+}
+
+func cleanupStagedTaskAttachments(taskID string, staged *StagedAttachments) {
+	if staged == nil {
+		return
+	}
+	recordSanitizedAttachmentCleanupError(taskID, staged.Cleanup())
+}
+
+func submitAcceptedForAttachmentOwnership(status SubmitStatus) bool {
+	return status == SubmitStarted || status == SubmitQueued
+}
+
+func (e *Engine) replyAttachmentFailure(p Platform, replyCtx any) error {
+	taskID := newAttachmentFailureTaskID()
+	e.reply(p, replyCtx, attachmentFailureUserMessage(taskID))
+	return fmt.Errorf("attachment_failed task_id=%s", taskID)
+}
+
+func (e *Engine) activeTurnAttachments(msg *Message) ([]ImageAttachment, []FileAttachment, func(), error) {
+	if msg == nil {
+		return nil, nil, func() {}, nil
+	}
+	if msg.Staged == nil {
+		if len(msg.Images) != 0 || len(msg.Files) != 0 {
+			return nil, nil, func() {}, errRawAttachmentBypass
+		}
+		return nil, nil, func() {}, nil
+	}
+	images, files, err := msg.Staged.ReadAll()
+	if err != nil {
+		return nil, nil, func() {}, err
+	}
+	release := func() {
+		for i := range images {
+			images[i].Data = nil
+		}
+		for i := range files {
+			files[i].Data = nil
+		}
+		images = nil
+		files = nil
+	}
+	return images, files, release, nil
+}
 
 // ActiveSessionKeys returns the session keys of all active interactive sessions.
 func (e *Engine) ActiveSessionKeys() []string {
@@ -1566,14 +1673,22 @@ func (e *Engine) submitProjectAgentTaskAndWait(req projectAgentTaskRequest) erro
 	if req.Sessions == nil {
 		req.Sessions = e.sessions
 	}
+	staged, err := e.prepareMessageAttachmentsForSubmit(&req.Message, req.Agent, req.WorkspaceDir)
+	if err != nil {
+		return fmt.Errorf("attachment_failed")
+	}
+	taskID := req.ID
+	if taskID == "" {
+		taskID = newAttachmentFailureTaskID()
+	}
 	done := make(chan TaskResult, 1)
 	task := ProjectTask{
-		ID:         req.ID,
+		ID:         taskID,
 		Source:     req.Source,
 		SessionKey: req.RunSessionKey,
 		Platform:   req.Platform,
 		ReplyCtx:   req.Message.ReplyCtx,
-		Cleanup:    func() {},
+		Cleanup:    func() { cleanupStagedTaskAttachments(taskID, staged) },
 		Run: func(runCtx context.Context) TaskResult {
 			msg := req.Message
 			sessionKey := req.SessionKey
@@ -1596,9 +1711,12 @@ func (e *Engine) submitProjectAgentTaskAndWait(req projectAgentTaskRequest) erro
 				return TaskResult{State: TaskStateFailed, Err: err}
 			}
 			prevHistLen := session.HistoryLen()
-			e.processInteractiveMessageWithContext(runCtx, req.Platform, &msg, session, req.Agent, req.Sessions, interactiveKey, req.WorkspaceDir, runSessionKey, lockGen)
+			processResult := e.processInteractiveMessageWithContext(runCtx, req.Platform, &msg, session, req.Agent, req.Sessions, interactiveKey, req.WorkspaceDir, runSessionKey, lockGen)
 			if req.UseNewSession {
 				e.cleanupInteractiveState(interactiveKey)
+			}
+			if processResult.State != "" || processResult.Err != nil {
+				return processResult
 			}
 			if err := runCtx.Err(); err != nil {
 				return TaskResult{Err: err}
@@ -1616,6 +1734,9 @@ func (e *Engine) submitProjectAgentTaskAndWait(req projectAgentTaskRequest) erro
 		result = e.projectScheduler.SubmitOnlyIfIdle(task)
 	} else {
 		result = e.projectScheduler.Submit(task)
+	}
+	if !submitAcceptedForAttachmentOwnership(result.Status) {
+		cleanupStagedTaskAttachments(taskID, staged)
 	}
 	switch result.Status {
 	case SubmitStarted, SubmitQueued:
@@ -1635,7 +1756,7 @@ func (e *Engine) submitProjectAgentTaskAndWait(req projectAgentTaskRequest) erro
 		return finished.Err
 	}
 	if finished.State != TaskStateCompleted {
-		return fmt.Errorf("project task %s ended with %s", req.ID, finished.State)
+		return fmt.Errorf("project task %s ended with %s", taskID, finished.State)
 	}
 	return nil
 }
@@ -2689,13 +2810,18 @@ func (e *Engine) resolveAlias(content string) string {
 }
 
 func (e *Engine) submitInteractiveProjectMessage(p Platform, msg *Message, agent Agent, sessions *SessionManager, interactiveKey, workspaceDir string) SubmitResult {
-	msgCopy := *msg
 	if agent == nil {
 		agent = e.agent
 	}
 	if sessions == nil {
 		sessions = e.sessions
 	}
+	staged, err := e.prepareMessageAttachmentsForSubmit(msg, agent, workspaceDir)
+	if err != nil {
+		_ = e.replyAttachmentFailure(p, msg.ReplyCtx)
+		return SubmitResult{Status: SubmitRejectedStopped}
+	}
+	msgCopy := *msg
 	taskID := msgCopy.MessageID
 	if taskID == "" {
 		taskID = "interactive:" + msgCopy.SessionKey + ":" + strconv.FormatInt(time.Now().UnixNano(), 10)
@@ -2706,7 +2832,7 @@ func (e *Engine) submitInteractiveProjectMessage(p Platform, msg *Message, agent
 		SessionKey: msgCopy.SessionKey,
 		Platform:   p,
 		ReplyCtx:   msgCopy.ReplyCtx,
-		Cleanup:    func() {},
+		Cleanup:    func() { cleanupStagedTaskAttachments(taskID, staged) },
 		Run: func(runCtx context.Context) TaskResult {
 			session := sessions.GetOrCreateActive(interactiveKey)
 			lockGen, locked := session.TryLock()
@@ -2714,14 +2840,21 @@ func (e *Engine) submitInteractiveProjectMessage(p Platform, msg *Message, agent
 				e.reply(p, msgCopy.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 				return TaskResult{State: TaskStateFailed, Err: fmt.Errorf("session %q busy outside project scheduler", interactiveKey)}
 			}
-			e.processInteractiveMessageWithContext(runCtx, p, &msgCopy, session, agent, sessions, interactiveKey, workspaceDir, msgCopy.SessionKey, lockGen)
+			processResult := e.processInteractiveMessageWithContext(runCtx, p, &msgCopy, session, agent, sessions, interactiveKey, workspaceDir, msgCopy.SessionKey, lockGen)
+			if processResult.State != "" || processResult.Err != nil {
+				return processResult
+			}
 			if err := runCtx.Err(); err != nil {
 				return TaskResult{Err: err}
 			}
 			return TaskResult{State: TaskStateCompleted}
 		},
 	}
-	return e.projectScheduler.Submit(task)
+	result := e.projectScheduler.Submit(task)
+	if !submitAcceptedForAttachmentOwnership(result.Status) {
+		cleanupStagedTaskAttachments(taskID, staged)
+	}
+	return result
 }
 
 func (e *Engine) handleInteractiveSubmitResult(p Platform, msg *Message, result SubmitResult) bool {
@@ -3203,7 +3336,8 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	}
 
 	content := strings.TrimSpace(msg.Content)
-	if content == "" && msg.ExtraContent == "" && len(msg.Images) == 0 && len(msg.Files) == 0 && msg.Location == nil {
+	hasAttachments := messageHasImageFileAttachments(msg)
+	if content == "" && msg.ExtraContent == "" && !hasAttachments && msg.Location == nil {
 		return
 	}
 
@@ -3307,7 +3441,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		interactiveKey = resolvedWorkspace + ":" + msg.SessionKey
 	}
 
-	if len(msg.Images) == 0 && strings.HasPrefix(content, "/") {
+	if !hasAttachments && strings.HasPrefix(content, "/") {
 		if e.handleCommand(p, msg, content) {
 			return
 		}
@@ -3322,7 +3456,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 
 	// "!" prefix: treat as shell command (same as /shell)
 	// Placed after permission handling so "!yes" doesn't hijack permission responses.
-	if len(msg.Images) == 0 && strings.HasPrefix(content, "!") {
+	if !hasAttachments && strings.HasPrefix(content, "!") {
 		shellCmd := strings.TrimSpace(content[1:])
 		if shellCmd != "" {
 			// Check disabled / admin just like handleCommand does for "shell"
@@ -3360,14 +3494,24 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		return
 	}
 
+	staged, err := e.prepareMessageAttachmentsForSubmit(msg, agent, resolvedWorkspace)
+	if err != nil {
+		_ = e.replyAttachmentFailure(p, msg.ReplyCtx)
+		return
+	}
+
 	msgCopy := *msg
+	taskID := msg.MessageID
+	if taskID == "" {
+		taskID = newAttachmentFailureTaskID()
+	}
 	task := ProjectTask{
-		ID:         msg.MessageID,
+		ID:         taskID,
 		Source:     TaskSourceInteractive,
 		SessionKey: msg.SessionKey,
 		Platform:   p,
 		ReplyCtx:   msg.ReplyCtx,
-		Cleanup:    func() {},
+		Cleanup:    func() { cleanupStagedTaskAttachments(taskID, staged) },
 		Run: func(runCtx context.Context) TaskResult {
 			session := sessions.GetOrCreateActive(msgCopy.SessionKey)
 			sessions.UpdateUserMeta(msgCopy.SessionKey, msgCopy.UserName, msgCopy.ChatName)
@@ -3404,7 +3548,10 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 				"user", msgCopy.UserName,
 				"session", session.ID,
 			)
-			e.processInteractiveMessageWithContext(runCtx, p, &msgCopy, session, agent, sessions, interactiveKey, resolvedWorkspace, msgCopy.SessionKey, lockGen)
+			processResult := e.processInteractiveMessageWithContext(runCtx, p, &msgCopy, session, agent, sessions, interactiveKey, resolvedWorkspace, msgCopy.SessionKey, lockGen)
+			if processResult.State != "" || processResult.Err != nil {
+				return processResult
+			}
 			if err := runCtx.Err(); err != nil {
 				return TaskResult{Err: err}
 			}
@@ -3412,6 +3559,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		},
 	}
 	result := e.projectScheduler.Submit(task)
+	if !submitAcceptedForAttachmentOwnership(result.Status) {
+		cleanupStagedTaskAttachments(taskID, staged)
+	}
 	e.handleInteractiveSubmitResult(p, msg, result)
 
 }
@@ -3529,6 +3679,11 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	// issue #565). Only reject if the session was established and died.
 	if state.agentSession != nil && !state.agentSession.Alive() {
 		return false
+	}
+
+	if messageHasImageFileAttachments(msg) {
+		_ = e.replyAttachmentFailure(p, msg.ReplyCtx)
+		return true
 	}
 
 	// Only queue metadata — do NOT send to agent stdin yet.
@@ -4063,7 +4218,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	e.processInteractiveMessageWithContext(e.ctx, p, msg, session, agent, sessions, interactiveKey, workspaceDir, ccSessionKey, lockGen)
 }
 
-func (e *Engine) processInteractiveMessageWithContext(runCtx context.Context, p Platform, msg *Message, session *Session, agent Agent, sessions *SessionManager, interactiveKey string, workspaceDir string, ccSessionKey string, lockGen uint64) {
+func (e *Engine) processInteractiveMessageWithContext(runCtx context.Context, p Platform, msg *Message, session *Session, agent Agent, sessions *SessionManager, interactiveKey string, workspaceDir string, ccSessionKey string, lockGen uint64) (result TaskResult) {
 	if runCtx == nil {
 		runCtx = context.Background()
 	}
@@ -4177,6 +4332,10 @@ func (e *Engine) processInteractiveMessageWithContext(runCtx context.Context, p 
 	}
 
 	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
+	images, files, releaseAttachments, err := e.activeTurnAttachments(msg)
+	if err != nil {
+		return attachmentFailureTaskResult(e.replyAttachmentFailure(p, msg.ReplyCtx))
+	}
 
 	sendStart := time.Now()
 	state.mu.Lock()
@@ -4191,14 +4350,19 @@ func (e *Engine) processInteractiveMessageWithContext(runCtx context.Context, p 
 	// EventPermissionRequest while blocked — the event loop must run in parallel.
 	sendDone := make(chan error, 1)
 	go func() {
+		var err error
 		if as == nil {
-			sendDone <- fmt.Errorf("agent session became nil")
-			return
+			err = fmt.Errorf("agent session became nil")
+		} else {
+			err = as.Send(promptContent, msg.MessageID, images, files)
 		}
-		sendDone <- as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
+		releaseAttachments()
+		sendDone <- err
 	}()
 
-	e.processInteractiveEventsWithContext(runCtx, state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen)
+	if err := e.processInteractiveEventsWithContext(runCtx, state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen); err != nil {
+		return TaskResult{State: TaskStateFailed, Err: err}
+	}
 	if elapsed := time.Since(sendStart); elapsed >= slowAgentSend {
 		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
 	}
@@ -4228,6 +4392,7 @@ func (e *Engine) processInteractiveMessageWithContext(runCtx context.Context, p 
 	if e.drainPendingMessages(state, session, sessions, interactiveKey, lockGen) {
 		unlocked = true
 	}
+	return TaskResult{}
 }
 
 // getOrCreateWorkspaceAgent returns (or creates) a per-workspace agent and session manager.
@@ -5392,10 +5557,10 @@ var agentErrorHandlers = []agentErrorHandler{
 }
 
 func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) {
-	e.processInteractiveEventsWithContext(e.ctx, state, session, sessions, sessionKey, msgID, turnStart, stopTypingFn, sendDone, replyCtx, lockGen)
+	_ = e.processInteractiveEventsWithContext(e.ctx, state, session, sessions, sessionKey, msgID, turnStart, stopTypingFn, sendDone, replyCtx, lockGen)
 }
 
-func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) {
+func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) (resultErr error) {
 	if runCtx == nil {
 		runCtx = context.Background()
 	}
@@ -5418,6 +5583,15 @@ func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, sta
 	var partialText string
 	triggerAutoCompress := false
 	pendingSend := sendDone
+	defer func() {
+		if pendingSend == nil {
+			return
+		}
+		if err := <-pendingSend; err != nil && resultErr == nil {
+			resultErr = err
+		}
+		pendingSend = nil
+	}()
 
 	// stopTyping tracks the current turn's typing indicator so it can be
 	// stopped when a queued message starts a new turn.
@@ -5601,7 +5775,8 @@ func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, sta
 			state.mu.Lock()
 			state.eventsNeedResync = true
 			state.mu.Unlock()
-			return
+			e.cleanupInteractiveState(sessionKey, state)
+			return e.ctx.Err()
 		}
 
 		if state.isStopped() {
@@ -5609,7 +5784,7 @@ func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, sta
 			state.mu.Lock()
 			state.eventsNeedResync = true
 			state.mu.Unlock()
-			return
+			return context.Canceled
 		}
 
 		// Reset idle timer after receiving an event
@@ -6585,7 +6760,11 @@ func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, sta
 					if pendingSend != nil {
 						if err := <-pendingSend; err != nil {
 							slog.Debug("async send error before compress", "error", err)
+							if resultErr == nil {
+								resultErr = err
+							}
 						}
+						pendingSend = nil
 					}
 					state.mu.Lock()
 					state.lastAutoCompressAt = time.Now()
@@ -6651,9 +6830,17 @@ func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, sta
 				if pendingSend != nil {
 					if err := <-pendingSend; err != nil {
 						slog.Debug("async send error before queued turn", "error", err)
+						if resultErr == nil {
+							resultErr = err
+						}
+						pendingSend = nil
 					}
 				}
-
+				pendingSend = nil
+				if len(queued.images) != 0 || len(queued.files) != 0 {
+					e.send(queued.platform, queued.replyCtx, attachmentFailureUserMessage(newAttachmentFailureTaskID()))
+					continue
+				}
 				queuedPrompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
 
 				state.mu.Lock()
@@ -6754,7 +6941,11 @@ func (e *Engine) processInteractiveEventsWithContext(runCtx context.Context, sta
 			if pendingSend != nil {
 				if err := <-pendingSend; err != nil {
 					slog.Debug("async send error after EventResult", "error", err)
+					if resultErr == nil {
+						resultErr = err
+					}
 				}
+				pendingSend = nil
 			}
 
 			// Add a "done" reaction after the final answer when supported. Skip
@@ -6883,6 +7074,7 @@ channelClosed:
 			}
 		}
 	}
+	return fmt.Errorf("agent process exited")
 }
 
 func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen int) []ToolStep {
@@ -6981,6 +7173,11 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.fromVoice = queued.fromVoice
 		state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
 		state.mu.Unlock()
+
+		if len(queued.images) != 0 || len(queued.files) != 0 {
+			e.send(queued.platform, queued.replyCtx, attachmentFailureUserMessage(newAttachmentFailureTaskID()))
+			continue
+		}
 
 		e.i18n.DetectAndSet(queued.content)
 		prompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
