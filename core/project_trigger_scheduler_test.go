@@ -451,24 +451,32 @@ func exprString(expr ast.Expr) string {
 var _ EngineScheduler = (*captureEngineScheduler)(nil)
 
 type captureEngineScheduler struct {
-	mu       sync.Mutex
-	tasks    []ProjectTask
-	statuses []SubmitStatus
-	onSubmit func(ProjectTask) SubmitResult
-	stopped  bool
+	mu         sync.Mutex
+	tasks      []ProjectTask
+	admissions []submitAdmission
+	statuses   []SubmitStatus
+	onSubmit   func(ProjectTask) SubmitResult
+	stopped    bool
+}
+
+func (s *captureEngineScheduler) capture(task ProjectTask, admission submitAdmission) SubmitResult {
+	s.mu.Lock()
+	s.admissions = append(s.admissions, admission)
+	onSubmit := s.onSubmit
+	if onSubmit == nil {
+		s.tasks = append(s.tasks, task)
+		s.mu.Unlock()
+		return SubmitResult{Status: SubmitStarted}
+	}
+	s.mu.Unlock()
+	return onSubmit(task)
 }
 
 func (s *captureEngineScheduler) Submit(task ProjectTask) SubmitResult {
-	if s.onSubmit != nil {
-		return s.onSubmit(task)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tasks = append(s.tasks, task)
-	return SubmitResult{Status: SubmitStarted}
+	return s.capture(task, admissionInteractiveQueue)
 }
 func (s *captureEngineScheduler) SubmitOnlyIfIdle(task ProjectTask) SubmitResult {
-	return s.Submit(task)
+	return s.capture(task, admissionOnlyIfIdle)
 }
 func (s *captureEngineScheduler) TryBeginLocalMutation(context.Context) (func(), bool) {
 	return func() {}, true
@@ -493,6 +501,31 @@ func (s *captureEngineScheduler) taskAt(t *testing.T, index int) ProjectTask {
 	}
 	t.Fatalf("timed out waiting for captured task %d", index)
 	return ProjectTask{}
+}
+
+func (s *captureEngineScheduler) admissionAt(t *testing.T, index int) submitAdmission {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		if len(s.admissions) > index {
+			admission := s.admissions[index]
+			s.mu.Unlock()
+			return admission
+		}
+		s.mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for captured admission %d", index)
+	return admissionInteractiveQueue
+}
+
+type captureProactiveEngineScheduler struct {
+	*captureEngineScheduler
+}
+
+func (s *captureProactiveEngineScheduler) SubmitProactive(task ProjectTask) SubmitResult {
+	return s.capture(task, admissionProactive)
 }
 
 func TestNewEngineUsesInjectedSchedulerOptionsIdentity(t *testing.T) {
@@ -572,24 +605,30 @@ func TestProactiveEntriesSubmitCompleteProjectTaskContract(t *testing.T) {
 	platform := &projectTriggerPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
 	agent := newProjectTriggerAgent()
 	cases := []struct {
-		name       string
-		wantSource AgentTriggerSource
-		wantKey    string
-		invoke     func(*Engine) <-chan error
+		name          string
+		wantSource    AgentTriggerSource
+		wantKey       string
+		wantAdmission submitAdmission
+		invoke        func(*Engine) <-chan error
 	}{
-		{name: "timer", wantSource: TaskSourceTimer, wantKey: "test:timer:user", invoke: func(e *Engine) <-chan error {
+		{name: "timer", wantSource: TaskSourceTimer, wantKey: "test:timer:user", wantAdmission: admissionProactive, invoke: func(e *Engine) <-chan error {
 			done := make(chan error, 1)
 			go func() {
 				done <- e.ExecuteTimerJob(&TimerJob{ID: "tm-contract", Project: "test", SessionKey: "test:timer:user", Prompt: "timer"})
 			}()
 			return done
 		}},
-		{name: "heartbeat", wantSource: TaskSourceHeartbeat, wantKey: "test:heartbeat:user", invoke: func(e *Engine) <-chan error {
+		{name: "heartbeat", wantSource: TaskSourceHeartbeat, wantKey: "test:heartbeat:user", wantAdmission: admissionProactive, invoke: func(e *Engine) <-chan error {
 			done := make(chan error, 1)
 			go func() { done <- e.ExecuteHeartbeat("test:heartbeat:user", "heartbeat", true) }()
 			return done
 		}},
-		{name: "relay", wantSource: TaskSourceRelay, wantKey: "relay:source:test:relay", invoke: func(e *Engine) <-chan error {
+		{name: "heartbeat-only-if-idle", wantSource: TaskSourceHeartbeat, wantKey: "test:heartbeat-idle:user", wantAdmission: admissionOnlyIfIdle, invoke: func(e *Engine) <-chan error {
+			done := make(chan error, 1)
+			go func() { done <- e.ExecuteHeartbeatOnlyIfIdle("test:heartbeat-idle:user", "heartbeat idle", true) }()
+			return done
+		}},
+		{name: "relay", wantSource: TaskSourceRelay, wantKey: "relay:source:test:relay", wantAdmission: admissionInteractiveQueue, invoke: func(e *Engine) <-chan error {
 			done := make(chan error, 1)
 			go func() {
 				_, err := e.HandleRelay(context.Background(), "source", "test:relay:user", "relay")
@@ -597,7 +636,7 @@ func TestProactiveEntriesSubmitCompleteProjectTaskContract(t *testing.T) {
 			}()
 			return done
 		}},
-		{name: "cron", wantSource: TaskSourceCron, wantKey: "test:cron:user", invoke: func(e *Engine) <-chan error {
+		{name: "cron", wantSource: TaskSourceCron, wantKey: "test:cron:user", wantAdmission: admissionProactive, invoke: func(e *Engine) <-chan error {
 			done := make(chan error, 1)
 			go func() {
 				done <- e.ExecuteCronJob(&CronJob{ID: "cr-contract", Project: "test", SessionKey: "test:cron:user", Prompt: "cron"})
@@ -607,10 +646,14 @@ func TestProactiveEntriesSubmitCompleteProjectTaskContract(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			scheduler := &captureEngineScheduler{}
+			capture := &captureEngineScheduler{}
+			scheduler := &captureProactiveEngineScheduler{captureEngineScheduler: capture}
 			e := NewEngine("test", agent, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(scheduler))
 			done := tc.invoke(e)
-			task := scheduler.taskAt(t, 0)
+			task := capture.taskAt(t, 0)
+			if got := capture.admissionAt(t, 0); got != tc.wantAdmission {
+				t.Fatalf("admission = %v, want %v", got, tc.wantAdmission)
+			}
 			if task.Source != tc.wantSource || task.SessionKey != tc.wantKey {
 				t.Fatalf("task Source/SessionKey = %q/%q, want %q/%q", task.Source, task.SessionKey, tc.wantSource, tc.wantKey)
 			}
@@ -632,23 +675,245 @@ func TestProactiveEntriesSubmitCompleteProjectTaskContract(t *testing.T) {
 	}
 }
 
-func TestCustomCommandAndSkillSubmitInteractiveProjectTasks(t *testing.T) {
+func TestCustomCommandAndSkillSubmitProactiveProjectTasks(t *testing.T) {
 	// Catches: custom command / skill prompt paths calling processInteractiveMessageWith
-	// directly instead of entering the project FIFO as TaskSourceInteractive.
-	scheduler := &captureEngineScheduler{}
+	// directly or using interactive admission instead of proactive admission.
+	capture := &captureEngineScheduler{}
+	scheduler := &captureProactiveEngineScheduler{captureEngineScheduler: capture}
 	platform := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(scheduler))
 	msg := &Message{SessionKey: "test:cmd:user", Platform: "test", MessageID: "cmd1", UserID: "u", UserName: "user", Content: "/cmd", ReplyCtx: "r"}
 	e.executeCustomCommand(platform, msg, &CustomCommand{Name: "cmd", Prompt: "custom prompt"}, nil)
-	customTask := scheduler.taskAt(t, 0)
+	customTask := capture.taskAt(t, 0)
+	if got := capture.admissionAt(t, 0); got != admissionProactive {
+		t.Fatalf("custom command admission = %v, want proactive", got)
+	}
 	if customTask.Source != TaskSourceInteractive || customTask.SessionKey != "test:cmd:user" || customTask.Run == nil || customTask.Cleanup == nil {
-		t.Fatalf("custom task = %+v, want interactive task with run/cleanup", customTask)
+		t.Fatalf("custom task = %+v, want interactive-source task with run/cleanup", customTask)
 	}
 	msg2 := &Message{SessionKey: "test:skill:user", Platform: "test", MessageID: "skill1", UserID: "u", UserName: "user", Content: "/skill", ReplyCtx: "r2"}
 	e.executeSkill(platform, msg2, &Skill{Name: "skill", Prompt: "do skill"}, nil)
-	skillTask := scheduler.taskAt(t, 1)
+	skillTask := capture.taskAt(t, 1)
+	if got := capture.admissionAt(t, 1); got != admissionProactive {
+		t.Fatalf("skill admission = %v, want proactive", got)
+	}
 	if skillTask.Source != TaskSourceInteractive || skillTask.SessionKey != "test:skill:user" || skillTask.Run == nil || skillTask.Cleanup == nil {
-		t.Fatalf("skill task = %+v, want interactive task with run/cleanup", skillTask)
+		t.Fatalf("skill task = %+v, want interactive-source task with run/cleanup", skillTask)
+	}
+	_ = e.Stop()
+}
+
+func TestWebhookPromptAndManualCompressUseProactiveAdmission(t *testing.T) {
+	capture := &captureEngineScheduler{}
+	scheduler := &captureProactiveEngineScheduler{captureEngineScheduler: capture}
+	platform := &projectTriggerPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	agent := &stubCompressorAgent{cmd: "/compact"}
+	e := NewEngine("test", agent, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(scheduler))
+
+	ws := NewWebhookServer(0, "", "/hook")
+	ws.executePrompt(e, "test:webhook:user", "webhook prompt", true, "push")
+	webhookTask := capture.taskAt(t, 0)
+	if got := capture.admissionAt(t, 0); got != admissionProactive {
+		t.Fatalf("webhook prompt admission = %v, want proactive", got)
+	}
+	if webhookTask.Source != TaskSourceInteractive || webhookTask.SessionKey != "test:webhook:user" {
+		t.Fatalf("webhook task Source/SessionKey = %q/%q, want %q/%q", webhookTask.Source, webhookTask.SessionKey, TaskSourceInteractive, "test:webhook:user")
+	}
+
+	key := "test:compress:user"
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{agentSession: newQueuingSession("manual-compress"), platform: platform, replyCtx: "compress-rctx"}
+	e.interactiveMu.Unlock()
+	e.cmdCompress(platform, &Message{SessionKey: key, Platform: "test", MessageID: "compress1", Content: "/compress", ReplyCtx: "compress-rctx"})
+	compressTask := capture.taskAt(t, 1)
+	if got := capture.admissionAt(t, 1); got != admissionProactive {
+		t.Fatalf("manual compress admission = %v, want proactive", got)
+	}
+	if compressTask.Source != TaskSourceInteractive || compressTask.SessionKey != key || compressTask.Run == nil || compressTask.Cleanup == nil {
+		t.Fatalf("manual compress task = %+v, want interactive-source task with run/cleanup", compressTask)
+	}
+	_ = e.Stop()
+}
+
+func TestRejectedProactiveEntriesDoNotSendStartedNotifications(t *testing.T) {
+	capture := &captureEngineScheduler{onSubmit: func(ProjectTask) SubmitResult {
+		return SubmitResult{Status: SubmitRejectedBusy}
+	}}
+	scheduler := &captureProactiveEngineScheduler{captureEngineScheduler: capture}
+
+	cases := []struct {
+		name   string
+		invoke func(*Engine, *projectTriggerPlatform) error
+	}{
+		{name: "timer", invoke: func(e *Engine, _ *projectTriggerPlatform) error {
+			return e.ExecuteTimerJob(&TimerJob{ID: "rejected-timer", Project: "test", SessionKey: "test:rejected:user", Prompt: "timer"})
+		}},
+		{name: "cron", invoke: func(e *Engine, _ *projectTriggerPlatform) error {
+			return e.ExecuteCronJob(&CronJob{ID: "rejected-cron", Project: "test", SessionKey: "test:rejected:user", Prompt: "cron"})
+		}},
+		{name: "heartbeat", invoke: func(e *Engine, _ *projectTriggerPlatform) error {
+			return e.ExecuteHeartbeat("test:rejected:user", "heartbeat", false)
+		}},
+		{name: "webhook", invoke: func(e *Engine, _ *projectTriggerPlatform) error {
+			NewWebhookServer(0, "", "/hook").executePrompt(e, "test:rejected:user", "webhook", false, "push")
+			return nil
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			platform := &projectTriggerPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+			e := NewEngine("test", &stubAgent{}, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithScheduler(scheduler))
+			err := tc.invoke(e, platform)
+			if tc.name != "webhook" && !errors.Is(err, errProjectSchedulerBusy) {
+				t.Fatalf("entry error = %v, want scheduler busy", err)
+			}
+			for _, sent := range platform.getSent() {
+				if strings.Contains(sent, "⏰") || strings.Contains(sent, "💓") || sent == "🪝 push" {
+					t.Fatalf("rejected proactive entry sent premature started notification: %v", platform.getSent())
+				}
+			}
+			_ = e.Stop()
+		})
+	}
+}
+
+func TestLegacyBusyTargetRejectsEveryProactiveEntryWithoutQueueing(t *testing.T) {
+	const key = "test:legacy-busy:user"
+	cases := []struct {
+		name   string
+		invoke func(*Engine, *projectTriggerPlatform)
+	}{
+		{name: "timer", invoke: func(e *Engine, _ *projectTriggerPlatform) {
+			if err := e.ExecuteTimerJob(&TimerJob{ID: "legacy-timer", Project: "test", SessionKey: key, Prompt: "timer"}); !errors.Is(err, errProjectSchedulerBusy) {
+				t.Fatalf("timer error = %v, want scheduler busy", err)
+			}
+		}},
+		{name: "cron", invoke: func(e *Engine, _ *projectTriggerPlatform) {
+			if err := e.ExecuteCronJob(&CronJob{ID: "legacy-cron", Project: "test", SessionKey: key, Prompt: "cron"}); !errors.Is(err, errProjectSchedulerBusy) {
+				t.Fatalf("cron error = %v, want scheduler busy", err)
+			}
+		}},
+		{name: "heartbeat", invoke: func(e *Engine, _ *projectTriggerPlatform) {
+			if err := e.ExecuteHeartbeat(key, "heartbeat", true); !errors.Is(err, errProjectSchedulerBusy) {
+				t.Fatalf("heartbeat error = %v, want scheduler busy", err)
+			}
+		}},
+		{name: "webhook", invoke: func(e *Engine, _ *projectTriggerPlatform) {
+			NewWebhookServer(0, "", "/hook").executePrompt(e, key, "webhook", true, "push")
+		}},
+		{name: "custom", invoke: func(e *Engine, p *projectTriggerPlatform) {
+			e.executeCustomCommand(p, &Message{SessionKey: key, Platform: "test", MessageID: "legacy-custom", UserID: "u", Content: "/ask", ReplyCtx: "r"}, &CustomCommand{Name: "ask", Prompt: "custom"}, nil)
+		}},
+		{name: "skill", invoke: func(e *Engine, p *projectTriggerPlatform) {
+			e.executeSkill(p, &Message{SessionKey: key, Platform: "test", MessageID: "legacy-skill", UserID: "u", Content: "/skill", ReplyCtx: "r"}, &Skill{Name: "skill", Prompt: "skill"}, nil)
+		}},
+		{name: "manual-compress", invoke: func(e *Engine, p *projectTriggerPlatform) {
+			e.interactiveMu.Lock()
+			e.interactiveStates[key] = &interactiveState{agentSession: newQueuingSession("legacy-compress"), platform: p, replyCtx: "r"}
+			e.interactiveMu.Unlock()
+			e.cmdCompress(p, &Message{SessionKey: key, Platform: "test", MessageID: "legacy-compress", Content: "/compress", ReplyCtx: "r"})
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheduler := NewLegacyScheduler(5)
+			started := make(chan struct{}, 1)
+			release := make(chan struct{})
+			if result := scheduler.Submit(ProjectTask{ID: "active", SessionKey: key, Run: func(context.Context) TaskResult {
+				started <- struct{}{}
+				<-release
+				return TaskResult{State: TaskStateCompleted}
+			}}); result.Status != SubmitStarted {
+				t.Fatalf("active submit = %+v", result)
+			}
+			select {
+			case <-started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("active legacy task did not start")
+			}
+
+			platform := &projectTriggerPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+			e := NewEngine("test", &stubCompressorAgent{cmd: "/compact"}, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithScheduler(scheduler))
+			tc.invoke(e, platform)
+			snapshot := scheduler.Snapshot()
+			if snapshot.ActiveCount != 1 || snapshot.WaitingCount != 0 {
+				t.Fatalf("legacy snapshot after rejected %s = %+v, want one active and no waiting", tc.name, snapshot)
+			}
+			close(release)
+			_ = e.Stop()
+		})
+	}
+}
+
+func TestProjectQueuedProactiveNotificationWaitsForActualStart(t *testing.T) {
+	scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(15_000, 0)), 10, 6*time.Hour, 30*time.Minute)
+	activeStarted := make(chan struct{}, 1)
+	releaseActive := make(chan struct{})
+	if result := scheduler.Submit(ProjectTask{ID: "active", SessionKey: "test:other:user", Run: func(context.Context) TaskResult {
+		activeStarted <- struct{}{}
+		<-releaseActive
+		return TaskResult{State: TaskStateCompleted}
+	}}); result.Status != SubmitStarted {
+		t.Fatalf("active submit = %+v", result)
+	}
+	select {
+	case <-activeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active project task did not start")
+	}
+
+	agent := newProjectTriggerAgent()
+	platform := &projectTriggerPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", agent, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithScheduler(scheduler))
+	done := make(chan error, 1)
+	go func() {
+		done <- e.ExecuteTimerJob(&TimerJob{ID: "queued-timer", Project: "test", SessionKey: "test:queued:user", Prompt: "timer"})
+	}()
+	waitProjectTriggerSnapshot(t, scheduler, 1)
+	if sent := platform.getSent(); len(sent) != 0 {
+		t.Fatalf("queued proactive task sent started notification before Run: %v", sent)
+	}
+
+	close(releaseActive)
+	waitProjectTriggerStart(t, agent.started, "timer")
+	if sent := platform.getSent(); len(sent) != 1 || !strings.Contains(sent[0], "⏰") {
+		t.Fatalf("started proactive task notifications = %v, want one timer notification", sent)
+	}
+	agent.release <- struct{}{}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("queued timer returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued timer did not complete")
+	}
+	_ = e.Stop()
+}
+
+func TestProactiveEntryFallsBackToSubmitForLegacyCustomScheduler(t *testing.T) {
+	scheduler := &captureEngineScheduler{}
+	platform := &projectTriggerPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", newProjectTriggerAgent(), []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithScheduler(scheduler))
+	done := make(chan error, 1)
+	go func() {
+		done <- e.ExecuteTimerJob(&TimerJob{ID: "fallback-timer", Project: "test", SessionKey: "test:fallback:user", Prompt: "timer"})
+	}()
+	task := scheduler.taskAt(t, 0)
+	if got := scheduler.admissionAt(t, 0); got != admissionInteractiveQueue {
+		t.Fatalf("fallback admission = %v, want base Submit", got)
+	}
+	task.Cleanup()
+	task.OnFinish(TaskResult{State: TaskStateCompleted})
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("fallback proactive entry returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fallback proactive entry did not observe terminal result")
 	}
 	_ = e.Stop()
 }

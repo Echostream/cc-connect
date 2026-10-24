@@ -228,8 +228,9 @@ func (ws *WebhookServer) executePrompt(engine *Engine, sessionKey, prompt string
 		return
 	}
 
+	notifyStarted := func() {}
 	if !silent {
-		engine.send(targetPlatform, replyCtx, fmt.Sprintf("🪝 %s", event))
+		notifyStarted = func() { engine.send(targetPlatform, replyCtx, fmt.Sprintf("🪝 %s", event)) }
 	}
 
 	msg := &Message{
@@ -241,7 +242,7 @@ func (ws *WebhookServer) executePrompt(engine *Engine, sessionKey, prompt string
 		ReplyCtx:   replyCtx,
 	}
 
-	result := engine.submitInteractiveProjectMessage(targetPlatform, msg, engine.agent, engine.sessions, sessionKey, "")
+	result := engine.submitProactiveProjectMessageOnStart(targetPlatform, msg, engine.agent, engine.sessions, sessionKey, "", notifyStarted)
 	if result.Status == SubmitRejectedFull || result.Status == SubmitRejectedBusy || result.Status == SubmitRejectedNotificationBacklog {
 		slog.Warn("webhook: project scheduler busy, prompt not accepted", "event", event, "session_key", sessionKey, "status", result.Status)
 		if !silent {

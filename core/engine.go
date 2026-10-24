@@ -1738,7 +1738,18 @@ type projectAgentTaskRequest struct {
 	UseNewSession    bool
 	SidePrefix       string
 	RequireAssistant bool
+	OnStart          func()
+	Proactive        bool
 	OnlyIfIdle       bool
+}
+
+// submitProactiveTask 使用可选 capability 提交主动任务。仓外旧 Scheduler
+// 只实现 EngineScheduler 时回退到 Submit，保持既有实现的源码兼容。
+func submitProactiveTask(scheduler EngineScheduler, task ProjectTask) SubmitResult {
+	if proactive, ok := scheduler.(EngineProactiveScheduler); ok {
+		return proactive.SubmitProactive(task)
+	}
+	return scheduler.Submit(task)
 }
 
 func (e *Engine) submitProjectAgentTaskAndWait(req projectAgentTaskRequest) error {
@@ -1794,6 +1805,9 @@ func (e *Engine) submitProjectAgentTaskAndWait(req projectAgentTaskRequest) erro
 				err := fmt.Errorf("session %q is busy outside project scheduler", sessionKey)
 				return TaskResult{State: TaskStateFailed, Err: err}
 			}
+			if req.OnStart != nil {
+				req.OnStart()
+			}
 			prevHistLen := session.HistoryLen()
 			processResult := e.processInteractiveMessageWithContext(runCtx, req.Platform, &msg, session, req.Agent, req.Sessions, interactiveKey, req.WorkspaceDir, runSessionKey, lockGen)
 			if req.UseNewSession {
@@ -1816,6 +1830,8 @@ func (e *Engine) submitProjectAgentTaskAndWait(req projectAgentTaskRequest) erro
 	var result SubmitResult
 	if req.OnlyIfIdle {
 		result = e.projectScheduler.SubmitOnlyIfIdle(task)
+	} else if req.Proactive {
+		result = submitProactiveTask(e.projectScheduler, task)
 	} else {
 		result = e.projectScheduler.Submit(task)
 	}
@@ -1925,9 +1941,9 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		effectivePlatform = &mutePlatform{targetPlatform}
 	}
 
-	// Notify user that a cron job is executing (unless silent/muted)
-	// Note: this notification uses targetPlatform directly, not the tracking wrapper,
-	// so it won't count as a "meaningful delivery" for empty response detection.
+	// Agent prompt 只有在 Scheduler 真正开始执行后才发送 started 提示，避免
+	// Legacy busy rejection 先显示“正在执行”。Shell 不走 Agent Scheduler，仍在执行前提示。
+	notifyStarted := func() {}
 	if !job.Mute {
 		silent := false
 		if e.cronScheduler != nil {
@@ -1942,11 +1958,12 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 					desc = truncateStr(job.Prompt, 40)
 				}
 			}
-			e.send(targetPlatform, replyCtx, fmt.Sprintf("⏰ %s", desc))
+			notifyStarted = func() { e.send(targetPlatform, replyCtx, fmt.Sprintf("⏰ %s", desc)) }
 		}
 	}
 
 	if job.IsShellJob() {
+		notifyStarted()
 		return e.executeCronShell(effectivePlatform, replyCtx, job)
 	}
 
@@ -2024,6 +2041,8 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		UseNewSession:    useNewSession,
 		SidePrefix:       "cron-",
 		RequireAssistant: !job.Mute,
+		OnStart:          notifyStarted,
+		Proactive:        true,
 	})
 }
 
@@ -2104,7 +2123,8 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 		effectivePlatform = &mutePlatform{targetPlatform}
 	}
 
-	// Notify user unless muted or silent
+	// Agent prompt 的 started 提示延迟到 Scheduler 真正执行；Shell 不走 Agent Scheduler。
+	notifyStarted := func() {}
 	if !job.Mute {
 		silent := false
 		if e.timerScheduler != nil {
@@ -2119,11 +2139,12 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 					desc = truncateStr(job.Prompt, 40)
 				}
 			}
-			e.send(targetPlatform, replyCtx, fmt.Sprintf("⏰ %s", desc))
+			notifyStarted = func() { e.send(targetPlatform, replyCtx, fmt.Sprintf("⏰ %s", desc)) }
 		}
 	}
 
 	if job.IsShellJob() {
+		notifyStarted()
 		return e.executeTimerShell(effectivePlatform, replyCtx, job)
 	}
 
@@ -2198,6 +2219,8 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 		WorkspaceDir:  workspaceDir,
 		UseNewSession: useNewSession,
 		SidePrefix:    "timer-",
+		OnStart:       notifyStarted,
+		Proactive:     true,
 	})
 }
 
@@ -2645,8 +2668,9 @@ func (e *Engine) executeHeartbeat(sessionKey, prompt string, silent bool, onlyIf
 		return fmt.Errorf("reconstruct reply context: %w", err)
 	}
 
+	notifyStarted := func() {}
 	if !silent {
-		e.send(targetPlatform, replyCtx, "💓 heartbeat")
+		notifyStarted = func() { e.send(targetPlatform, replyCtx, "💓 heartbeat") }
 	}
 
 	msg := &Message{
@@ -2664,6 +2688,8 @@ func (e *Engine) executeHeartbeat(sessionKey, prompt string, silent bool, onlyIf
 		SessionKey: sessionKey,
 		Platform:   targetPlatform,
 		Message:    *msg,
+		OnStart:    notifyStarted,
+		Proactive:  !onlyIfIdle,
 		OnlyIfIdle: onlyIfIdle,
 	})
 }
@@ -2912,6 +2938,18 @@ func (e *Engine) resolveAlias(content string) string {
 }
 
 func (e *Engine) submitInteractiveProjectMessage(p Platform, msg *Message, agent Agent, sessions *SessionManager, interactiveKey, workspaceDir string) SubmitResult {
+	return e.submitProjectMessage(p, msg, agent, sessions, interactiveKey, workspaceDir, false, nil)
+}
+
+func (e *Engine) submitProactiveProjectMessage(p Platform, msg *Message, agent Agent, sessions *SessionManager, interactiveKey, workspaceDir string) SubmitResult {
+	return e.submitProjectMessage(p, msg, agent, sessions, interactiveKey, workspaceDir, true, nil)
+}
+
+func (e *Engine) submitProactiveProjectMessageOnStart(p Platform, msg *Message, agent Agent, sessions *SessionManager, interactiveKey, workspaceDir string, onStart func()) SubmitResult {
+	return e.submitProjectMessage(p, msg, agent, sessions, interactiveKey, workspaceDir, true, onStart)
+}
+
+func (e *Engine) submitProjectMessage(p Platform, msg *Message, agent Agent, sessions *SessionManager, interactiveKey, workspaceDir string, proactive bool, onStart func()) SubmitResult {
 	if agent == nil {
 		agent = e.agent
 	}
@@ -2942,6 +2980,9 @@ func (e *Engine) submitInteractiveProjectMessage(p Platform, msg *Message, agent
 				e.reply(p, msgCopy.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 				return TaskResult{State: TaskStateFailed, Err: fmt.Errorf("session %q busy outside project scheduler", interactiveKey)}
 			}
+			if onStart != nil {
+				onStart()
+			}
 			processResult := e.processInteractiveMessageWithContext(runCtx, p, &msgCopy, session, agent, sessions, interactiveKey, workspaceDir, msgCopy.SessionKey, lockGen)
 			if processResult.State != "" || processResult.Err != nil {
 				return processResult
@@ -2952,7 +2993,12 @@ func (e *Engine) submitInteractiveProjectMessage(p Platform, msg *Message, agent
 			return TaskResult{State: TaskStateCompleted}
 		},
 	}
-	result := e.projectScheduler.Submit(task)
+	var result SubmitResult
+	if proactive {
+		result = submitProactiveTask(e.projectScheduler, task)
+	} else {
+		result = e.projectScheduler.Submit(task)
+	}
 	if !submitAcceptedForAttachmentOwnership(result.Status) {
 		cleanupStagedTaskAttachments(taskID, staged)
 	}
@@ -11658,7 +11704,7 @@ func (e *Engine) cmdCompress(p Platform, msg *Message) {
 			return TaskResult{State: TaskStateCompleted}
 		},
 	}
-	e.handleInteractiveSubmitResult(p, &msgCopy, e.projectScheduler.Submit(task))
+	e.handleInteractiveSubmitResult(p, &msgCopy, submitProactiveTask(e.projectScheduler, task))
 }
 
 // runCompress sends the agent's compress command and handles results.
@@ -16086,7 +16132,7 @@ func (e *Engine) executeCustomCommand(p Platform, msg *Message, cmd *CustomComma
 
 	msgCopy := *msg
 	msgCopy.Content = prompt
-	e.handleInteractiveSubmitResult(p, &msgCopy, e.submitInteractiveProjectMessage(p, &msgCopy, agent, sessions, interactiveKey, workspaceDir))
+	e.handleInteractiveSubmitResult(p, &msgCopy, e.submitProactiveProjectMessage(p, &msgCopy, agent, sessions, interactiveKey, workspaceDir))
 }
 
 // executeShellCommand runs a shell command and sends the output to the user.
@@ -16309,7 +16355,7 @@ func (e *Engine) executeSkill(p Platform, msg *Message, skill *Skill, args []str
 
 	msgCopy := *msg
 	msgCopy.Content = prompt
-	e.handleInteractiveSubmitResult(p, &msgCopy, e.submitInteractiveProjectMessage(p, &msgCopy, agent, sessions, interactiveKey, workspaceDir))
+	e.handleInteractiveSubmitResult(p, &msgCopy, e.submitProactiveProjectMessage(p, &msgCopy, agent, sessions, interactiveKey, workspaceDir))
 }
 
 func (e *Engine) cmdSkills(p Platform, msg *Message) {
