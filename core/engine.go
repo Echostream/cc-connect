@@ -5219,8 +5219,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	sendWorkspace := func(p Platform, replyCtx any, content string) {
 		e.sendForWorkspace(p, replyCtx, content, workspaceDir)
 	}
-	sendWorkspaceWithError := func(p Platform, replyCtx any, content string) error {
-		return e.sendWithErrorForWorkspace(p, replyCtx, content, workspaceDir)
+	replyWorkspaceWithError := func(p Platform, replyCtx any, content string) error {
+		return e.replyWithErrorForWorkspace(p, replyCtx, content, workspaceDir)
 	}
 
 	// Streaming card: aggregate entire turn into a single updatable card.
@@ -6201,7 +6201,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					// for a silent reply, which has no deliverable content.
 					if !isSilent {
 						for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
-							if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
+							if err := replyWorkspaceWithError(p, replyCtx, chunk); err != nil {
 								return
 							}
 						}
@@ -6304,7 +6304,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if segmentStart < len(textParts) {
 					unsent := strings.Join(textParts[segmentStart:], "")
 					if unsent != "" {
-						if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, unsent, statusFooter, sendWorkspaceWithError) {
+						if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, unsent, statusFooter, replyWorkspaceWithError) {
 							return
 						}
 					}
@@ -6313,7 +6313,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				sp.discard()
 				metaOnly := strings.TrimSpace(strings.TrimPrefix(fullResponse, baseResponse))
 				if metaOnly != "" || statusFooter != "" {
-					if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, metaOnly, statusFooter, sendWorkspaceWithError) {
+					if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, metaOnly, statusFooter, replyWorkspaceWithError) {
 						return
 					}
 				}
@@ -6321,8 +6321,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			} else if sp.finish(fullResponse, statusFooter) {
 				slog.Debug("EventResult: finalized via stream preview", "response_len", len(fullResponse), "footer_len", len(statusFooter))
 			} else {
-				slog.Debug("EventResult: sending via p.Send (preview inactive or failed)", "response_len", len(fullResponse), "footer_len", len(statusFooter))
-				if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, fullResponse, statusFooter, sendWorkspaceWithError) {
+				slog.Debug("EventResult: sending via p.Reply (preview inactive or failed)", "response_len", len(fullResponse), "footer_len", len(statusFooter))
+				if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, fullResponse, statusFooter, replyWorkspaceWithError) {
 					return
 				}
 			}
@@ -6634,7 +6634,7 @@ channelClosed:
 				unsent := strings.Join(textParts[segmentStart:], "")
 				if unsent != "" {
 					for _, chunk := range SplitMessageCodeFenceAware(unsent, maxPlatformMessageLen) {
-						if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
+						if err := replyWorkspaceWithError(p, replyCtx, chunk); err != nil {
 							return
 						}
 					}
@@ -6644,7 +6644,7 @@ channelClosed:
 			slog.Debug("stream preview: finalized in-place (process exited)")
 		} else {
 			for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
-				if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
+				if err := replyWorkspaceWithError(p, replyCtx, chunk); err != nil {
 					return
 				}
 			}
@@ -12237,6 +12237,32 @@ func (e *Engine) sendWithErrorForWorkspace(p Platform, replyCtx any, content, wo
 
 func (e *Engine) sendForWorkspace(p Platform, replyCtx any, content, workspaceDir string) {
 	_ = e.sendWithErrorForWorkspace(p, replyCtx, content, workspaceDir)
+}
+
+// replyWithErrorForWorkspace mirrors sendWithErrorForWorkspace but uses the
+// platform Reply primitive for an inbound turn's final answer. On Weixin this
+// keeps reactive conversation replies out of the proactive Send push budget.
+func (e *Engine) replyWithErrorForWorkspace(p Platform, replyCtx any, content, workspaceDir string) error {
+	if err := e.waitOutgoing(p); err != nil {
+		slog.Warn("outgoing rate limit: context cancelled", "platform", p.Name(), "error", err)
+		return err
+	}
+	content = e.renderOutgoingContentForWorkspace(p, content, workspaceDir)
+	return e.replyAlreadyRenderedWithError(p, replyCtx, content)
+}
+
+// replyAlreadyRenderedWithError sends already-rendered content through Reply
+// with the same error and slow-operation logging shape as Send.
+func (e *Engine) replyAlreadyRenderedWithError(p Platform, replyCtx any, content string) error {
+	start := time.Now()
+	if err := p.Reply(e.ctx, replyCtx, content); err != nil {
+		slog.Error("platform reply failed", "platform", p.Name(), "error", err, "content_len", len(content))
+		return err
+	}
+	if elapsed := time.Since(start); elapsed >= slowPlatformSend {
+		slog.Warn("slow platform reply", "platform", p.Name(), "elapsed", elapsed, "content_len", len(content))
+	}
+	return nil
 }
 
 func (e *Engine) renderCardForPlatform(p Platform, card *Card) *Card {
