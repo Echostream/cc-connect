@@ -1,9 +1,11 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -726,6 +728,309 @@ func TestBuildSessionKey(t *testing.T) {
 	}
 }
 
+func TestTelegramContextAuthorizationOptionsRejectUnsafeLegacyConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		opts map[string]any
+	}{
+		{
+			name: "legacy allow_from rejected",
+			opts: map[string]any{
+				"token":               "test-token",
+				"allow_from":          "1001",
+				"dm_allow_from":       "1001",
+				"allow_chat":          "-10010",
+				"group_member_policy": "all",
+			},
+		},
+		{
+			name: "empty dm allowlist rejected",
+			opts: map[string]any{"token": "test-token", "allow_chat": "-10010", "group_member_policy": "all"},
+		},
+		{
+			name: "wildcard dm allowlist rejected",
+			opts: map[string]any{"token": "test-token", "dm_allow_from": "*", "allow_chat": "-10010", "group_member_policy": "all"},
+		},
+		{
+			name: "empty allow chat rejected",
+			opts: map[string]any{"token": "test-token", "dm_allow_from": "1001", "group_member_policy": "all"},
+		},
+		{
+			name: "wildcard allow chat rejected",
+			opts: map[string]any{"token": "test-token", "dm_allow_from": "1001", "allow_chat": "*", "group_member_policy": "all"},
+		},
+		{
+			name: "unsafe group policy rejected",
+			opts: map[string]any{"token": "test-token", "dm_allow_from": "1001", "allow_chat": "-10010", "group_member_policy": "owner"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := New(tt.opts); err == nil {
+				t.Fatal("expected New to reject unsafe context authorization options, got nil")
+			}
+		})
+	}
+}
+
+func TestTelegramConversationAuthorizationAndDirection(t *testing.T) {
+	cases := []struct {
+		name         string
+		update       models.Update
+		wantDispatch bool
+	}{
+		{name: "owner dm", update: telegramDMUpdate(1001), wantDispatch: true},
+		{name: "member dm", update: telegramDMUpdate(2001), wantDispatch: false},
+		{name: "trusted group mention", update: telegramGroupUpdate(-10010, 2001, telegramMentionBot()), wantDispatch: true},
+		{name: "trusted supergroup mention", update: telegramChatUpdate(-10010, models.ChatTypeSupergroup, 2001, telegramMentionBot()), wantDispatch: true},
+		{name: "trusted group reply bot", update: telegramGroupUpdate(-10010, 2001, telegramReplyToBot()), wantDispatch: true},
+		{name: "trusted supergroup reply bot", update: telegramChatUpdate(-10010, models.ChatTypeSupergroup, 2001, telegramReplyToBot()), wantDispatch: true},
+		{name: "trusted supergroup topic mention", update: telegramChatUpdate(-10010, models.ChatTypeSupergroup, 2001, telegramTopic(42, telegramMentionBot())), wantDispatch: true},
+		{name: "trusted group naked command rejected", update: telegramGroupUpdate(-10010, 2001, telegramBotCommand("/status")), wantDispatch: false},
+		{name: "trusted supergroup naked command rejected", update: telegramChatUpdate(-10010, models.ChatTypeSupergroup, 2001, telegramBotCommand("/status")), wantDispatch: false},
+		{name: "trusted group command at bot", update: telegramGroupUpdate(-10010, 2001, telegramBotCommand("/status@mybot")), wantDispatch: true},
+		{name: "trusted group command at other bot", update: telegramGroupUpdate(-10010, 2001, telegramBotCommand("/status@otherbot")), wantDispatch: false},
+		{name: "trusted group reply bot naked command", update: telegramGroupUpdate(-10010, 2001, telegramReplyToBotWith(telegramBotCommand("/status"))), wantDispatch: true},
+		{name: "owner dm naked command", update: telegramDMCommandUpdate(1001, "/status"), wantDispatch: true},
+		{name: "trusted group ambient", update: telegramGroupUpdate(-10010, 2001, telegramPlainText()), wantDispatch: false},
+		{name: "trusted group ambient with group_reply_all", update: telegramGroupUpdate(-10010, 2001, telegramPlainText()), wantDispatch: false},
+		{name: "untrusted group owner", update: telegramGroupUpdate(-10099, 1001, telegramMentionBot()), wantDispatch: false},
+		{name: "trusted group callback command", update: telegramCallbackUpdate(-10010, 2001, "cmd:/status"), wantDispatch: true},
+		{name: "trusted group callback ask question", update: telegramCallbackUpdate(-10010, 2001, "askq:0:1"), wantDispatch: true},
+		{name: "trusted group callback permission", update: telegramCallbackUpdate(-10010, 2001, "perm:allow"), wantDispatch: true},
+		{name: "untrusted group callback", update: telegramCallbackUpdate(-10099, 1001, "cmd:/status"), wantDispatch: false},
+		{name: "member dm callback", update: telegramCallbackDMUpdate(2001, "cmd:/status"), wantDispatch: false},
+		{name: "owner dm callback", update: telegramCallbackDMUpdate(1001, "cmd:/status"), wantDispatch: true},
+		{name: "callback inline missing chat", update: telegramInlineCallbackUpdate(1001, "cmd:/status"), wantDispatch: false},
+		{name: "callback inaccessible message", update: telegramInaccessibleCallbackUpdate(-10010, 2001, "cmd:/status"), wantDispatch: false},
+		{name: "callback channel rejected", update: telegramCallbackInChatUpdate(-10010, models.ChatTypeChannel, 1001, "cmd:/status"), wantDispatch: false},
+		{name: "callback unknown chat type rejected", update: telegramCallbackInChatUpdate(-10010, models.ChatType("mystery"), 1001, "cmd:/status"), wantDispatch: false},
+		{name: "callback zero chat id rejected", update: telegramCallbackInChatUpdate(0, models.ChatTypeGroup, 1001, "cmd:/status"), wantDispatch: false},
+		{name: "channel message rejected", update: telegramMessageInChatUpdate(-10010, models.ChatTypeChannel, 1001, "@mybot hi"), wantDispatch: false},
+		{name: "unknown chat type rejected", update: telegramMessageInChatUpdate(-10010, models.ChatType("mystery"), 1001, "@mybot hi"), wantDispatch: false},
+		{name: "zero chat id rejected", update: telegramMessageInChatUpdate(0, models.ChatTypeGroup, 1001, "@mybot hi"), wantDispatch: false},
+		{name: "zero user id rejected", update: telegramMessageInChatUpdate(-10010, models.ChatTypeGroup, 0, "@mybot hi"), wantDispatch: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dispatched := 0
+			p := telegramContextAuthTestPlatform(func(_ core.Platform, msg *core.Message) {
+				dispatched++
+				if msg.SessionKey == "" {
+					t.Fatal("dispatched message has empty SessionKey")
+				}
+			})
+			if strings.Contains(tc.name, "group_reply_all") {
+				p.groupReplyAll = true
+			}
+
+			p.processUpdate(context.Background(), &tc.update)
+
+			if got := dispatched > 0; got != tc.wantDispatch {
+				t.Fatalf("dispatch = %v (%d messages), want %v", got, dispatched, tc.wantDispatch)
+			}
+		})
+	}
+}
+
+func TestTelegramSessionKeysContextAuthorization(t *testing.T) {
+	p := &Platform{shareSessionInChannel: true}
+	if got := p.buildSessionKey(-10010, 42, 2001); got != "telegram:-10010:42" {
+		t.Fatal(got)
+	}
+	if got := p.buildSessionKey(-10010, 42, 2002); got != "telegram:-10010:42" {
+		t.Fatal(got)
+	}
+	if got := p.buildSessionKey(-10010, 0, 2001); got != "telegram:-10010" {
+		t.Fatal(got)
+	}
+	if got := p.buildSessionKey(1001, 0, 1001); got == p.buildSessionKey(1002, 0, 1002) {
+		t.Fatal("DM keys collided")
+	}
+}
+
+func TestTelegramContextAuthLogsDoNotExposeRawIdentifiers(t *testing.T) {
+	var logs bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(old) })
+
+	p := telegramContextAuthTestPlatform(func(core.Platform, *core.Message) {
+		t.Fatal("unexpected dispatch")
+	})
+	ambient := telegramMessageInChatUpdate(-10010, models.ChatTypeGroup, 1001, "ambient secret")
+	untrusted := telegramMessageInChatUpdate(-10099, models.ChatTypeGroup, 1001, "@mybot secret")
+	callback := telegramCallbackDMUpdate(2001, "cmd:/secret")
+	p.processUpdate(context.Background(), &ambient)
+	p.processUpdate(context.Background(), &untrusted)
+	p.processUpdate(context.Background(), &callback)
+
+	out := logs.String()
+	for _, want := range []string{
+		"channel=telegram",
+		"event=message",
+		"event=callback",
+		"reason=missing_mention",
+		"reason=chat_not_allowed",
+		"reason=dm_not_allowed",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("context auth log = %q, want %q", out, want)
+		}
+	}
+	for _, forbidden := range []string{"-10010", "-10099", "1001", "2001", "ambient secret", "@mybot secret", "cmd:/secret"} {
+		if strings.Contains(out, forbidden) {
+			t.Fatalf("context auth log leaked %q: %s", forbidden, out)
+		}
+	}
+}
+
+func telegramContextAuthTestOptions() map[string]any {
+	return map[string]any{
+		"token":                    "test-token",
+		"dm_allow_from":            "1001,7",
+		"allow_chat":               "-10010,100",
+		"group_member_policy":      "all",
+		"share_session_in_channel": true,
+	}
+}
+
+func telegramTestAuthorizer() core.ContextAuthorizer {
+	return core.ContextAuthorizer{DMAllowFrom: "1001,7", AllowChat: "-10010,100", GroupMemberPolicy: "all"}
+}
+
+func telegramContextAuthTestPlatform(handler core.MessageHandler) *Platform {
+	platform, err := New(telegramContextAuthTestOptions())
+	if err != nil {
+		panic(err)
+	}
+	p := platform.(*Platform)
+	p.handler = handler
+	p.bot = newStubTelegramBot()
+	p.selfUser = &models.User{ID: 42, IsBot: true, Username: "mybot"}
+	return p
+}
+
+func telegramDMUpdate(userID int64) models.Update {
+	return telegramMessageInChatUpdate(userID, models.ChatTypePrivate, userID, "hello")
+}
+
+func telegramDMCommandUpdate(userID int64, command string) models.Update {
+	update := telegramMessageInChatUpdate(userID, models.ChatTypePrivate, userID, command)
+	telegramBotCommand(command)(update.Message)
+	return update
+}
+
+func telegramGroupUpdate(chatID, userID int64, apply func(*models.Message)) models.Update {
+	return telegramChatUpdate(chatID, models.ChatTypeGroup, userID, apply)
+}
+
+func telegramChatUpdate(chatID int64, chatType models.ChatType, userID int64, apply func(*models.Message)) models.Update {
+	update := telegramMessageInChatUpdate(chatID, chatType, userID, "hello")
+	apply(update.Message)
+	return update
+}
+
+func telegramMentionBot() func(*models.Message) {
+	return func(msg *models.Message) {
+		msg.Text = "@mybot hello"
+		msg.Entities = []models.MessageEntity{{Type: models.MessageEntityTypeMention, Offset: 0, Length: 6}}
+	}
+}
+
+func telegramReplyToBot() func(*models.Message) {
+	return func(msg *models.Message) {
+		msg.Text = "reply hello"
+		msg.ReplyToMessage = &models.Message{From: &models.User{ID: 42, IsBot: true}}
+	}
+}
+
+func telegramReplyToBotWith(apply func(*models.Message)) func(*models.Message) {
+	return func(msg *models.Message) {
+		apply(msg)
+		msg.ReplyToMessage = &models.Message{From: &models.User{ID: 42, IsBot: true}}
+	}
+}
+
+func telegramBotCommand(command string) func(*models.Message) {
+	return func(msg *models.Message) {
+		msg.Text = command
+		msg.Entities = []models.MessageEntity{{Type: models.MessageEntityTypeBotCommand, Offset: 0, Length: len(command)}}
+	}
+}
+
+func telegramTopic(threadID int, apply func(*models.Message)) func(*models.Message) {
+	return func(msg *models.Message) {
+		apply(msg)
+		msg.MessageThreadID = threadID
+		msg.Chat.IsForum = true
+	}
+}
+
+func telegramPlainText() func(*models.Message) {
+	return func(msg *models.Message) { msg.Text = "ambient hello" }
+}
+
+func telegramMessageInChatUpdate(chatID int64, chatType models.ChatType, userID int64, text string) models.Update {
+	return models.Update{Message: &models.Message{
+		ID:       10,
+		Date:     int(time.Now().Unix()),
+		From:     &models.User{ID: userID, FirstName: "User"},
+		Chat:     models.Chat{ID: chatID, Type: chatType, Title: "Chat"},
+		Text:     text,
+		Entities: []models.MessageEntity{{Type: models.MessageEntityTypeMention, Offset: 0, Length: 6}},
+	}}
+}
+
+func telegramCallbackUpdate(chatID, userID int64, data string) models.Update {
+	return telegramCallbackInChatUpdate(chatID, models.ChatTypeGroup, userID, data)
+}
+
+func telegramCallbackDMUpdate(userID int64, data string) models.Update {
+	return telegramCallbackInChatUpdate(userID, models.ChatTypePrivate, userID, data)
+}
+
+func telegramCallbackInChatUpdate(chatID int64, chatType models.ChatType, userID int64, data string) models.Update {
+	msg := &models.Message{
+		ID:   20,
+		Date: int(time.Now().Unix()),
+		Chat: models.Chat{ID: chatID, Type: chatType, Title: "Chat"},
+		Text: "choose",
+	}
+	return models.Update{CallbackQuery: &models.CallbackQuery{
+		ID:      "cbid",
+		From:    models.User{ID: userID, FirstName: "User"},
+		Data:    data,
+		Message: models.MaybeInaccessibleMessage{Type: models.MaybeInaccessibleMessageTypeMessage, Message: msg},
+	}}
+}
+
+func telegramInlineCallbackUpdate(userID int64, data string) models.Update {
+	return models.Update{CallbackQuery: &models.CallbackQuery{
+		ID:              "inline-cbid",
+		From:            models.User{ID: userID, FirstName: "User"},
+		Data:            data,
+		InlineMessageID: "inline-message",
+	}}
+}
+
+func telegramInaccessibleCallbackUpdate(chatID, userID int64, data string) models.Update {
+	return models.Update{CallbackQuery: &models.CallbackQuery{
+		ID:   "inaccessible-cbid",
+		From: models.User{ID: userID, FirstName: "User"},
+		Data: data,
+		Message: models.MaybeInaccessibleMessage{
+			Type: models.MaybeInaccessibleMessageTypeInaccessibleMessage,
+			InaccessibleMessage: &models.InaccessibleMessage{
+				Chat:      models.Chat{ID: chatID, Type: models.ChatTypeGroup, Title: "Chat"},
+				MessageID: 20,
+			},
+		},
+	}}
+}
+
 func TestReconstructReplyCtx(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -777,7 +1082,7 @@ func TestIsDirectedAtBot(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "command without @suffix",
+			name: "group command without @suffix",
 			msg: &models.Message{
 				Text: "/help",
 				Chat: models.Chat{ID: 1, Type: models.ChatTypeGroup},
@@ -785,7 +1090,7 @@ func TestIsDirectedAtBot(t *testing.T) {
 					{Type: models.MessageEntityTypeBotCommand, Offset: 0, Length: 5},
 				},
 			},
-			want: true,
+			want: false,
 		},
 		{
 			name: "command @mybot",
@@ -832,6 +1137,20 @@ func TestIsDirectedAtBot(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "reply to bot naked command",
+			msg: &models.Message{
+				Text: "/help",
+				Chat: models.Chat{ID: 1, Type: models.ChatTypeGroup},
+				Entities: []models.MessageEntity{
+					{Type: models.MessageEntityTypeBotCommand, Offset: 0, Length: 5},
+				},
+				ReplyToMessage: &models.Message{
+					From: &models.User{ID: 42},
+				},
+			},
+			want: true,
+		},
+		{
 			name: "plain text not directed",
 			msg: &models.Message{
 				Text: "hello everyone",
@@ -854,9 +1173,11 @@ func TestIsDirectedAtBot(t *testing.T) {
 func TestHandleMessageWithForumTopic(t *testing.T) {
 	handled := make(chan *core.Message, 1)
 	p := &Platform{
-		token:         "token",
-		httpClient:    &http.Client{},
-		groupReplyAll: true,
+		token:                 "token",
+		httpClient:            &http.Client{},
+		groupReplyAll:         true,
+		shareSessionInChannel: true,
+		contextAuthorizer:     telegramTestAuthorizer(),
 	}
 	p.handler = func(_ core.Platform, msg *core.Message) {
 		handled <- msg
@@ -868,7 +1189,8 @@ func TestHandleMessageWithForumTopic(t *testing.T) {
 	msg := &models.Message{
 		ID:              10,
 		MessageThreadID: 55,
-		Text:            "hello from topic",
+		Text:            "@mybot hello from topic",
+		Entities:        []models.MessageEntity{{Type: models.MessageEntityTypeMention, Offset: 0, Length: 6}},
 		Date:            int(time.Now().Unix()),
 		From:            &models.User{ID: 7, Username: "alice"},
 		Chat: models.Chat{
@@ -883,8 +1205,8 @@ func TestHandleMessageWithForumTopic(t *testing.T) {
 
 	select {
 	case got := <-handled:
-		if got.SessionKey != "telegram:100:55:7" {
-			t.Fatalf("SessionKey = %q, want %q", got.SessionKey, "telegram:100:55:7")
+		if got.SessionKey != "telegram:100:55" {
+			t.Fatalf("SessionKey = %q, want %q", got.SessionKey, "telegram:100:55")
 		}
 		rc := got.ReplyCtx.(replyContext)
 		if rc.threadID != 55 {
@@ -898,9 +1220,11 @@ func TestHandleMessageWithForumTopic(t *testing.T) {
 func TestHandleMessagePrivateTopicUsesThreadID(t *testing.T) {
 	handled := make(chan *core.Message, 1)
 	p := &Platform{
-		token:         "token",
-		httpClient:    &http.Client{},
-		groupReplyAll: true,
+		token:                 "token",
+		httpClient:            &http.Client{},
+		groupReplyAll:         true,
+		shareSessionInChannel: true,
+		contextAuthorizer:     telegramTestAuthorizer(),
 	}
 	p.handler = func(_ core.Platform, msg *core.Message) {
 		handled <- msg
@@ -926,8 +1250,8 @@ func TestHandleMessagePrivateTopicUsesThreadID(t *testing.T) {
 
 	select {
 	case got := <-handled:
-		if got.SessionKey != "telegram:100:55:7" {
-			t.Fatalf("SessionKey = %q, want %q", got.SessionKey, "telegram:100:55:7")
+		if got.SessionKey != "telegram:100:55" {
+			t.Fatalf("SessionKey = %q, want %q", got.SessionKey, "telegram:100:55")
 		}
 		rc := got.ReplyCtx.(replyContext)
 		if rc.threadID != 55 {
@@ -966,7 +1290,7 @@ func newTelegramTestPlatform(t *testing.T, handler func(http.ResponseWriter, *ht
 }
 
 func TestNewProgressStyleDefault(t *testing.T) {
-	p, err := New(map[string]any{"token": "test-token"})
+	p, err := New(telegramContextAuthTestOptions())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -997,10 +1321,9 @@ func TestNewProgressStyleOptions(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			p, err := New(map[string]any{
-				"token":          "test-token",
-				"progress_style": tc.input,
-			})
+			opts := telegramContextAuthTestOptions()
+			opts["progress_style"] = tc.input
+			p, err := New(opts)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error for input %v, got nil", tc.input)
@@ -1035,4 +1358,3 @@ func TestProgressStyleProviderInterface(t *testing.T) {
 		t.Fatalf("ProgressStyle() = %q, want compact", got)
 	}
 }
-

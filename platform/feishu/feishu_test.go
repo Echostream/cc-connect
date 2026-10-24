@@ -1,18 +1,24 @@
 package feishu
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 	lark "github.com/larksuite/oapi-sdk-go/v3"
+	callback "github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
+	larkapplication "github.com/larksuite/oapi-sdk-go/v3/service/application/v6"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
@@ -2301,5 +2307,399 @@ func TestDispatchMessagePostWithFiles(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for dispatched message")
+	}
+}
+
+func TestOwnerDMAndNonOwnerDMRejected(t *testing.T) {
+	// Mutation this catches: Feishu DM keeps using legacy allow_from empty/wildcard
+	// semantics instead of strict dm_allow_from, letting non-owner DMs dispatch.
+	tests := []struct {
+		name         string
+		userID       string
+		wantDispatch bool
+	}{
+		{name: "owner dm", userID: "ou_owner", wantDispatch: true},
+		{name: "non owner dm", userID: "ou_member", wantDispatch: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make(chan *core.Message, 1)
+			p := feishuAuthTestPlatform(t, got)
+
+			err := p.onMessage(context.Background(), feishuTextMessage("om_"+tc.userID, "p2p", tc.userID, tc.userID, "hello", nil))
+			if err != nil {
+				t.Fatalf("onMessage() error = %v", err)
+			}
+			assertFeishuDispatch(t, got, tc.wantDispatch)
+		})
+	}
+}
+
+func TestGroupMembersAuthorizedByChatNotDMIdentity(t *testing.T) {
+	// Mutations this catches: group messages still require dm_allow_from, allowed
+	// groups do not require @bot, or active thread state bypasses mention checks.
+	tests := []struct {
+		name         string
+		chatID       string
+		userID       string
+		mentioned    bool
+		activeThread bool
+		wantDispatch bool
+	}{
+		{name: "trusted group member", chatID: "oc_trusted", userID: "ou_member", mentioned: true, wantDispatch: true},
+		{name: "owner in untrusted group", chatID: "oc_other", userID: "ou_owner", mentioned: true, wantDispatch: false},
+		{name: "trusted group without mention", chatID: "oc_trusted", userID: "ou_member", mentioned: false, wantDispatch: false},
+		{name: "trusted group active thread without mention", chatID: "oc_trusted", userID: "ou_member", mentioned: false, activeThread: true, wantDispatch: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make(chan *core.Message, 1)
+			p := feishuAuthTestPlatform(t, got)
+			p.botOpenID = "ou_bot"
+			p.threadIsolation = true
+			p.activeThreadSessions = sync.Map{}
+			rootID := "om_root_" + tc.name
+			if tc.activeThread {
+				p.activeThreadSessions.Store("feishu:"+tc.chatID+":root:"+rootID, time.Now())
+			}
+			var mentions []*larkim.MentionEvent
+			if tc.mentioned {
+				mentions = []*larkim.MentionEvent{{Key: strPtr("@_user_1"), Id: &larkim.UserId{OpenId: strPtr("ou_bot")}, Name: strPtr("Bot")}}
+			}
+			content := "hello"
+			if tc.mentioned {
+				content = "@_user_1 hello"
+			}
+
+			err := p.onMessage(context.Background(), feishuTextMessageWithRoot("om_"+tc.name, "group", tc.chatID, tc.userID, content, mentions, rootID, rootID))
+			if err != nil {
+				t.Fatalf("onMessage() error = %v", err)
+			}
+			assertFeishuDispatch(t, got, tc.wantDispatch)
+		})
+	}
+}
+
+func TestCardMenuRecallUseConversationAuthorization(t *testing.T) {
+	// Mutations this catches: card/menu/recall keep using legacy allow_from or
+	// allow_chat-only checks and bypass ContextAuthorizer's conversation policy.
+	t.Run("trusted group card", func(t *testing.T) {
+		got := make(chan *core.Message, 1)
+		p := feishuAuthTestPlatform(t, got)
+		_, err := p.onCardAction(feishuCardAction("oc_trusted", "ou_member", "cmd:/help"))
+		if err != nil {
+			t.Fatalf("onCardAction() error = %v", err)
+		}
+		assertFeishuDispatch(t, got, true)
+	})
+
+	t.Run("untrusted group card", func(t *testing.T) {
+		got := make(chan *core.Message, 1)
+		p := feishuAuthTestPlatform(t, got)
+		_, err := p.onCardAction(feishuCardAction("oc_other", "ou_owner", "cmd:/help"))
+		if err != nil {
+			t.Fatalf("onCardAction() error = %v", err)
+		}
+		assertFeishuDispatch(t, got, false)
+	})
+
+	t.Run("non owner dm menu", func(t *testing.T) {
+		got := make(chan *core.Message, 1)
+		p := feishuAuthTestPlatform(t, got)
+		err := p.onBotMenu(feishuBotMenu("ou_member", "/help"))
+		if err != nil {
+			t.Fatalf("onBotMenu() error = %v", err)
+		}
+		assertFeishuDispatch(t, got, false)
+	})
+
+	t.Run("owner dm menu", func(t *testing.T) {
+		got := make(chan *core.Message, 1)
+		p := feishuAuthTestPlatform(t, got)
+		err := p.onBotMenu(feishuBotMenu("ou_owner", "/help"))
+		if err != nil {
+			t.Fatalf("onBotMenu() error = %v", err)
+		}
+		assertFeishuDispatch(t, got, true)
+	})
+
+	t.Run("trusted group recall", func(t *testing.T) {
+		got := make(chan *core.Message, 1)
+		p := feishuAuthTestPlatform(t, got)
+		p.storeMessageAuthContext("om_recalled_trusted", core.ChatContext{Kind: core.ChatKindGroup, ChatID: "oc_trusted", UserID: "ou_member"})
+		err := p.onMessageRecalled(context.Background(), feishuRecall("oc_trusted", "om_recalled_trusted"))
+		if err != nil {
+			t.Fatalf("onMessageRecalled() error = %v", err)
+		}
+		assertFeishuDispatch(t, got, true)
+	})
+
+	t.Run("untrusted group recall", func(t *testing.T) {
+		got := make(chan *core.Message, 1)
+		p := feishuAuthTestPlatform(t, got)
+		p.storeMessageAuthContext("om_recalled_other", core.ChatContext{Kind: core.ChatKindGroup, ChatID: "oc_other", UserID: "ou_owner"})
+		err := p.onMessageRecalled(context.Background(), feishuRecall("oc_other", "om_recalled_other"))
+		if err != nil {
+			t.Fatalf("onMessageRecalled() error = %v", err)
+		}
+		assertFeishuDispatch(t, got, false)
+	})
+
+	t.Run("recall without chat rejected", func(t *testing.T) {
+		got := make(chan *core.Message, 1)
+		p := feishuAuthTestPlatform(t, got)
+		err := p.onMessageRecalled(context.Background(), feishuRecall("", "om_recalled_unknown"))
+		if err != nil {
+			t.Fatalf("onMessageRecalled() error = %v", err)
+		}
+		assertFeishuDispatch(t, got, false)
+	})
+}
+
+func TestFeishuRootThreadSessionKeySharedAcrossMembers(t *testing.T) {
+	p := &Platform{platformName: "feishu", threadIsolation: true}
+	first := p.makeSessionKey(feishuEventMessage("om_msg_a", "group", "oc_chat", "hello", nil, "om_root", "om_root"), "oc_chat", "ou_member_a")
+	second := p.makeSessionKey(feishuEventMessage("om_msg_b", "group", "oc_chat", "hello", nil, "om_root", "om_root"), "oc_chat", "ou_member_b")
+	if first != "feishu:oc_chat:root:om_root" || first != second {
+		t.Fatalf("root thread keys differ: %q %q", first, second)
+	}
+
+	otherRoot := p.makeSessionKey(feishuEventMessage("om_msg_c", "group", "oc_chat", "hello", nil, "om_root_2", "om_root_2"), "oc_chat", "ou_member_a")
+	if otherRoot == first {
+		t.Fatalf("different root reused key %q", otherRoot)
+	}
+	otherChat := p.makeSessionKey(feishuEventMessage("om_msg_d", "group", "oc_other", "hello", nil, "om_root", "om_root"), "oc_other", "ou_member_a")
+	if otherChat == first {
+		t.Fatalf("different chat reused key %q", otherChat)
+	}
+	dmKey := p.makeSessionKey(feishuEventMessage("om_dm", "p2p", "ou_owner", "hello", nil, "", ""), "ou_owner", "ou_owner")
+	if dmKey == first || dmKey != "feishu:ou_owner:ou_owner" {
+		t.Fatalf("dm key = %q, want feishu:ou_owner:ou_owner and distinct from root", dmKey)
+	}
+	fallbackRoot := p.makeSessionKey(feishuEventMessage("om_lonely", "group", "oc_chat", "hello", nil, "", ""), "oc_chat", "ou_member_a")
+	if fallbackRoot != "feishu:oc_chat:root:om_lonely" {
+		t.Fatalf("fallback root key = %q, want message-id root key", fallbackRoot)
+	}
+}
+
+func feishuAuthTestPlatform(t *testing.T, got chan<- *core.Message) *Platform {
+	t.Helper()
+	platformAny, err := New(map[string]any{
+		"app_id":              "cli_auth_test",
+		"app_secret":          "secret_auth_test",
+		"dm_allow_from":       "ou_owner",
+		"allow_chat":          "oc_trusted",
+		"group_member_policy": "all",
+		"enable_feishu_card":  true,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip, ok := platformAny.(*interactivePlatform)
+	if !ok {
+		t.Fatalf("platform type = %T, want *interactivePlatform", platformAny)
+	}
+	p := ip.Platform
+	p.dedup = &core.MessageDedup{}
+	p.handler = func(_ core.Platform, msg *core.Message) { got <- msg }
+	return p
+}
+
+func feishuTextMessage(messageID, chatType, chatID, userID, text string, mentions []*larkim.MentionEvent) *larkim.P2MessageReceiveV1 {
+	return feishuTextMessageWithRoot(messageID, chatType, chatID, userID, text, mentions, "", "")
+}
+
+func feishuTextMessageWithRoot(messageID, chatType, chatID, userID, text string, mentions []*larkim.MentionEvent, rootID, parentID string) *larkim.P2MessageReceiveV1 {
+	return &larkim.P2MessageReceiveV1{
+		Event: &larkim.P2MessageReceiveV1Data{
+			Sender:  &larkim.EventSender{SenderId: &larkim.UserId{OpenId: strPtr(userID)}, SenderType: strPtr("user")},
+			Message: feishuEventMessage(messageID, chatType, chatID, text, mentions, rootID, parentID),
+		},
+	}
+}
+
+func feishuEventMessage(messageID, chatType, chatID, text string, mentions []*larkim.MentionEvent, rootID, parentID string) *larkim.EventMessage {
+	createTime := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	msg := &larkim.EventMessage{
+		MessageId:   strPtr(messageID),
+		ChatId:      strPtr(chatID),
+		ChatType:    strPtr(chatType),
+		MessageType: strPtr("text"),
+		Content:     strPtr(`{"text":"` + text + `"}`),
+		CreateTime:  &createTime,
+		Mentions:    mentions,
+	}
+	if rootID != "" {
+		msg.RootId = strPtr(rootID)
+	}
+	if parentID != "" {
+		msg.ParentId = strPtr(parentID)
+	}
+	return msg
+}
+
+func feishuCardAction(chatID, userID, action string) *callback.CardActionTriggerEvent {
+	return &callback.CardActionTriggerEvent{Event: &callback.CardActionTriggerRequest{
+		Operator: &callback.Operator{OpenID: userID},
+		Action:   &callback.CallBackAction{Value: map[string]any{"action": action}},
+		Context:  &callback.Context{OpenChatID: chatID, OpenMessageID: "om_card_" + chatID},
+	}}
+}
+
+func feishuBotMenu(userID, eventKey string) *larkapplication.P2BotMenuV6 {
+	return &larkapplication.P2BotMenuV6{Event: &larkapplication.P2BotMenuV6Data{
+		Operator: &larkapplication.Operator{OperatorId: &larkapplication.UserId{OpenId: strPtr(userID)}},
+		EventKey: strPtr(eventKey),
+	}}
+}
+
+func feishuRecall(chatID, messageID string) *larkim.P2MessageRecalledV1 {
+	return &larkim.P2MessageRecalledV1{Event: &larkim.P2MessageRecalledV1Data{
+		MessageId: strPtr(messageID),
+		ChatId:    strPtr(chatID),
+	}}
+}
+
+func assertFeishuDispatch(t *testing.T, got <-chan *core.Message, want bool) *core.Message {
+	t.Helper()
+	if want {
+		select {
+		case msg := <-got:
+			return msg
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected dispatched message, got none")
+		}
+	}
+	select {
+	case msg := <-got:
+		t.Fatalf("expected no dispatched message, got %+v", msg)
+	case <-time.After(150 * time.Millisecond):
+	}
+	return nil
+}
+
+func TestFeishuRecallAuthContextCacheLifecycle(t *testing.T) {
+	got := make(chan *core.Message, 1)
+	p := feishuAuthTestPlatform(t, got)
+	base := time.Unix(1000, 0)
+	p.authContextNow = func() time.Time { return base }
+	p.storeMessageAuthContext("om_valid", core.ChatContext{Kind: core.ChatKindGroup, ChatID: "oc_trusted", UserID: "ou_member"})
+	p.storeMessageAuthContext("om_mismatch", core.ChatContext{Kind: core.ChatKindGroup, ChatID: "oc_other", UserID: "ou_member"})
+	p.storeMessageAuthContext("om_untrusted", core.ChatContext{Kind: core.ChatKindGroup, ChatID: "oc_untrusted", UserID: "ou_member"})
+
+	if err := p.onMessageRecalled(context.Background(), feishuRecall("oc_trusted", "om_valid")); err != nil {
+		t.Fatalf("valid recall error = %v", err)
+	}
+	assertFeishuDispatch(t, got, true)
+	if _, ok := p.loadMessageAuthContextForRecall("om_valid", "oc_trusted"); ok {
+		t.Fatal("valid recall context should be consumed and deleted")
+	}
+
+	if err := p.onMessageRecalled(context.Background(), feishuRecall("oc_trusted", "om_mismatch")); err != nil {
+		t.Fatalf("mismatch recall error = %v", err)
+	}
+	assertFeishuDispatch(t, got, false)
+	if _, ok := p.loadMessageAuthContextForRecall("om_mismatch", "oc_other"); !ok {
+		t.Fatal("chat mismatch must not delete otherwise valid context")
+	}
+
+	if err := p.onMessageRecalled(context.Background(), feishuRecall("oc_untrusted", "om_untrusted")); err != nil {
+		t.Fatalf("untrusted recall error = %v", err)
+	}
+	assertFeishuDispatch(t, got, false)
+	if _, ok := p.loadMessageAuthContextForRecall("om_untrusted", "oc_untrusted"); !ok {
+		t.Fatal("authorization reject must not delete context before a valid recall")
+	}
+
+	p.authContextNow = func() time.Time { return base.Add(recalledMessageTTL + time.Millisecond) }
+	if _, ok := p.loadMessageAuthContextForRecall("om_mismatch", "oc_other"); ok {
+		t.Fatal("expired auth context should be pruned")
+	}
+}
+
+func TestFeishuRecallAuthContextCacheCapacityAndStop(t *testing.T) {
+	p := feishuAuthTestPlatform(t, make(chan *core.Message, 1))
+	base := time.Unix(2000, 0)
+	current := base
+	p.authContextNow = func() time.Time { return current }
+	for i := 0; i < maxMessageAuthContexts+5; i++ {
+		current = base.Add(time.Duration(i) * time.Millisecond)
+		p.storeMessageAuthContext(fmt.Sprintf("om_%04d", i), core.ChatContext{Kind: core.ChatKindGroup, ChatID: "oc_trusted", UserID: "ou_member"})
+	}
+	count := 0
+	p.messageAuthContexts.Range(func(_, _ any) bool { count++; return true })
+	if count > maxMessageAuthContexts {
+		t.Fatalf("auth context cache size = %d, want <= %d", count, maxMessageAuthContexts)
+	}
+	if _, ok := p.loadMessageAuthContextForRecall("om_0000", "oc_trusted"); ok {
+		t.Fatal("oldest auth context should be evicted when capacity is exceeded")
+	}
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	count = 0
+	p.messageAuthContexts.Range(func(_, _ any) bool { count++; return true })
+	if count != 0 {
+		t.Fatalf("Stop should clear auth context cache, got %d entries", count)
+	}
+}
+
+func TestFeishuRecallAuthContextCacheConcurrentAccess(t *testing.T) {
+	p := feishuAuthTestPlatform(t, make(chan *core.Message, 1))
+	p.authContextNow = time.Now
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			messageID := fmt.Sprintf("om_concurrent_%d", i)
+			p.storeMessageAuthContext(messageID, core.ChatContext{Kind: core.ChatKindGroup, ChatID: "oc_trusted", UserID: "ou_member"})
+			_, _ = p.loadMessageAuthContextForRecall(messageID, "oc_trusted")
+		}()
+	}
+	wg.Wait()
+}
+
+func TestFeishuContextAuthLogsDoNotExposeRawIdentifiers(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(old)
+
+	got := make(chan *core.Message, 1)
+	p := feishuAuthTestPlatform(t, got)
+	p.botOpenID = "ou_bot_log_secret"
+
+	// no-mention path is a context-auth rejection/drop path and must not log raw chat id.
+	_ = p.onMessage(context.Background(), feishuTextMessage("om_nomention_log_secret", "group", "oc_nomention_log_secret", "ou_nomention_log_secret", "hello", nil))
+	// message authorization reject with explicit @bot.
+	_ = p.onMessage(context.Background(), feishuTextMessage("om_log_secret", "group", "oc_log_secret", "ou_member_log_secret", "@_user_1 hello", []*larkim.MentionEvent{{Key: strPtr("@_user_1"), Id: &larkim.UserId{OpenId: strPtr("ou_bot_log_secret")}, Name: strPtr("Bot")}}))
+	_, _ = p.onCardAction(cardActionEventInChat("oc_card_log_secret", "ou_owner_log_secret", "cmd:/help"))
+	_ = p.onMessageRecalled(context.Background(), feishuRecall("oc_recall_log_secret", "om_recall_log_secret"))
+	_ = p.onBotMenu(feishuBotMenu("ou_menu_log_secret", "/help"))
+
+	var authLines []string
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(line, "channel=feishu") && strings.Contains(line, "event=") && strings.Contains(line, "reason=") {
+			authLines = append(authLines, line)
+		}
+	}
+	logText := strings.Join(authLines, "\n")
+	for _, want := range []string{"event=message", "event=card", "event=recall", "event=menu", "reason=missing_mention", "channel=feishu"} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("context auth log = %q, want fixed field %s", logText, want)
+		}
+	}
+	for _, raw := range []string{
+		"oc_nomention_log_secret", "om_nomention_log_secret", "ou_nomention_log_secret",
+		"oc_log_secret", "om_log_secret", "ou_member_log_secret",
+		"oc_card_log_secret", "ou_owner_log_secret",
+		"oc_recall_log_secret", "om_recall_log_secret",
+		"ou_menu_log_secret", "feishu:oc_log_secret",
+	} {
+		if strings.Contains(logText, raw) {
+			t.Fatalf("context auth log leaked raw identifier %q in %q", raw, logText)
+		}
 	}
 }

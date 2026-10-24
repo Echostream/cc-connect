@@ -106,7 +106,10 @@ type botFactory func(token string, onUpdate func(context.Context, *models.Update
 
 type Platform struct {
 	token                 string
-	allowFrom             string
+	dmAllowFrom           string
+	allowChat             string
+	groupMemberPolicy     string
+	contextAuthorizer     core.ContextAuthorizer
 	groupReplyAll         bool
 	shareSessionInChannel bool
 	enableReactions       bool
@@ -139,8 +142,15 @@ func New(opts map[string]any) (core.Platform, error) {
 	if token == "" {
 		return nil, fmt.Errorf("telegram: token is required")
 	}
-	allowFrom, _ := opts["allow_from"].(string)
-	core.CheckAllowFrom("telegram", allowFrom)
+	if allowFrom, _ := opts["allow_from"].(string); strings.TrimSpace(allowFrom) != "" {
+		return nil, fmt.Errorf("telegram: allow_from is deprecated for context authorization; use dm_allow_from and allow_chat")
+	}
+	dmAllowFrom, _ := opts["dm_allow_from"].(string)
+	allowChat, _ := opts["allow_chat"].(string)
+	groupMemberPolicy, _ := opts["group_member_policy"].(string)
+	if err := validateTelegramContextAuthorizationOptions(dmAllowFrom, allowChat, groupMemberPolicy); err != nil {
+		return nil, err
+	}
 
 	// Build HTTP client with optional proxy support.
 	// Timeout must exceed the server-side long-poll duration (pollTimeout − 1s = 59s)
@@ -182,15 +192,50 @@ func New(opts map[string]any) (core.Platform, error) {
 		}
 	}
 
+	authorizer := core.ContextAuthorizer{
+		DMAllowFrom:       dmAllowFrom,
+		AllowChat:         allowChat,
+		GroupMemberPolicy: groupMemberPolicy,
+	}
 	return &Platform{
 		token:                 token,
-		allowFrom:             allowFrom,
+		dmAllowFrom:           dmAllowFrom,
+		allowChat:             allowChat,
+		groupMemberPolicy:     groupMemberPolicy,
+		contextAuthorizer:     authorizer,
 		groupReplyAll:         groupReplyAll,
 		shareSessionInChannel: shareSessionInChannel,
 		enableReactions:       enableReactions,
 		progressStyle:         progressStyle,
 		httpClient:            httpClient,
 	}, nil
+}
+
+func validateTelegramContextAuthorizationOptions(dmAllowFrom, allowChat, groupMemberPolicy string) error {
+	if !telegramStrictListConfigured(dmAllowFrom) {
+		return fmt.Errorf("telegram: dm_allow_from must be a non-empty exact ID list without wildcard")
+	}
+	if !telegramStrictListConfigured(allowChat) {
+		return fmt.Errorf("telegram: allow_chat must be a non-empty exact chat ID list without wildcard")
+	}
+	if groupMemberPolicy != "all" {
+		return fmt.Errorf("telegram: group_member_policy must be %q", "all")
+	}
+	return nil
+}
+
+func telegramStrictListConfigured(list string) bool {
+	list = strings.TrimSpace(list)
+	if list == "" {
+		return false
+	}
+	for _, item := range strings.Split(list, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" || item == "*" {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *Platform) Name() string { return "telegram" }
@@ -409,6 +454,14 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 		return
 	}
 
+	userID := strconv.FormatInt(msg.From.ID, 10)
+	authCtx := telegramAuthorizationContext(&msg.Chat, msg.From.ID)
+	decision := p.contextAuthorizer.Authorize(authCtx)
+	if !decision.Allowed {
+		p.logContextAuthReject("message", decision.Reason)
+		return
+	}
+
 	userName := msg.From.Username
 	if userName == "" {
 		userName = strings.TrimSpace(msg.From.FirstName + " " + msg.From.LastName)
@@ -429,22 +482,14 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 	sessionKey := p.buildSessionKey(msg.Chat.ID, threadID, msg.From.ID)
 	channelKey := buildChannelKey(msg.Chat.ID, threadID)
 
-	userID := strconv.FormatInt(msg.From.ID, 10)
-	if !core.AllowList(p.allowFrom, userID) {
-		slog.Debug("telegram: message from unauthorized user", "user", userID)
-		return
-	}
-
 	chatName := ""
 	if isGroup {
 		chatName = msg.Chat.Title
 	}
 
-	if isGroup && !p.groupReplyAll {
-		slog.Debug("telegram: checking group message", "text", msg.Text, "is_command", isCommand(msg))
-		if !p.isDirectedAtBot(msg) {
-			return
-		}
+	if isGroup && !p.isDirectedAtBot(msg) {
+		p.logContextAuthReject("message", "missing_mention")
+		return
 	}
 
 	rctx := replyContext{chatID: msg.Chat.ID, threadID: threadID, messageID: msg.ID}
@@ -579,6 +624,30 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 		ChannelKey: channelKey,
 		ReplyCtx:   rctx,
 	}, msg)
+}
+
+func telegramAuthorizationContext(chat *models.Chat, userID int64) core.ChatContext {
+	if chat == nil || userID == 0 || chat.ID == 0 {
+		return core.ChatContext{}
+	}
+	if chat.Type == models.ChatTypePrivate {
+		return core.ChatContext{Kind: core.ChatKindDM, UserID: strconv.FormatInt(userID, 10)}
+	}
+	if chat.Type != models.ChatTypeGroup && chat.Type != models.ChatTypeSupergroup {
+		return core.ChatContext{}
+	}
+	return core.ChatContext{
+		Kind:   core.ChatKindGroup,
+		ChatID: strconv.FormatInt(chat.ID, 10),
+		UserID: strconv.FormatInt(userID, 10),
+	}
+}
+
+func (p *Platform) logContextAuthReject(event, reason string) {
+	if reason == "" {
+		reason = "invalid_context"
+	}
+	slog.Debug("context authorization rejected", "channel", "telegram", "event", event, "reason", reason)
 }
 
 func (p *Platform) dispatchMessage(msg *core.Message, tgMsg *models.Message) {
@@ -781,8 +850,19 @@ func retryLogMessage(cause retryCause) string {
 }
 
 func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQuery) {
+	if cb == nil || cb.Message.Type != models.MaybeInaccessibleMessageTypeMessage || cb.Message.Message == nil {
+		p.logContextAuthReject("callback", "invalid_context")
+		return
+	}
 	msg := cb.Message.Message
-	if msg == nil {
+	if cb.From.ID == 0 {
+		p.logContextAuthReject("callback", "invalid_context")
+		return
+	}
+	authCtx := telegramAuthorizationContext(&msg.Chat, cb.From.ID)
+	decision := p.contextAuthorizer.Authorize(authCtx)
+	if !decision.Allowed {
+		p.logContextAuthReject("callback", decision.Reason)
 		return
 	}
 
@@ -796,11 +876,6 @@ func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQ
 	chatID := msg.Chat.ID
 	msgID := msg.ID
 	userID := strconv.FormatInt(cb.From.ID, 10)
-
-	if !core.AllowList(p.allowFrom, userID) {
-		slog.Debug("telegram: callback from unauthorized user", "user", userID)
-		return
-	}
 
 	// Answer the callback to clear the loading indicator
 	if _, err := bot.AnswerCallbackQuery(ctx, &tgbot.AnswerCallbackQueryParams{CallbackQueryID: cb.ID}); err != nil {
@@ -829,6 +904,10 @@ func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQ
 		chatName = msg.Chat.Title
 	}
 	rctx := replyContext{chatID: chatID, threadID: threadID, messageID: msgID}
+	handler := p.messageHandler()
+	if handler == nil {
+		return
+	}
 
 	emptyMarkup := &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{}}
 
@@ -849,7 +928,7 @@ func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQ
 			slog.Debug("telegram: callback edit failed", "error", err)
 		}
 
-		p.handler(p, &core.Message{
+		handler(p, &core.Message{
 			SessionKey: sessionKey,
 			Platform:   "telegram",
 			UserID:     userID,
@@ -892,7 +971,7 @@ func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQ
 			slog.Debug("telegram: callback edit failed", "error", err)
 		}
 
-		p.handler(p, &core.Message{
+		handler(p, &core.Message{
 			SessionKey: sessionKey,
 			Platform:   "telegram",
 			UserID:     userID,
@@ -943,7 +1022,7 @@ func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQ
 		slog.Debug("telegram: permission callback edit failed", "error", err)
 	}
 
-	p.handler(p, &core.Message{
+	handler(p, &core.Message{
 		SessionKey:           sessionKey,
 		Platform:             "telegram",
 		UserID:               userID,
@@ -959,7 +1038,7 @@ func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQ
 
 // isDirectedAtBot checks whether a group message is directed at this bot:
 //   - Command with @thisbot suffix (e.g. /help@thisbot)
-//   - Command without @suffix (broadcast to all bots — accept it)
+//   - Command without @suffix is not directed in groups unless it replies to bot
 //   - Command with @otherbot suffix → reject
 //   - Non-command: accept if bot is @mentioned or message is a reply to bot
 func (p *Platform) isDirectedAtBot(msg *models.Message) bool {
@@ -972,7 +1051,16 @@ func (p *Platform) isDirectedAtBot(msg *models.Message) bool {
 	}
 	botName := self.Username
 
-	// Commands: /cmd or /cmd@botname
+	// Reply-to-bot is an explicit per-message direction signal, including for
+	// bare slash commands such as /status. Plain group slash commands without an
+	// @bot suffix are otherwise broadcast commands and must not trigger this bot.
+	if msg.ReplyToMessage != nil && msg.ReplyToMessage.From != nil {
+		if msg.ReplyToMessage.From.ID == self.ID {
+			return true
+		}
+	}
+
+	// Commands: /cmd@botname is directed, /cmd without @suffix is not.
 	if isCommand(msg) {
 		atIdx := strings.Index(msg.Text, "@")
 		spaceIdx := strings.Index(msg.Text, " ")
@@ -982,11 +1070,9 @@ func (p *Platform) isDirectedAtBot(msg *models.Message) bool {
 		}
 		if atIdx > 0 && atIdx < cmdEnd {
 			target := msg.Text[atIdx+1 : cmdEnd]
-			slog.Debug("telegram: command with @suffix", "bot", botName, "target", target, "match", strings.EqualFold(target, botName))
 			return strings.EqualFold(target, botName)
 		}
-		slog.Debug("telegram: command without @suffix, accepting", "bot", botName, "text", msg.Text)
-		return true // /cmd without @suffix — accept
+		return false
 	}
 
 	// Non-command: check @mention
@@ -994,19 +1080,10 @@ func (p *Platform) isDirectedAtBot(msg *models.Message) bool {
 		for _, e := range msg.Entities {
 			if e.Type == models.MessageEntityTypeMention {
 				mention := extractEntityText(msg.Text, e.Offset, e.Length)
-				slog.Debug("telegram: checking mention", "bot", botName, "mention", mention, "match", strings.EqualFold(mention, "@"+botName))
 				if strings.EqualFold(mention, "@"+botName) {
 					return true
 				}
 			}
-		}
-	}
-
-	// Check if replying to a message from this bot
-	if msg.ReplyToMessage != nil && msg.ReplyToMessage.From != nil {
-		slog.Debug("telegram: checking reply", "bot_id", self.ID, "reply_from_id", msg.ReplyToMessage.From.ID)
-		if msg.ReplyToMessage.From.ID == self.ID {
-			return true
 		}
 	}
 
@@ -1022,7 +1099,6 @@ func (p *Platform) isDirectedAtBot(msg *models.Message) bool {
 		}
 	}
 
-	slog.Debug("telegram: ignoring group message not directed at bot", "chat", msg.Chat.ID, "bot", botName, "text", msg.Text, "entities", msg.Entities)
 	return false
 }
 

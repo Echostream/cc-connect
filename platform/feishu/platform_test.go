@@ -1697,22 +1697,23 @@ func TestAllowChat_FiltersGroupMessages(t *testing.T) {
 		chatType  string
 		wantPass  bool
 	}{
-		{"empty allow_chat permits all groups", "", "oc_abc", "group", true},
-		{"wildcard permits all groups", "*", "oc_abc", "group", true},
 		{"matching chat_id passes", "oc_abc", "oc_abc", "group", true},
 		{"non-matching chat_id blocked", "oc_abc", "oc_xyz", "group", false},
 		{"multiple chat_ids, match second", "oc_abc,oc_xyz", "oc_xyz", "group", true},
 		{"multiple chat_ids, no match", "oc_abc,oc_def", "oc_xyz", "group", false},
-		{"private chat bypasses allow_chat filter", "oc_abc", "oc_xyz", "p2p", true},
+		{"private chat uses dm_allow_from and bypasses allow_chat", "oc_abc", "ou_owner", "p2p", true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p, err := newPlatform("feishu", lark.FeishuBaseUrl, map[string]any{
-				"app_id": "cli_xxx", "app_secret": "secret",
-				"enable_feishu_card": true,
-				"group_reply_all":    true,
-				"allow_chat":         tt.allowChat,
+				"app_id":              "cli_xxx",
+				"app_secret":          "secret",
+				"enable_feishu_card":  true,
+				"group_reply_all":     true,
+				"dm_allow_from":       "ou_owner",
+				"allow_chat":          tt.allowChat,
+				"group_member_policy": "all",
 			})
 			if err != nil {
 				t.Fatalf("newPlatform() error = %v", err)
@@ -1721,6 +1722,9 @@ func TestAllowChat_FiltersGroupMessages(t *testing.T) {
 
 			messageID := "om_test_" + tt.name
 			openID := "ou_test"
+			if tt.chatType == "p2p" {
+				openID = "ou_owner"
+			}
 			msgType := "text"
 			senderType := "user"
 			content := `{"text":"hello"}`
@@ -1759,6 +1763,23 @@ func TestAllowChat_FiltersGroupMessages(t *testing.T) {
 				if tt.wantPass {
 					t.Fatal("expected message to pass allow_chat filter, but it was blocked")
 				}
+			}
+		})
+	}
+}
+
+func TestAllowChatRejectsEmptyAndWildcardConfiguration(t *testing.T) {
+	for _, allowChat := range []string{"", "*", "oc_abc,*"} {
+		t.Run("allow_chat="+allowChat, func(t *testing.T) {
+			_, err := newPlatform("feishu", lark.FeishuBaseUrl, map[string]any{
+				"app_id":              "cli_xxx",
+				"app_secret":          "secret",
+				"dm_allow_from":       "ou_owner",
+				"allow_chat":          allowChat,
+				"group_member_policy": "all",
+			})
+			if err == nil || !strings.Contains(err.Error(), "allow_chat") {
+				t.Fatalf("newPlatform() error = %v, want allow_chat rejection", err)
 			}
 		})
 	}

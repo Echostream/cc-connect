@@ -126,6 +126,8 @@ type Platform struct {
 	doneEmoji                  string
 	allowFrom                  string
 	allowChat                  string
+	contextAuthConfigured      bool
+	authorizer                 core.ContextAuthorizer
 	groupOnly                  bool
 	groupReplyAll              bool
 	respondToAtEveryoneAndHere bool
@@ -150,18 +152,18 @@ type Platform struct {
 	// Issue #1618: previous behavior treated botOpenID=="" as "filter off", which
 	// silently turned the bot into a loud responder for the rest of the process
 	// lifetime when the bot-info API failed.
-	groupFilterDegraded     bool
-	groupFilterDegradedAt   time.Time
-	groupFilterDegradedErr  string
-	groupFilterRetryCancel  context.CancelFunc
-	groupFilterRetryStop    chan struct{}
-	peerBots                map[string]string // app_id -> friendly alias, for quoted-reply attribution
-	mentionMap       map[string]string // agent name -> open_id (for outbound @ resolution)
-	userNameCache    sync.Map          // open_id -> display name
-	chatNameCache    sync.Map          // chat_id -> chat name
-	chatMemberCache  sync.Map          // chatID -> *chatMemberEntry
-	recalledMu       sync.Mutex
-	recalledMsgIDs   map[string]time.Time // message_id -> recall time, short TTL race guard
+	groupFilterDegraded    bool
+	groupFilterDegradedAt  time.Time
+	groupFilterDegradedErr string
+	groupFilterRetryCancel context.CancelFunc
+	groupFilterRetryStop   chan struct{}
+	peerBots               map[string]string // app_id -> friendly alias, for quoted-reply attribution
+	mentionMap             map[string]string // agent name -> open_id (for outbound @ resolution)
+	userNameCache          sync.Map          // open_id -> display name
+	chatNameCache          sync.Map          // chat_id -> chat name
+	chatMemberCache        sync.Map          // chatID -> *chatMemberEntry
+	recalledMu             sync.Mutex
+	recalledMsgIDs         map[string]time.Time // message_id -> recall time, short TTL race guard
 	// Webhook mode fields (for Lark international version)
 	server       *http.Server
 	port         string
@@ -181,6 +183,9 @@ type Platform struct {
 	// without requiring another @bot mention. Value is the last-seen time so
 	// stale entries can be expired by a future TTL sweep if needed.
 	activeThreadSessions sync.Map // sessionKey -> time.Time
+	authContextMu        sync.Mutex
+	messageAuthContexts  sync.Map // messageID -> messageAuthContextEntry for callback/recall authorization
+	authContextNow       func() time.Time
 
 	richCardImageMu         sync.Mutex
 	richCardImageResolved   map[string]string
@@ -345,8 +350,30 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		doneEmoji = ""
 	}
 	allowFrom, _ := opts["allow_from"].(string)
-	core.CheckAllowFrom(name, allowFrom)
-	allowChat, _ := opts["allow_chat"].(string)
+	if strings.TrimSpace(allowFrom) != "" {
+		return nil, fmt.Errorf("%s: allow_from is not supported for Feishu conversation authorization; use dm_allow_from", name)
+	}
+	dmAllowFrom, dmAllowFromSet := opts["dm_allow_from"].(string)
+	allowChat, allowChatSet := opts["allow_chat"].(string)
+	groupMemberPolicy, groupMemberPolicySet := opts["group_member_policy"].(string)
+	contextAuthConfigured := dmAllowFromSet || allowChatSet || groupMemberPolicySet
+	if contextAuthConfigured {
+		if dmAllowFromSet && strings.TrimSpace(dmAllowFrom) == "" {
+			return nil, fmt.Errorf("%s: dm_allow_from must not be empty when set", name)
+		}
+		if allowChatSet && strings.TrimSpace(allowChat) == "" {
+			return nil, fmt.Errorf("%s: allow_chat must not be empty when set", name)
+		}
+		if containsWildcardListItem(dmAllowFrom) {
+			return nil, fmt.Errorf("%s: dm_allow_from must not contain wildcard", name)
+		}
+		if containsWildcardListItem(allowChat) {
+			return nil, fmt.Errorf("%s: allow_chat must not contain wildcard", name)
+		}
+		if strings.TrimSpace(groupMemberPolicy) != "" && strings.TrimSpace(groupMemberPolicy) != "all" {
+			return nil, fmt.Errorf("%s: unsupported group_member_policy %q", name, groupMemberPolicy)
+		}
+	}
 	groupOnly, _ := opts["group_only"].(bool)
 	groupReplyAll, _ := opts["group_reply_all"].(bool)
 	// require_mention = false is equivalent to group_reply_all = true:
@@ -454,16 +481,22 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	}
 
 	base := &Platform{
-		platformName:               name,
-		domain:                     domain,
-		appID:                      appID,
-		appSecret:                  appSecret,
-		progressStyle:              progressStyle,
-		useInteractiveCard:         useInteractiveCard,
-		reactionEmoji:              reactionEmoji,
-		doneEmoji:                  doneEmoji,
-		allowFrom:                  allowFrom,
-		allowChat:                  allowChat,
+		platformName:          name,
+		domain:                domain,
+		appID:                 appID,
+		appSecret:             appSecret,
+		progressStyle:         progressStyle,
+		useInteractiveCard:    useInteractiveCard,
+		reactionEmoji:         reactionEmoji,
+		doneEmoji:             doneEmoji,
+		allowFrom:             allowFrom,
+		allowChat:             allowChat,
+		contextAuthConfigured: contextAuthConfigured,
+		authorizer: core.ContextAuthorizer{
+			DMAllowFrom:       dmAllowFrom,
+			AllowChat:         allowChat,
+			GroupMemberPolicy: groupMemberPolicy,
+		},
 		groupOnly:                  groupOnly,
 		groupReplyAll:              groupReplyAll,
 		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
@@ -492,6 +525,39 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	wrapped := &interactivePlatform{Platform: base}
 	base.self = wrapped
 	return wrapped, nil
+}
+
+func containsWildcardListItem(list string) bool {
+	for _, item := range strings.Split(list, ",") {
+		if strings.TrimSpace(item) == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+func isFeishuGroupChatType(chatType string) bool {
+	return chatType == "group" || chatType == "topic_group"
+}
+
+func (p *Platform) authorizeConversation(chatType, chatID, userID string) (core.ChatContext, core.AuthorizationDecision) {
+	var authCtx core.ChatContext
+	switch chatType {
+	case "p2p":
+		authCtx = core.ChatContext{Kind: core.ChatKindDM, UserID: userID}
+	case "group", "topic_group":
+		authCtx = core.ChatContext{Kind: core.ChatKindGroup, ChatID: chatID, UserID: userID}
+	default:
+		return core.ChatContext{}, core.AuthorizationDecision{Allowed: false, Reason: "invalid_context"}
+	}
+	return authCtx, p.authorizer.Authorize(authCtx)
+}
+
+func (p *Platform) authorizeCardAction(chatID, userID string) core.AuthorizationDecision {
+	if strings.TrimSpace(chatID) == "" || strings.TrimSpace(userID) == "" {
+		return core.AuthorizationDecision{Allowed: false, Reason: "invalid_context"}
+	}
+	return p.authorizer.Authorize(core.ChatContext{Kind: core.ChatKindGroup, ChatID: chatID, UserID: userID})
 }
 
 func (p *Platform) Name() string { return p.platformName }
@@ -747,13 +813,6 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		return nil, nil
 	}
 
-	// Check allow_chat filter: skip card actions from chats this platform doesn't own.
-	if event.Event.Context != nil && event.Event.Context.OpenChatID != "" {
-		if !core.AllowList(p.allowChat, event.Event.Context.OpenChatID) {
-			return nil, nil
-		}
-	}
-
 	actionVal, _ := event.Event.Action.Value["action"].(string)
 
 	// select_static callbacks put the chosen value in event.Event.Action.Option
@@ -780,21 +839,20 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		userID = event.Event.Operator.OpenID
 	}
 
-	// Check allow_from filter: skip card actions from users not authorized to
-	// command the agent. This mirrors the plain-text message handler's check so
-	// that clicking a card button (cmd:/perm:/nav:/act:/askq:) cannot bypass
-	// the per-user allowlist when the chat-level allow_chat filter admits the
-	// chat (Issue #1852).
-	if userID == "" || !core.AllowList(p.allowFrom, userID) {
-		slog.Debug(p.tag()+": card action from unauthorized user", "user", userID)
-		return nil, nil
-	}
-
 	chatID := ""
 	messageID := ""
 	if event.Event.Context != nil {
 		chatID = event.Event.Context.OpenChatID
 		messageID = event.Event.Context.OpenMessageID
+	}
+	if p.contextAuthConfigured {
+		if decision := p.authorizeCardAction(chatID, userID); !decision.Allowed {
+			p.logContextAuthReject("card", decision.Reason)
+			return nil, nil
+		}
+	} else if userID == "" || !core.AllowList(p.allowFrom, userID) {
+		slog.Debug(p.tag()+": card action from unauthorized user", "user", userID)
+		return nil, nil
 	}
 	if chatID == "" {
 		chatID = userID
@@ -1060,7 +1118,125 @@ func (p *Platform) AddDoneReaction(rctx any) {
 
 const recalledMessageTTL = 10 * time.Minute
 
+// maxMessageAuthContexts bounds the authorized-message recall cache. The TTL
+// intentionally reuses recalledMessageTTL so both recall race guards live for
+// the same short operational window; the cache stores only ChatContext metadata
+// needed to authorize callbacks/recalls, never message body or attachments.
+const maxMessageAuthContexts = 1024
+
 const cardNavTimeout = 2500 * time.Millisecond
+
+type messageAuthContextEntry struct {
+	ctx      core.ChatContext
+	storedAt time.Time
+}
+
+func (p *Platform) messageAuthNow() time.Time {
+	if p.authContextNow != nil {
+		return p.authContextNow()
+	}
+	return time.Now()
+}
+
+func (p *Platform) storeMessageAuthContext(messageID string, ctx core.ChatContext) {
+	messageID = strings.TrimSpace(messageID)
+	if messageID == "" {
+		return
+	}
+	entry := messageAuthContextEntry{ctx: ctx, storedAt: p.messageAuthNow()}
+	p.authContextMu.Lock()
+	defer p.authContextMu.Unlock()
+	p.messageAuthContexts.Store(messageID, entry)
+	p.pruneMessageAuthContextsLocked(entry.storedAt)
+}
+
+func (p *Platform) loadMessageAuthContextForRecall(messageID, chatID string) (core.ChatContext, bool) {
+	messageID = strings.TrimSpace(messageID)
+	if messageID == "" {
+		return core.ChatContext{}, false
+	}
+	now := p.messageAuthNow()
+	p.authContextMu.Lock()
+	defer p.authContextMu.Unlock()
+	p.pruneMessageAuthContextsLocked(now)
+	raw, ok := p.messageAuthContexts.Load(messageID)
+	if !ok {
+		return core.ChatContext{}, false
+	}
+	entry, ok := raw.(messageAuthContextEntry)
+	if !ok {
+		p.messageAuthContexts.Delete(messageID)
+		return core.ChatContext{}, false
+	}
+	if now.Sub(entry.storedAt) > recalledMessageTTL {
+		p.messageAuthContexts.Delete(messageID)
+		return core.ChatContext{}, false
+	}
+	if entry.ctx.ChatID != chatID {
+		return core.ChatContext{}, false
+	}
+	return entry.ctx, true
+}
+
+func (p *Platform) deleteMessageAuthContext(messageID string) {
+	messageID = strings.TrimSpace(messageID)
+	if messageID == "" {
+		return
+	}
+	p.authContextMu.Lock()
+	defer p.authContextMu.Unlock()
+	p.messageAuthContexts.Delete(messageID)
+}
+
+func (p *Platform) clearMessageAuthContexts() {
+	p.authContextMu.Lock()
+	defer p.authContextMu.Unlock()
+	p.messageAuthContexts.Range(func(key, _ any) bool {
+		p.messageAuthContexts.Delete(key)
+		return true
+	})
+}
+
+func (p *Platform) pruneMessageAuthContextsLocked(now time.Time) {
+	count := 0
+	oldestKey := any(nil)
+	oldestAt := time.Time{}
+	p.messageAuthContexts.Range(func(key, value any) bool {
+		entry, ok := value.(messageAuthContextEntry)
+		if !ok || now.Sub(entry.storedAt) > recalledMessageTTL {
+			p.messageAuthContexts.Delete(key)
+			return true
+		}
+		count++
+		if oldestKey == nil || entry.storedAt.Before(oldestAt) {
+			oldestKey = key
+			oldestAt = entry.storedAt
+		}
+		return true
+	})
+	for count > maxMessageAuthContexts && oldestKey != nil {
+		p.messageAuthContexts.Delete(oldestKey)
+		count--
+		oldestKey = nil
+		oldestAt = time.Time{}
+		p.messageAuthContexts.Range(func(key, value any) bool {
+			entry, ok := value.(messageAuthContextEntry)
+			if !ok {
+				p.messageAuthContexts.Delete(key)
+				return true
+			}
+			if oldestKey == nil || entry.storedAt.Before(oldestAt) {
+				oldestKey = key
+				oldestAt = entry.storedAt
+			}
+			return true
+		})
+	}
+}
+
+func (p *Platform) logContextAuthReject(event, reason string) {
+	slog.Debug(p.tag()+": context authorization rejected", "channel", p.platformName, "event", event, "reason", reason)
+}
 
 func (p *Platform) markMessageRecalled(messageID string) {
 	messageID = strings.TrimSpace(messageID)
@@ -1388,7 +1564,18 @@ func (p *Platform) onMessageRecalled(_ context.Context, event *larkim.P2MessageR
 		slog.Debug(p.tag()+": recall event without message id", "chat_id", chatID)
 		return nil
 	}
-	if chatID != "" && !core.AllowList(p.allowChat, chatID) {
+	if p.contextAuthConfigured {
+		authCtx, ok := p.loadMessageAuthContextForRecall(messageID, chatID)
+		if !ok {
+			p.logContextAuthReject("recall", "invalid_context")
+			return nil
+		}
+		if decision := p.authorizer.Authorize(authCtx); !decision.Allowed {
+			p.logContextAuthReject("recall", decision.Reason)
+			return nil
+		}
+		p.deleteMessageAuthContext(messageID)
+	} else if chatID != "" && !core.AllowList(p.allowChat, chatID) {
 		slog.Debug(p.tag()+": recall event from unauthorized chat", "chat_id", chatID, "message_id", messageID)
 		return nil
 	}
@@ -1486,26 +1673,20 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// emit a periodic warning, instead of failing open.
 	botOpenID := p.getBotOpenID()
 	filterActive := botOpenID != "" || p.IsGroupFilterDegraded()
-	if chatType == "group" && !p.groupReplyAll && filterActive {
+	if isFeishuGroupChatType(chatType) && !p.groupReplyAll && filterActive {
 		if !isBotMentioned(msg.Mentions, botOpenID) {
+			if p.contextAuthConfigured {
+				p.logContextAuthReject("message", "missing_mention")
+				return nil
+			}
 			switch {
-			// Feishu @all sends {"text":"@_all"} with 0 mentions.
 			case p.respondToAtEveryoneAndHere && msg.Content != nil && strings.Contains(*msg.Content, "@_all"):
 				slog.Debug(p.tag()+": responding to @all message", "chat_id", chatID)
-			// Once a thread has been engaged via @bot, allow follow-up
-			// attachment-only messages (image/file/audio) in the same thread
-			// through without re-mentioning the bot. Plain text and rich-text
-			// posts still require an explicit @bot to avoid pulling in
-			// unrelated chatter.
 			case p.threadIsolation && isAttachmentMsgType(msgType) && p.isActiveThreadSession(sessionKey):
 				slog.Debug(p.tag()+": passing attachment through active thread without mention",
 					"chat_id", chatID, "session_key", sessionKey, "msg_type", msgType, "message_id", messageID)
 			default:
 				if p.IsGroupFilterDegraded() && botOpenID == "" {
-					// Fail closed: drop the message. Use WARN (not
-					// ERROR) here per-message to avoid log floods;
-					// the supervisor already emits a periodic ERROR
-					// with the underlying cause.
 					slog.Warn(p.tag()+": group filter degraded; dropping non-mention group message (use /status to inspect)",
 						"chat_id", chatID,
 						"message_id", messageID,
@@ -1518,17 +1699,30 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 		}
 	}
 
-	if !core.AllowList(p.allowFrom, userID) {
-		slog.Debug(p.tag()+": message from unauthorized user", "user", userID)
-		p.replyUnauthorizedAccess(ctx, replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey})
-		return nil
-	}
+	var authCtx core.ChatContext
+	if p.contextAuthConfigured {
+		var decision core.AuthorizationDecision
+		authCtx, decision = p.authorizeConversation(chatType, chatID, userID)
+		if !decision.Allowed {
+			p.logContextAuthReject("message", decision.Reason)
+			if chatType == "p2p" {
+				p.replyUnauthorizedAccess(ctx, replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey})
+			}
+			return nil
+		}
+	} else {
+		if !core.AllowList(p.allowFrom, userID) {
+			slog.Debug(p.tag()+": message from unauthorized user", "user", userID)
+			p.replyUnauthorizedAccess(ctx, replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey})
+			return nil
+		}
 
-	if chatType == "group" && !core.AllowList(p.allowChat, chatID) {
-		slog.Debug(p.tag()+": message from unauthorized chat", "chat_id", chatID)
-		return nil
+		if chatType == "group" && !core.AllowList(p.allowChat, chatID) {
+			slog.Debug(p.tag()+": message from unauthorized chat", "chat_id", chatID)
+			return nil
+		}
 	}
-	if chatType != "group" && p.groupOnly {
+	if !isFeishuGroupChatType(chatType) && p.groupOnly {
 		slog.Debug(p.tag()+": p2p message skipped (group_only=true)", "chat_type", chatType)
 		return nil
 	}
@@ -1547,6 +1741,9 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	parentID := stringValue(msg.ParentId)
 
 	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+	if p.contextAuthConfigured && messageID != "" {
+		p.storeMessageAuthContext(messageID, authCtx)
+	}
 	slog.Debug(p.tag()+": routed inbound message",
 		"message_id", messageID,
 		"session_key", sessionKey,
@@ -5171,6 +5368,7 @@ func (p *Platform) Stop() error {
 	}
 	// Flush any pending image batches so buffered images aren't lost on shutdown.
 	p.flushImageBatches()
+	p.clearMessageAuthContexts()
 	return nil
 }
 
@@ -5469,7 +5667,13 @@ func (p *Platform) onBotMenu(event *larkapplication.P2BotMenuV6) error {
 		return nil
 	}
 
-	if !core.AllowList(p.allowFrom, userID) {
+	if p.contextAuthConfigured {
+		decision := p.authorizer.Authorize(core.ChatContext{Kind: core.ChatKindDM, UserID: userID})
+		if !decision.Allowed {
+			p.logContextAuthReject("menu", decision.Reason)
+			return nil
+		}
+	} else if !core.AllowList(p.allowFrom, userID) {
 		slog.Debug(p.tag()+": menu event from unauthorized user", "user", userID, "event_key", eventKey)
 		return nil
 	}
