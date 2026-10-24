@@ -481,17 +481,74 @@ func (s *captureEngineScheduler) taskAt(t *testing.T, index int) ProjectTask {
 	return ProjectTask{}
 }
 
-func TestNewEngineUsesInjectedProjectSchedulerIdentity(t *testing.T) {
+func TestNewEngineUsesInjectedSchedulerOptionsIdentity(t *testing.T) {
 	// Catches: NewEngine computes an injected scheduler option but still assigns a
 	// freshly-created scheduler, masking main wiring and fake-scheduler tests.
-	injected := &captureEngineScheduler{}
-	e := NewEngine("test", &stubAgent{}, []Platform{&stubPlatformEngine{n: "test"}}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(injected))
-	if e.projectScheduler != injected {
-		t.Fatalf("NewEngine projectScheduler = %T %p, want injected %p", e.projectScheduler, e.projectScheduler, injected)
+	cases := []struct {
+		name string
+		opt  func(EngineScheduler) EngineOption
+	}{
+		{name: "neutral WithScheduler", opt: WithScheduler},
+		{name: "compat WithProjectScheduler", opt: WithProjectScheduler},
 	}
-	_ = e.Stop()
-	if !injected.stopped {
-		t.Fatal("Engine.Stop did not stop injected scheduler")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			injected := &captureEngineScheduler{}
+			e := NewEngine("test", &stubAgent{}, []Platform{&stubPlatformEngine{n: "test"}}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, tc.opt(injected))
+			if e.projectScheduler != injected {
+				t.Fatalf("NewEngine projectScheduler = %T %p, want injected %p", e.projectScheduler, e.projectScheduler, injected)
+			}
+			_ = e.Stop()
+			if !injected.stopped {
+				t.Fatal("Engine.Stop did not stop injected scheduler")
+			}
+		})
+	}
+}
+
+func TestNewEngineWithNilSchedulerOptionKeepsDefaultProjectSchedulerAndStopCleanup(t *testing.T) {
+	// Catches: the neutral scheduler option accidentally disables the default
+	// ProjectScheduler path or makes Engine.Stop skip accepted task cleanup.
+	e := NewEngine("test", &stubAgent{}, []Platform{&stubPlatformEngine{n: "test"}}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithScheduler(nil))
+	scheduler, ok := e.projectScheduler.(*ProjectScheduler)
+	if !ok {
+		t.Fatalf("NewEngine default scheduler = %T, want *ProjectScheduler", e.projectScheduler)
+	}
+
+	started := make(chan struct{})
+	cleaned := make(chan struct{}, 1)
+	releaseRun := make(chan struct{})
+	result := scheduler.Submit(ProjectTask{
+		ID:         "default-stop-cleanup",
+		SessionKey: "test:default",
+		Run: func(ctx context.Context) TaskResult {
+			close(started)
+			select {
+			case <-releaseRun:
+				return TaskResult{State: TaskStateCompleted}
+			case <-ctx.Done():
+				return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+			}
+		},
+		Cleanup: func() { cleaned <- struct{}{} },
+	})
+	if result.Status != SubmitStarted {
+		t.Fatalf("Submit status = %s, want %s", result.Status, SubmitStarted)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for default scheduler task to start")
+	}
+
+	if err := e.Stop(); err != nil {
+		t.Fatalf("Engine.Stop() error = %v", err)
+	}
+	close(releaseRun)
+	select {
+	case <-cleaned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for default scheduler cleanup")
 	}
 }
 

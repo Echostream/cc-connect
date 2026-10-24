@@ -390,7 +390,7 @@ type Engine struct {
 	cronScheduler                 *CronScheduler
 	timerScheduler                *TimerScheduler
 	heartbeatScheduler            *HeartbeatScheduler
-	projectScheduler              EngineProjectScheduler
+	projectScheduler              EngineScheduler
 	projectSchedulerStopTimeout   time.Duration
 	projectSchedulerCancelTimeout time.Duration
 	agentSessionCloseTimeout      time.Duration
@@ -773,7 +773,21 @@ func (pp *pendingPermission) resolve() {
 	pp.resolveOnce.Do(func() { close(pp.Resolved) })
 }
 
-type EngineProjectScheduler interface {
+// EngineScheduler coordinates Engine work that must be accepted, queued,
+// rejected, cancelled, stopped, or observed consistently by the runtime.
+//
+// Submit and SubmitOnlyIfIdle define ownership transfer: SubmitStarted and
+// SubmitQueued mean the scheduler owns the ProjectTask until it reaches a
+// terminal TaskResult and must call ProjectTask.Cleanup exactly once; any
+// SubmitRejected* status means the caller keeps ownership and must clean up.
+// CancelSessionContext requests cancellation for work in the supplied session
+// scope and reports whether any accepted work is still draining. Stop rejects
+// later submissions and cleans up all accepted active or waiting tasks before it
+// returns or the context expires. TryBeginLocalMutation reserves a scheduler
+// mutation window only when the runtime considers that safe; callers must invoke
+// the returned release function exactly once. Snapshot returns a point-in-time
+// runtime view for status and management surfaces.
+type EngineScheduler interface {
 	Submit(ProjectTask) SubmitResult
 	SubmitOnlyIfIdle(ProjectTask) SubmitResult
 	TryBeginLocalMutation(context.Context) (func(), bool)
@@ -782,16 +796,24 @@ type EngineProjectScheduler interface {
 	Stop(context.Context)
 }
 
+// EngineProjectScheduler is kept as a compatibility alias for callers that used
+// the pre-neutral scheduler name. New code should use EngineScheduler.
+type EngineProjectScheduler = EngineScheduler
+
 type EngineOption func(*engineOptions)
 
 type engineOptions struct {
-	projectScheduler EngineProjectScheduler
+	projectScheduler EngineScheduler
 }
 
-func WithProjectScheduler(scheduler EngineProjectScheduler) EngineOption {
+func WithScheduler(scheduler EngineScheduler) EngineOption {
 	return func(opts *engineOptions) {
 		opts.projectScheduler = scheduler
 	}
+}
+
+func WithProjectScheduler(scheduler EngineProjectScheduler) EngineOption {
+	return WithScheduler(scheduler)
 }
 
 func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath string, lang Language, opts ...EngineOption) *Engine {
