@@ -2959,8 +2959,17 @@ func (e *Engine) handleInteractiveSubmitResult(p Platform, msg *Message, result 
 		if result.Status == SubmitQueued {
 			slog.Info("message queued in project scheduler", "session", msg.SessionKey, "msg_id", msg.MessageID, "position", result.Position)
 		}
+		if result.Feedback == SubmitFeedbackQueued {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
+		}
 		return true
-	case SubmitRejectedFull, SubmitRejectedBusy, SubmitRejectedNotificationBacklog:
+	case SubmitRejectedFull:
+		if result.Feedback == SubmitFeedbackQueueFull {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgQueueFull), result.QueueDepth))
+		} else {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
+		}
+	case SubmitRejectedBusy, SubmitRejectedNotificationBacklog:
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 	case SubmitRejectedStopped:
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), "project scheduler stopped"))

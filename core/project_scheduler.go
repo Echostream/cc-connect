@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -56,26 +57,57 @@ type runFinishedCommand struct {
 	result TaskResult
 }
 
+type taskCompletionFinishedCommand struct {
+	active *activeTask
+}
+
+type detachedTaskCompletionFinishedCommand struct {
+	sessionKey string
+	generation *projectCompletionGeneration
+}
+
 type terminalNotification struct {
 	publish func(TaskResult)
 	result  TaskResult
 	release func()
 }
 
+type terminalNotifier struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	queue  []terminalNotification
+	closed bool
+}
+
 type cancelSessionWaiter struct {
-	done   chan struct{}
-	result CancelResult
+	done        chan struct{}
+	waitActive  *activeTask
+	generations []*projectCompletionGeneration
+}
+
+type projectCompletionGeneration struct {
+	remaining int
+}
+
+type projectDetachedCompletion struct {
+	sessionKey string
+	completion *taskCompletion
+	result     TaskResult
+	generation *projectCompletionGeneration
 }
 
 type notificationSlots struct {
-	tokens chan struct{}
+	mu              sync.Mutex
+	logicalCapacity int
+	pendingCount    int
 }
 
 type taskCompletion struct {
-	cleanup func()
-	publish func(TaskResult)
-	release func()
-	once    sync.Once
+	cleanup  func()
+	publish  func(TaskResult)
+	release  func()
+	notifier *terminalNotifier
+	once     sync.Once
 }
 
 type activeTask struct {
@@ -84,6 +116,7 @@ type activeTask struct {
 	completion *taskCompletion
 	deadline   time.Time
 	decision   string
+	completing bool
 }
 
 type schedulerLoop struct {
@@ -92,16 +125,20 @@ type schedulerLoop struct {
 	waitingTTL time.Duration
 	runTimeout time.Duration
 
-	commands          chan schedulerCommand
-	done              chan struct{}
-	finishEvents      chan terminalNotification
-	notificationSlots *notificationSlots
-	waiting           []ProjectTask
-	active            *activeTask
-	localMutation     bool
-	stopped           bool
-	stopWaiters       []chan struct{}
-	cancelWaiters     []cancelSessionWaiter
+	commands              chan schedulerCommand
+	done                  chan struct{}
+	notifier              *terminalNotifier
+	notificationSlots     *notificationSlots
+	waiting               []ProjectTask
+	active                *activeTask
+	localMutation         bool
+	stopped               bool
+	stopWaiters           []chan struct{}
+	cancelWaiters         []cancelSessionWaiter
+	completionCount       int
+	completionGenerations map[string][]*projectCompletionGeneration
+	detachedCompletions   []projectDetachedCompletion
+	completionRunning     bool
 
 	expiryTimer SchedulerTimer
 	runTimer    SchedulerTimer
@@ -121,13 +158,11 @@ func NewProjectScheduler(clock SchedulerClock, maxWaiting int, waitingTTL, runTi
 	if maxWaiting < 0 {
 		maxWaiting = 0
 	}
-	notificationCapacity := 2 * (maxWaiting + 1)
-	if notificationCapacity < 0 {
-		notificationCapacity = 0
-	}
+	notificationCapacity := schedulerNotificationCapacity(maxWaiting)
 	commands := make(chan schedulerCommand)
 	done := make(chan struct{})
-	slots := &notificationSlots{tokens: make(chan struct{}, notificationCapacity)}
+	slots := newNotificationSlots(notificationCapacity)
+	notifier := newTerminalNotifier()
 	loop := &schedulerLoop{
 		clock:             clock,
 		maxWaiting:        maxWaiting,
@@ -135,10 +170,10 @@ func NewProjectScheduler(clock SchedulerClock, maxWaiting int, waitingTTL, runTi
 		runTimeout:        runTimeout,
 		commands:          commands,
 		done:              done,
-		finishEvents:      make(chan terminalNotification, notificationCapacity),
+		notifier:          notifier,
 		notificationSlots: slots,
 	}
-	go loop.publishTerminalNotifications()
+	go notifier.run()
 	go loop.run()
 	return &ProjectScheduler{commands: commands, done: done}
 }
@@ -270,19 +305,9 @@ func (s *ProjectScheduler) Stop(ctx context.Context) {
 	}
 }
 
-func (l *schedulerLoop) publishTerminalNotifications() {
-	for event := range l.finishEvents {
-		func() {
-			defer event.release()
-			defer func() { _ = recover() }()
-			event.publish(event.result)
-		}()
-	}
-}
-
 func (l *schedulerLoop) run() {
 	defer close(l.done)
-	defer close(l.finishEvents)
+	defer l.notifier.close()
 	for {
 		var expiryC <-chan time.Time
 		var runC <-chan time.Time
@@ -300,7 +325,7 @@ func (l *schedulerLoop) run() {
 			}
 		case <-expiryC:
 			l.expiryTimer = nil
-			l.dropExpiredWaiting()
+			l.runDetachedCompletions(l.dropExpiredWaiting())
 			l.armExpiryTimer()
 		case <-runC:
 			l.runTimer = nil
@@ -326,7 +351,11 @@ func (l *schedulerLoop) handleCommand(cmd schedulerCommand) bool {
 	case stopCommand:
 		return l.handleStop(c)
 	case runFinishedCommand:
-		return l.handleRunFinished(c.result)
+		l.handleRunFinished(c.result)
+	case taskCompletionFinishedCommand:
+		return l.handleTaskCompletionFinished(c.active)
+	case detachedTaskCompletionFinishedCommand:
+		return l.handleDetachedTaskCompletionFinished(c)
 	}
 	return false
 }
@@ -340,12 +369,13 @@ func (l *schedulerLoop) handleSubmitWithOptions(task ProjectTask, options Submit
 		l.recordRejected()
 		return SubmitResult{Status: SubmitRejectedBusy}
 	}
-	if options.OnlyIfIdle && (l.active != nil || len(l.waiting) > 0) {
+	busy := l.active != nil || l.completionCount != 0 || len(l.waiting) > 0
+	if options.OnlyIfIdle && busy {
 		l.recordRejected()
 		return SubmitResult{Status: SubmitRejectedBusy}
 	}
 	task = l.normalizeTask(task)
-	if l.active != nil && len(l.waiting) >= l.maxWaiting {
+	if busy && len(l.waiting) >= l.maxWaiting {
 		l.recordRejected()
 		return SubmitResult{Status: SubmitRejectedFull}
 	}
@@ -353,7 +383,7 @@ func (l *schedulerLoop) handleSubmitWithOptions(task ProjectTask, options Submit
 		l.recordRejected()
 		return SubmitResult{Status: SubmitRejectedNotificationBacklog}
 	}
-	if l.active == nil {
+	if !busy {
 		l.startTask(task)
 		return SubmitResult{Status: SubmitStarted}
 	}
@@ -362,9 +392,9 @@ func (l *schedulerLoop) handleSubmitWithOptions(task ProjectTask, options Submit
 	return SubmitResult{Status: SubmitQueued, Position: len(l.waiting)}
 }
 
-func (l *schedulerLoop) handleRunFinished(result TaskResult) bool {
+func (l *schedulerLoop) handleRunFinished(result TaskResult) {
 	if l.active == nil {
-		return l.shouldExitAfterStop()
+		return
 	}
 	active := l.active
 	l.stopRunTimer()
@@ -376,21 +406,56 @@ func (l *schedulerLoop) handleRunFinished(result TaskResult) bool {
 		result = normalizeTaskResult(result)
 	}
 	l.recordTerminal(result.State)
-	active.completion.finish(result, l.finishEvents)
-	l.active = nil
-	if len(l.cancelWaiters) > 0 {
-		for _, waiter := range l.cancelWaiters {
-			select {
-			case <-waiter.done:
-			default:
-				close(waiter.done)
-			}
+	active.completing = true
+	go func() {
+		active.completion.finish(result)
+		select {
+		case l.commands <- taskCompletionFinishedCommand{active: active}:
+		case <-l.done:
 		}
-		l.cancelWaiters = nil
+	}()
+}
+
+func (l *schedulerLoop) handleTaskCompletionFinished(active *activeTask) bool {
+	if l.active != active {
+		return false
 	}
+	l.active = nil
+	l.releaseReadyCancelWaiters()
 	if l.stopped {
-		l.finishStopIfReady()
-		return true
+		return l.finishStopIfReady()
+	}
+	l.startNextEligible()
+	return false
+}
+
+func (l *schedulerLoop) handleDetachedTaskCompletionFinished(c detachedTaskCompletionFinishedCommand) bool {
+	generation := c.generation
+	if generation == nil || generation.remaining == 0 || !l.completionRunning {
+		return false
+	}
+	l.completionRunning = false
+	generation.remaining--
+	l.completionCount--
+	if generation.remaining == 0 {
+		generations := l.completionGenerations[c.sessionKey]
+		for i, existing := range generations {
+			if existing != generation {
+				continue
+			}
+			generations = append(generations[:i], generations[i+1:]...)
+			break
+		}
+		if len(generations) == 0 {
+			delete(l.completionGenerations, c.sessionKey)
+		} else {
+			l.completionGenerations[c.sessionKey] = generations
+		}
+	}
+	l.releaseReadyCancelWaiters()
+	l.runDetachedCompletions(nil)
+	if l.stopped {
+		return l.finishStopIfReady()
 	}
 	l.startNextEligible()
 	return false
@@ -409,7 +474,7 @@ func (l *schedulerLoop) handleBeginLocalMutation(c beginLocalMutationCommand) {
 			return false
 		}
 	}
-	if l.stopped || l.active != nil || len(l.waiting) > 0 || l.localMutation {
+	if l.stopped || l.active != nil || l.completionCount != 0 || len(l.waiting) > 0 || l.localMutation {
 		reply(localMutationLease{})
 		return
 	}
@@ -440,30 +505,37 @@ func (l *schedulerLoop) handleCancelSession(c cancelSessionCommand) {
 	}
 	result := CancelResult{}
 	kept := l.waiting[:0]
+	cancelled := make([]ProjectTask, 0)
 	for _, task := range l.waiting {
 		if task.SessionKey == c.sessionKey {
 			result.WaitingCancelled++
-			l.recordTerminal(TaskStateCancelled)
-			newTaskCompletion(task, l.notificationSlots).finish(TaskResult{State: TaskStateCancelled}, l.finishEvents)
+			cancelled = append(cancelled, task)
 			continue
 		}
 		kept = append(kept, task)
 	}
 	l.waiting = kept
+	completions := l.detachCompletions(cancelled, TaskStateCancelled)
 	l.armExpiryTimer()
 
+	waiter := cancelSessionWaiter{done: c.done}
 	if l.active != nil && l.active.task.SessionKey == c.sessionKey {
-		result.ActiveCancelled = 1
-		result.Pending = true
-		if l.active.decision == "" {
-			l.active.decision = TaskStateCancelled
+		waiter.waitActive = l.active
+		if !l.active.completing {
+			result.ActiveCancelled = 1
+			if l.active.decision == "" {
+				l.active.decision = TaskStateCancelled
+			}
+			l.active.cancel()
 		}
-		l.active.cancel()
-		l.cancelWaiters = append(l.cancelWaiters, cancelSessionWaiter{done: c.done, result: result})
-		c.resp <- result
-		return
+	}
+	waiter.generations = append(waiter.generations, l.completionGenerations[c.sessionKey]...)
+	result.Pending = waiter.waitActive != nil || len(waiter.generations) != 0
+	if result.Pending {
+		l.cancelWaiters = append(l.cancelWaiters, waiter)
 	}
 	c.resp <- result
+	l.runDetachedCompletions(completions)
 }
 
 func (l *schedulerLoop) handleCancelSessionWaiterCancel(c cancelSessionWaiterCancelCommand) {
@@ -480,44 +552,69 @@ func (l *schedulerLoop) handleCancelSessionWaiterCancel(c cancelSessionWaiterCan
 	l.cancelWaiters = kept
 }
 
+func (l *schedulerLoop) releaseReadyCancelWaiters() {
+	if len(l.cancelWaiters) == 0 {
+		return
+	}
+	kept := l.cancelWaiters[:0]
+	for _, waiter := range l.cancelWaiters {
+		if waiter.waitActive != nil && l.active == waiter.waitActive {
+			kept = append(kept, waiter)
+			continue
+		}
+		pending := false
+		for _, generation := range waiter.generations {
+			if generation.remaining != 0 {
+				pending = true
+				break
+			}
+		}
+		if pending {
+			kept = append(kept, waiter)
+			continue
+		}
+		select {
+		case <-waiter.done:
+		default:
+			close(waiter.done)
+		}
+	}
+	l.cancelWaiters = kept
+}
+
 func (l *schedulerLoop) handleStop(c stopCommand) bool {
 	if l.stopped {
-		if l.active == nil {
+		if l.active == nil && l.completionCount == 0 {
 			close(c.done)
-		} else {
-			l.stopWaiters = append(l.stopWaiters, c.done)
+			return true
 		}
+		l.stopWaiters = append(l.stopWaiters, c.done)
 		return false
 	}
 	l.stopped = true
 	l.stopWaiters = append(l.stopWaiters, c.done)
 	l.stopExpiryTimer()
 	l.stopRunTimer()
-	l.cancelWaiting()
-	if l.active != nil {
+	completions := l.cancelWaiting()
+	if l.active != nil && !l.active.completing {
 		if l.active.decision == "" {
 			l.active.decision = TaskStateCancelled
 		}
 		l.active.cancel()
+	}
+	l.runDetachedCompletions(completions)
+	return l.finishStopIfReady()
+}
+
+func (l *schedulerLoop) finishStopIfReady() bool {
+	if !l.stopped || l.active != nil || l.completionCount != 0 {
 		return false
 	}
-	l.finishStopIfReady()
-	return true
-}
-
-func (l *schedulerLoop) shouldExitAfterStop() bool {
-	if l.stopped {
-		l.finishStopIfReady()
-		return true
-	}
-	return false
-}
-
-func (l *schedulerLoop) finishStopIfReady() {
 	for _, done := range l.stopWaiters {
 		close(done)
 	}
 	l.stopWaiters = nil
+	return true
 }
 
 func (l *schedulerLoop) normalizeTask(task ProjectTask) ProjectTask {
@@ -547,8 +644,8 @@ func (l *schedulerLoop) reserveNotificationSlot(task *ProjectTask) bool {
 }
 
 func (l *schedulerLoop) startNextEligible() {
-	l.dropExpiredWaiting()
-	if l.stopped || l.active != nil || len(l.waiting) == 0 {
+	l.runDetachedCompletions(l.dropExpiredWaiting())
+	if l.stopped || l.active != nil || l.completionCount != 0 || len(l.waiting) == 0 {
 		l.armExpiryTimer()
 		return
 	}
@@ -561,7 +658,7 @@ func (l *schedulerLoop) startNextEligible() {
 
 func (l *schedulerLoop) startTask(task ProjectTask) {
 	ctx, cancel := context.WithCancel(context.Background())
-	completion := newTaskCompletion(task, l.notificationSlots)
+	completion := newTaskCompletion(task, l.notificationSlots, l.notifier)
 	active := &activeTask{task: task, cancel: cancel, completion: completion}
 	if l.runTimeout > 0 {
 		active.deadline = l.clock.Now().Add(l.runTimeout)
@@ -578,36 +675,84 @@ func (l *schedulerLoop) startTask(task ProjectTask) {
 }
 
 func (l *schedulerLoop) markActiveTimedOut() {
-	if l.active == nil || l.active.decision != "" {
+	if l.active == nil || l.active.completing || l.active.decision != "" {
 		return
 	}
 	l.active.decision = TaskStateTimedOut
 	l.active.cancel()
 }
 
-func (l *schedulerLoop) dropExpiredWaiting() {
+func (l *schedulerLoop) dropExpiredWaiting() []projectDetachedCompletion {
 	if len(l.waiting) == 0 {
-		return
+		return nil
 	}
 	now := l.clock.Now()
 	kept := l.waiting[:0]
+	expired := make([]ProjectTask, 0)
 	for _, task := range l.waiting {
 		if !task.ExpiresAt.IsZero() && !now.Before(task.ExpiresAt) {
-			l.recordTerminal(TaskStateExpired)
-			newTaskCompletion(task, l.notificationSlots).finish(TaskResult{State: TaskStateExpired}, l.finishEvents)
+			expired = append(expired, task)
 			continue
 		}
 		kept = append(kept, task)
 	}
 	l.waiting = kept
+	return l.detachCompletions(expired, TaskStateExpired)
 }
 
-func (l *schedulerLoop) cancelWaiting() {
-	for _, task := range l.waiting {
-		l.recordTerminal(TaskStateCancelled)
-		newTaskCompletion(task, l.notificationSlots).finish(TaskResult{State: TaskStateCancelled}, l.finishEvents)
-	}
+func (l *schedulerLoop) cancelWaiting() []projectDetachedCompletion {
+	waiting := l.waiting
 	l.waiting = nil
+	return l.detachCompletions(waiting, TaskStateCancelled)
+}
+
+func (l *schedulerLoop) detachCompletions(tasks []ProjectTask, state string) []projectDetachedCompletion {
+	if len(tasks) == 0 {
+		return nil
+	}
+	if l.completionGenerations == nil {
+		l.completionGenerations = make(map[string][]*projectCompletionGeneration)
+	}
+	counts := make(map[string]int)
+	for _, task := range tasks {
+		counts[task.SessionKey]++
+	}
+	generations := make(map[string]*projectCompletionGeneration, len(counts))
+	for sessionKey, count := range counts {
+		generation := &projectCompletionGeneration{remaining: count}
+		generations[sessionKey] = generation
+		l.completionGenerations[sessionKey] = append(l.completionGenerations[sessionKey], generation)
+	}
+	l.completionCount += len(tasks)
+	completions := make([]projectDetachedCompletion, 0, len(tasks))
+	for _, task := range tasks {
+		l.recordTerminal(state)
+		completions = append(completions, projectDetachedCompletion{
+			sessionKey: task.SessionKey,
+			completion: newTaskCompletion(task, l.notificationSlots, l.notifier),
+			result:     TaskResult{State: state},
+			generation: generations[task.SessionKey],
+		})
+	}
+	return completions
+}
+
+func (l *schedulerLoop) runDetachedCompletions(completions []projectDetachedCompletion) {
+	l.detachedCompletions = append(l.detachedCompletions, completions...)
+	if l.completionRunning || len(l.detachedCompletions) == 0 {
+		return
+	}
+	completion := l.detachedCompletions[0]
+	l.detachedCompletions[0] = projectDetachedCompletion{}
+	l.detachedCompletions = l.detachedCompletions[1:]
+	l.completionRunning = true
+	go func() {
+		completion.completion.finish(completion.result)
+		l.commands <- detachedTaskCompletionFinishedCommand{
+			sessionKey: completion.sessionKey,
+			generation: completion.generation,
+		}
+	}()
 }
 
 func (l *schedulerLoop) armExpiryTimer() {
@@ -670,6 +815,7 @@ func (l *schedulerLoop) snapshot() SchedulerSnapshot {
 		snap.ActiveCount = 1
 		active := taskSnapshot(l.active.task)
 		snap.Active = &active
+		snap.ActiveTasks = []SchedulerTaskSnapshot{active}
 	}
 	if len(l.waiting) > 0 {
 		snap.Waiting = make([]SchedulerTaskSnapshot, len(l.waiting))
@@ -709,10 +855,11 @@ func taskSnapshot(task ProjectTask) SchedulerTaskSnapshot {
 	}
 }
 
-func newTaskCompletion(task ProjectTask, slots *notificationSlots) *taskCompletion {
+func newTaskCompletion(task ProjectTask, slots *notificationSlots, notifier *terminalNotifier) *taskCompletion {
 	completion := &taskCompletion{
-		cleanup: task.Cleanup,
-		publish: task.OnFinish,
+		cleanup:  task.Cleanup,
+		publish:  task.OnFinish,
+		notifier: notifier,
 	}
 	if task.OnFinish != nil {
 		completion.release = slots.release
@@ -720,15 +867,81 @@ func newTaskCompletion(task ProjectTask, slots *notificationSlots) *taskCompleti
 	return completion
 }
 
-func (c *taskCompletion) finish(result TaskResult, events chan<- terminalNotification) {
+func (c *taskCompletion) finish(result TaskResult) {
 	c.once.Do(func() {
 		result = normalizeTaskResult(result)
-		c.cleanup()
+		func() {
+			defer func() {
+				if recover() != nil {
+					slog.Error("scheduler task cleanup panic", "component", "scheduler")
+				}
+			}()
+			c.cleanup()
+		}()
 		if c.publish == nil {
 			return
 		}
-		events <- terminalNotification{publish: c.publish, result: result, release: c.release}
+		c.notifier.enqueue(terminalNotification{publish: c.publish, result: result, release: c.release})
 	})
+}
+
+func newTerminalNotifier() *terminalNotifier {
+	n := &terminalNotifier{}
+	n.cond = sync.NewCond(&n.mu)
+	return n
+}
+
+func (n *terminalNotifier) enqueue(event terminalNotification) {
+	n.mu.Lock()
+	if n.closed {
+		n.mu.Unlock()
+		event.release()
+		slog.Error("scheduler terminal notification rejected after close", "component", "scheduler")
+		return
+	}
+	n.queue = append(n.queue, event)
+	n.cond.Signal()
+	n.mu.Unlock()
+}
+
+func (n *terminalNotifier) close() {
+	n.mu.Lock()
+	if !n.closed {
+		n.closed = true
+		n.cond.Broadcast()
+	}
+	n.mu.Unlock()
+}
+
+func (n *terminalNotifier) run() {
+	for {
+		n.mu.Lock()
+		for len(n.queue) == 0 && !n.closed {
+			n.cond.Wait()
+		}
+		if len(n.queue) == 0 {
+			n.mu.Unlock()
+			return
+		}
+		event := n.queue[0]
+		n.queue[0] = terminalNotification{}
+		if len(n.queue) == 1 {
+			n.queue = nil
+		} else {
+			n.queue = n.queue[1:]
+		}
+		n.mu.Unlock()
+
+		func() {
+			defer event.release()
+			defer func() {
+				if recover() != nil {
+					slog.Error("scheduler terminal notification panic", "component", "scheduler")
+				}
+			}()
+			event.publish(event.result)
+		}()
+	}
 }
 
 func normalizeTaskResult(result TaskResult) TaskResult {
@@ -750,22 +963,42 @@ func normalizeTaskResult(result TaskResult) TaskResult {
 	return result
 }
 
+func schedulerNotificationCapacity(maxWaiting int) int {
+	const notificationsPerAcceptedTask = 2
+	if maxWaiting < 0 || maxWaiting > int(^uint(0)>>1)/notificationsPerAcceptedTask-1 {
+		return 0
+	}
+	return notificationsPerAcceptedTask * (maxWaiting + 1)
+}
+
+func newNotificationSlots(capacity int) *notificationSlots {
+	return &notificationSlots{logicalCapacity: capacity}
+}
+
 func (s *notificationSlots) reserve() bool {
-	select {
-	case s.tokens <- struct{}{}:
-		return true
-	default:
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingCount >= s.logicalCapacity {
 		return false
 	}
+	s.pendingCount++
+	return true
 }
 
 func (s *notificationSlots) release() {
-	select {
-	case <-s.tokens:
-	default:
+	s.mu.Lock()
+	if s.pendingCount > 0 {
+		s.pendingCount--
 	}
+	s.mu.Unlock()
 }
 
-func (s *notificationSlots) pending() int { return len(s.tokens) }
+func (s *notificationSlots) pending() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pendingCount
+}
 
-func (s *notificationSlots) capacity() int { return cap(s.tokens) }
+func (s *notificationSlots) capacity() int {
+	return s.logicalCapacity
+}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -821,6 +822,56 @@ func waitFinishStart(t *testing.T, callbackEntered <-chan string) string {
 	}
 }
 
+func TestProjectSchedulerCleanupPanicStillPublishesAndReleasesSlot(t *testing.T) {
+	scheduler := NewProjectScheduler(nil, 0, 0, 0)
+	finished := make(chan TaskResult, 2)
+	var cleanupAttempts atomic.Int32
+	if got := scheduler.Submit(ProjectTask{
+		ID: "cleanup-panic",
+		Cleanup: func() {
+			cleanupAttempts.Add(1)
+			panic("cleanup must be isolated")
+		},
+		OnFinish: func(result TaskResult) { finished <- result },
+	}); got.Status != SubmitStarted {
+		t.Fatalf("cleanup panic submit=%+v", got)
+	}
+	if result := <-finished; result.State != TaskStateCompleted {
+		t.Fatalf("cleanup panic terminal=%s", result.State)
+	}
+	if got := cleanupAttempts.Load(); got != 1 {
+		t.Fatalf("cleanup attempts=%d, want 1", got)
+	}
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		if scheduler.Snapshot().NotificationPending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cleanup panic 后 notification slot 未释放")
+		}
+	}
+	select {
+	case result := <-finished:
+		t.Fatalf("cleanup panic OnFinish 重复发布：%+v", result)
+	default:
+	}
+	afterFinished := make(chan struct{})
+	if got := scheduler.Submit(ProjectTask{
+		ID: "after-cleanup-panic",
+		OnFinish: func(TaskResult) {
+			close(afterFinished)
+		},
+	}); got.Status != SubmitStarted {
+		t.Fatalf("cleanup panic 后续 submit=%+v", got)
+	}
+	select {
+	case <-afterFinished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup panic 后续任务未正常发布")
+	}
+	scheduler.Stop(context.Background())
+}
+
 func TestOnFinishPanicReleasesNotificationSlot(t *testing.T) {
 	// 防回归点：OnFinish panic 不能杀死 publisher goroutine，且必须释放通知槽，后续任务仍能发布。
 	clock := newFakeSchedulerClock(time.Unix(5_100, 0))
@@ -849,6 +900,14 @@ func TestOnFinishPanicReleasesNotificationSlot(t *testing.T) {
 	}
 	if got := waitCleanup(t, cleaned); got != "panic" {
 		t.Fatalf("cleanup panic = %q", got)
+	}
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		if scheduler.Snapshot().ActiveCount == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("panic task completion ownership 未收敛")
+		}
 	}
 
 	if got := scheduler.Submit(ProjectTask{
@@ -1025,6 +1084,279 @@ func assertStartedAtMostOnce(t *testing.T, started <-chan string, id string) {
 		default:
 			return
 		}
+	}
+}
+
+func TestProjectWaitingCancelCleanupCanReenterSnapshot(t *testing.T) {
+	scheduler := NewProjectScheduler(nil, 2, time.Hour, 0)
+	activeStarted := make(chan struct{})
+	activeRelease := make(chan struct{})
+	cleanupDone := make(chan struct{})
+	if got := scheduler.Submit(ProjectTask{
+		ID: "active", SessionKey: "active-session",
+		Run: func(context.Context) TaskResult {
+			close(activeStarted)
+			<-activeRelease
+			return TaskResult{State: TaskStateCompleted}
+		},
+	}); got.Status != SubmitStarted {
+		t.Fatalf("active submit=%+v", got)
+	}
+	select {
+	case <-activeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active 未启动")
+	}
+	if got := scheduler.Submit(ProjectTask{
+		ID: "waiting", SessionKey: "cancel-session",
+		Cleanup: func() {
+			scheduler.Snapshot()
+			close(cleanupDone)
+		},
+	}); got.Status != SubmitQueued {
+		t.Fatalf("waiting submit=%+v", got)
+	}
+
+	cancelResult := make(chan CancelResult, 1)
+	go func() {
+		cancelResult <- scheduler.CancelSessionContext(context.Background(), "cancel-session", CancelStop)
+	}()
+	select {
+	case <-cleanupDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiting cancel Cleanup 重入 Snapshot 未完成")
+	}
+	select {
+	case result := <-cancelResult:
+		if result.WaitingCancelled != 1 || result.ActiveCancelled != 0 || result.Pending {
+			t.Fatalf("cancel result=%+v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiting cancel completion 未收敛")
+	}
+	close(activeRelease)
+	scheduler.Stop(context.Background())
+}
+
+func TestProjectWaitingCancelContextBoundsDetachedCleanupAndPreservesOrder(t *testing.T) {
+	scheduler := NewProjectScheduler(nil, 2, time.Hour, 0)
+	activeStarted := make(chan struct{})
+	activeRelease := make(chan struct{})
+	activeCleaned := make(chan struct{})
+	cleanupEntered := make(chan struct{})
+	cleanupRelease := make(chan struct{})
+	successorStarted := make(chan struct{})
+	if got := scheduler.Submit(ProjectTask{
+		ID: "active", SessionKey: "active-session",
+		Run: func(context.Context) TaskResult {
+			close(activeStarted)
+			<-activeRelease
+			return TaskResult{State: TaskStateCompleted}
+		},
+		Cleanup: func() { close(activeCleaned) },
+	}); got.Status != SubmitStarted {
+		t.Fatalf("active submit=%+v", got)
+	}
+	select {
+	case <-activeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active 未启动")
+	}
+	if got := scheduler.Submit(ProjectTask{
+		ID: "cancelled", SessionKey: "cancel-session",
+		Cleanup: func() {
+			close(cleanupEntered)
+			<-cleanupRelease
+		},
+	}); got.Status != SubmitQueued {
+		t.Fatalf("cancelled submit=%+v", got)
+	}
+	if got := scheduler.Submit(ProjectTask{
+		ID: "successor", SessionKey: "successor-session",
+		Run: func(context.Context) TaskResult {
+			close(successorStarted)
+			return TaskResult{State: TaskStateCompleted}
+		},
+	}); got.Status != SubmitQueued {
+		t.Fatalf("successor submit=%+v", got)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelResult := make(chan CancelResult, 1)
+	go func() {
+		cancelResult <- scheduler.CancelSessionContext(ctx, "cancel-session", CancelStop)
+	}()
+	select {
+	case <-cleanupEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiting cancel Cleanup 未进入")
+	}
+	cancel()
+	select {
+	case result := <-cancelResult:
+		if result.WaitingCancelled != 1 || !result.Pending {
+			t.Fatalf("bounded cancel result=%+v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiting cancel 未遵守 caller context 有界返回")
+	}
+
+	close(activeRelease)
+	select {
+	case <-activeCleaned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active completion 未进入")
+	}
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		if scheduler.Snapshot().ActiveCount == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("active completion ownership 未收敛")
+		}
+	}
+	select {
+	case <-successorStarted:
+		t.Fatal("detached Cleanup 收敛前 successor 提前启动")
+	default:
+	}
+
+	close(cleanupRelease)
+	select {
+	case <-successorStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("detached Cleanup 收敛后 successor 未启动")
+	}
+	if result := scheduler.CancelSessionContext(context.Background(), "cancel-session", CancelStop); result.Pending {
+		t.Fatalf("detached completion 收敛后 cancel result=%+v", result)
+	}
+	scheduler.Stop(context.Background())
+}
+
+func TestProjectWaitingExpireCleanupCanReenterSnapshot(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(8_100, 0))
+	scheduler := NewProjectScheduler(clock, 2, time.Hour, 0)
+	activeStarted := make(chan struct{})
+	activeRelease := make(chan struct{})
+	cleanupDone := make(chan struct{})
+	if got := scheduler.Submit(ProjectTask{
+		ID: "active",
+		Run: func(context.Context) TaskResult {
+			close(activeStarted)
+			<-activeRelease
+			return TaskResult{State: TaskStateCompleted}
+		},
+	}); got.Status != SubmitStarted {
+		t.Fatalf("active submit=%+v", got)
+	}
+	select {
+	case <-activeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active 未启动")
+	}
+	if got := scheduler.Submit(ProjectTask{
+		ID: "expiring",
+		Cleanup: func() {
+			scheduler.Snapshot()
+			close(cleanupDone)
+		},
+	}); got.Status != SubmitQueued {
+		t.Fatalf("expiring submit=%+v", got)
+	}
+
+	clock.Advance(time.Hour + time.Nanosecond)
+	select {
+	case <-cleanupDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiting expire Cleanup 重入 Snapshot 未完成")
+	}
+	if snapshot := scheduler.Snapshot(); snapshot.Expired != 1 || snapshot.WaitingCount != 0 {
+		t.Fatalf("expire snapshot=%+v", snapshot)
+	}
+	close(activeRelease)
+	scheduler.Stop(context.Background())
+}
+
+func TestProjectStopWaitingCleanupIsDetachedAndNotifierClosesAfterSettlement(t *testing.T) {
+	scheduler := NewProjectScheduler(nil, 1, time.Hour, 0)
+	activeStarted := make(chan struct{})
+	activeRelease := make(chan struct{})
+	cleanupReentered := make(chan struct{})
+	cleanupRelease := make(chan struct{})
+	waitingFinished := make(chan TaskResult, 1)
+	if got := scheduler.Submit(ProjectTask{
+		ID: "active",
+		Run: func(ctx context.Context) TaskResult {
+			close(activeStarted)
+			<-ctx.Done()
+			<-activeRelease
+			return TaskResult{State: TaskStateCancelled}
+		},
+	}); got.Status != SubmitStarted {
+		t.Fatalf("active submit=%+v", got)
+	}
+	select {
+	case <-activeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active 未启动")
+	}
+	if got := scheduler.Submit(ProjectTask{
+		ID: "waiting",
+		Cleanup: func() {
+			scheduler.Snapshot()
+			close(cleanupReentered)
+			<-cleanupRelease
+		},
+		OnFinish: func(result TaskResult) { waitingFinished <- result },
+	}); got.Status != SubmitQueued {
+		t.Fatalf("waiting submit=%+v", got)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopReturned := make(chan struct{})
+	go func() {
+		scheduler.Stop(ctx)
+		close(stopReturned)
+	}()
+	select {
+	case <-cleanupReentered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop waiting Cleanup 重入 Snapshot 未完成")
+	}
+	cancel()
+	select {
+	case <-stopReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop 未遵守 caller context 有界返回")
+	}
+	select {
+	case result := <-waitingFinished:
+		t.Fatalf("Cleanup 未释放前提前发布：%+v", result)
+	default:
+	}
+
+	close(cleanupRelease)
+	close(activeRelease)
+	settled := make(chan struct{})
+	go func() {
+		scheduler.Stop(context.Background())
+		close(settled)
+	}()
+	select {
+	case <-settled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("释放 waiting Cleanup 后 Scheduler 未收敛")
+	}
+	select {
+	case result := <-waitingFinished:
+		if result.State != TaskStateCancelled {
+			t.Fatalf("waiting terminal=%s", result.State)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("notifier 过早关闭，waiting terminal 未发布")
+	}
+	if snapshot := scheduler.Snapshot(); snapshot.NotificationPending != 0 {
+		t.Fatalf("Stop 收敛后 notification pending=%d", snapshot.NotificationPending)
 	}
 }
 
