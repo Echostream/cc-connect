@@ -166,11 +166,9 @@ const (
 	defaultProjectSchedulerMaxTurnTimeMins = 30
 )
 
-// SchedulerConfig is the raw [projects.scheduler] TOML subtree.
-//
-// C2.1 only parses and validates the forward-compatible schema. Runtime wiring
-// still happens in later C2 steps, so a successfully parsed legacy value here
-// must not be read as proof that the current binary executes the legacy path.
+// SchedulerConfig 是原始的 [projects.scheduler] TOML 子树。
+// 运行时会按每个 Project 的有效配置选择 LegacyScheduler 或 ProjectScheduler；
+// 省略整个子树时保持 Legacy 行为，只有显式 type = "project" 才启用 Project 调度。
 type SchedulerConfig struct {
 	Type            SchedulerType `toml:"type,omitempty"`
 	MaxWaiting      *int          `toml:"max_waiting,omitempty"`

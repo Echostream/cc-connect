@@ -199,19 +199,28 @@ func (p *mediaPlatform) snapshot() (texts []string, messageID string, images []c
 
 func (p *mediaPlatform) waitTextContaining(t *testing.T, substr string) string {
 	t.Helper()
+	return p.waitTextCountContaining(t, substr, 1)[0]
+}
+
+func (p *mediaPlatform) waitTextCountContaining(t *testing.T, substr string, want int) []string {
+	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		texts, _, _, _, _ := p.snapshot()
+		matches := make([]string, 0, want)
 		for _, text := range texts {
 			if strings.Contains(strings.ToLower(text), strings.ToLower(substr)) {
-				return text
+				matches = append(matches, text)
 			}
+		}
+		if len(matches) >= want {
+			return matches
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	texts, _, _, _, _ := p.snapshot()
-	t.Fatalf("timeout waiting for text containing %q, got %#v", substr, texts)
-	return ""
+	t.Fatalf("timeout waiting for %d texts containing %q, got %#v", want, substr, texts)
+	return nil
 }
 
 func newMediaEngine(t *testing.T) (*core.Engine, *recordingAgent, *mediaPlatform) {
@@ -285,7 +294,8 @@ func TestQueuedMessagePreservesFiles(t *testing.T) {
 	queued.Files = []core.FileAttachment{{MimeType: "text/plain", FileName: "queued.txt", Data: []byte("queued-file")}}
 	engine.ReceiveMessage(platform, queued)
 
-	platform.waitTextContaining(t, "process after")
+	// 该 fixture 使用 NewEngine 的 Project fallback；Project 排队不发送仅供
+	// Legacy 模式使用的排队反馈，附件保留由后续第二次 Send 的断言验证。
 	agent.session.releaseFirstResult("first done")
 
 	records := agent.session.waitRecords(t, 2)
@@ -429,7 +439,9 @@ func TestSendToSessionWithAttachmentsRequiresSessionWhenMultipleSessionsHaveAtta
 	engine.ReceiveMessage(platform, first)
 	engine.ReceiveMessage(platform, second)
 	agent.session.waitRecords(t, 2)
-	platform.waitTextContaining(t, "media ok")
+	// 两个 Project turn 都完成后再进入断言和 TempDir 清理，避免第二个
+	// session store 写入与测试目录删除并发。
+	platform.waitTextCountContaining(t, "media ok", 2)
 
 	err := engine.SendToSessionWithAttachments(
 		"",

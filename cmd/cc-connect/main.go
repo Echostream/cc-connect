@@ -59,6 +59,77 @@ func resolveResetOnIdle(configured *int) (time.Duration, bool) {
 	return time.Duration(defaultResetOnIdleMins) * time.Minute, true
 }
 
+const defaultLegacySchedulerMaxWaiting = 5
+
+type schedulerRuntimePlan struct {
+	schedulerType     config.SchedulerType
+	maxWaiting        int
+	waitingTTL        time.Duration
+	runTimeout        time.Duration
+	legacyMaxTurnTime time.Duration
+}
+
+type maxTurnTimeSetter interface {
+	SetMaxTurnTime(time.Duration)
+}
+
+func buildSchedulerRuntimePlan(cfg *config.Config, proj *config.ProjectConfig) (schedulerRuntimePlan, error) {
+	if cfg == nil {
+		return schedulerRuntimePlan{}, fmt.Errorf("scheduler runtime: config is required")
+	}
+	effective, err := config.EffectiveScheduler(proj)
+	if err != nil {
+		return schedulerRuntimePlan{}, fmt.Errorf("scheduler runtime: %w", err)
+	}
+
+	plan := schedulerRuntimePlan{schedulerType: effective.Type}
+	switch effective.Type {
+	case config.SchedulerTypeLegacy:
+		plan.maxWaiting = defaultLegacySchedulerMaxWaiting
+		if cfg.Queue.MaxDepth != nil && *cfg.Queue.MaxDepth > 0 {
+			plan.maxWaiting = *cfg.Queue.MaxDepth
+		}
+		if cfg.MaxTurnTimeMins != nil && *cfg.MaxTurnTimeMins > 0 {
+			plan.legacyMaxTurnTime = time.Duration(*cfg.MaxTurnTimeMins) * time.Minute
+		}
+	case config.SchedulerTypeProject:
+		plan.maxWaiting = effective.MaxWaiting
+		plan.waitingTTL = time.Duration(effective.WaitingTTLMins) * time.Minute
+		plan.runTimeout = time.Duration(effective.MaxTurnTimeMins) * time.Minute
+	default:
+		return schedulerRuntimePlan{}, fmt.Errorf("scheduler runtime: unsupported type %q", effective.Type)
+	}
+	return plan, nil
+}
+
+func buildSchedulerRuntimePlans(cfg *config.Config) ([]schedulerRuntimePlan, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("scheduler runtime: config is required")
+	}
+	plans := make([]schedulerRuntimePlan, len(cfg.Projects))
+	for i := range cfg.Projects {
+		plan, err := buildSchedulerRuntimePlan(cfg, &cfg.Projects[i])
+		if err != nil {
+			return nil, fmt.Errorf("project %q: %w", cfg.Projects[i].Name, err)
+		}
+		plans[i] = plan
+	}
+	return plans, nil
+}
+
+func (p schedulerRuntimePlan) newScheduler() core.EngineScheduler {
+	if p.schedulerType == config.SchedulerTypeProject {
+		return core.NewProjectScheduler(nil, p.maxWaiting, p.waitingTTL, p.runTimeout)
+	}
+	return core.NewLegacyScheduler(p.maxWaiting)
+}
+
+func (p schedulerRuntimePlan) configureEngine(setter maxTurnTimeSetter) {
+	if p.schedulerType == config.SchedulerTypeLegacy && p.legacyMaxTurnTime > 0 {
+		setter.SetMaxTurnTime(p.legacyMaxTurnTime)
+	}
+}
+
 // logSizeSource describes where the resolved log size came from, so the
 // caller can log it and operators can audit the active setting without
 // grepping systemd/launchd definitions.
@@ -357,6 +428,14 @@ func main() {
 
 	setupLogger(cfg.Log.Level, logWriter)
 
+	// 在构造任何 Agent 或 Platform 前解析全部 Project 的调度方案，
+	// 避免无效配置留下只完成部分构造的进程。
+	schedulerPlans, err := buildSchedulerRuntimePlans(cfg)
+	if err != nil {
+		slog.Error("failed to build scheduler runtime plans", "error", err)
+		os.Exit(1)
+	}
+
 	// run_as_user preflight + isolation audit. MUST run before any engine
 	// or agent is constructed. If any project fails, abort startup
 	// entirely — never half-spawn. See core/runas_check.go and
@@ -369,7 +448,7 @@ func main() {
 	engines := make([]*core.Engine, 0, len(cfg.Projects))
 	effectiveWorkDirs := make([]string, 0, len(cfg.Projects))
 
-	for _, proj := range cfg.Projects {
+	for projectIndex, proj := range cfg.Projects {
 		// Inject project-level run_as_user / run_as_env into the agent's
 		// opts map so agents that support isolation can pick them up
 		// without needing their own top-level config plumbing.
@@ -429,8 +508,9 @@ func main() {
 			lang = core.LangAuto // auto-detect
 		}
 
-		projectScheduler := core.NewProjectScheduler(nil, 10, 6*time.Hour, 30*time.Minute)
-		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang, core.WithProjectScheduler(projectScheduler))
+		schedulerPlan := schedulerPlans[projectIndex]
+		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang, core.WithScheduler(schedulerPlan.newScheduler()))
+		schedulerPlan.configureEngine(engine)
 		// Wire display settings including show_context_indicator and reply_footer
 		// Global [display] config can be overridden by project-level settings
 		_, _, _, _, _, showCtx, showFooter, _ := config.EffectiveDisplay(cfg, &proj)

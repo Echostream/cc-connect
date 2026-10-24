@@ -450,6 +450,220 @@ func (p *shutdownOrderPlatform) Stop() error {
 	return nil
 }
 
+func TestBuildSchedulerRuntimePlan(t *testing.T) {
+	intPtr := func(value int) *int { return &value }
+
+	tests := []struct {
+		name              string
+		cfg               *config.Config
+		proj              *config.ProjectConfig
+		wantType          config.SchedulerType
+		wantMaxWaiting    int
+		wantWaitingTTL    time.Duration
+		wantRunTimeout    time.Duration
+		wantLegacyMaxTurn time.Duration
+	}{
+		{
+			name:           "missing scheduler defaults to legacy",
+			cfg:            &config.Config{},
+			proj:           &config.ProjectConfig{},
+			wantType:       config.SchedulerTypeLegacy,
+			wantMaxWaiting: 5,
+		},
+		{
+			name: "explicit legacy uses positive global queue depth",
+			cfg: &config.Config{
+				Queue: config.QueueConfig{MaxDepth: intPtr(2)},
+			},
+			proj: &config.ProjectConfig{
+				Scheduler: &config.SchedulerConfig{Type: config.SchedulerTypeLegacy},
+			},
+			wantType:       config.SchedulerTypeLegacy,
+			wantMaxWaiting: 2,
+		},
+		{
+			name: "legacy zero queue and max turn preserve disabled defaults",
+			cfg: &config.Config{
+				Queue:           config.QueueConfig{MaxDepth: intPtr(0)},
+				MaxTurnTimeMins: intPtr(0),
+			},
+			proj:           &config.ProjectConfig{},
+			wantType:       config.SchedulerTypeLegacy,
+			wantMaxWaiting: 5,
+		},
+		{
+			name: "legacy positive max turn is converted to minutes",
+			cfg: &config.Config{
+				MaxTurnTimeMins: intPtr(15),
+			},
+			proj:              &config.ProjectConfig{},
+			wantType:          config.SchedulerTypeLegacy,
+			wantMaxWaiting:    5,
+			wantLegacyMaxTurn: 15 * time.Minute,
+		},
+		{
+			name: "project omitted numerics use project defaults",
+			cfg:  &config.Config{},
+			proj: &config.ProjectConfig{
+				Scheduler: &config.SchedulerConfig{Type: config.SchedulerTypeProject},
+			},
+			wantType:       config.SchedulerTypeProject,
+			wantMaxWaiting: 10,
+			wantWaitingTTL: 6 * time.Hour,
+			wantRunTimeout: 30 * time.Minute,
+		},
+		{
+			name: "project explicit numerics are converted to minutes",
+			cfg:  &config.Config{},
+			proj: &config.ProjectConfig{
+				Scheduler: &config.SchedulerConfig{
+					Type:            config.SchedulerTypeProject,
+					MaxWaiting:      intPtr(11),
+					WaitingTTLMins:  intPtr(361),
+					MaxTurnTimeMins: intPtr(31),
+				},
+			},
+			wantType:       config.SchedulerTypeProject,
+			wantMaxWaiting: 11,
+			wantWaitingTTL: 361 * time.Minute,
+			wantRunTimeout: 31 * time.Minute,
+		},
+		{
+			name: "project ignores legacy global queue and max turn",
+			cfg: &config.Config{
+				Queue:           config.QueueConfig{MaxDepth: intPtr(2)},
+				MaxTurnTimeMins: intPtr(15),
+			},
+			proj: &config.ProjectConfig{
+				Scheduler: &config.SchedulerConfig{Type: config.SchedulerTypeProject},
+			},
+			wantType:       config.SchedulerTypeProject,
+			wantMaxWaiting: 10,
+			wantWaitingTTL: 6 * time.Hour,
+			wantRunTimeout: 30 * time.Minute,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := buildSchedulerRuntimePlan(tc.cfg, tc.proj)
+			if err != nil {
+				t.Fatalf("buildSchedulerRuntimePlan() error = %v", err)
+			}
+			if got.schedulerType != tc.wantType ||
+				got.maxWaiting != tc.wantMaxWaiting ||
+				got.waitingTTL != tc.wantWaitingTTL ||
+				got.runTimeout != tc.wantRunTimeout ||
+				got.legacyMaxTurnTime != tc.wantLegacyMaxTurn {
+				t.Fatalf("plan = %+v, want type=%q maxWaiting=%d waitingTTL=%v runTimeout=%v legacyMaxTurn=%v",
+					got, tc.wantType, tc.wantMaxWaiting, tc.wantWaitingTTL, tc.wantRunTimeout, tc.wantLegacyMaxTurn)
+			}
+		})
+	}
+}
+
+func TestBuildSchedulerRuntimePlansKeepsProjectsIndependent(t *testing.T) {
+	projectType := config.SchedulerTypeProject
+	cfg := &config.Config{
+		Projects: []config.ProjectConfig{
+			{Name: "legacy"},
+			{Name: "project", Scheduler: &config.SchedulerConfig{Type: projectType}},
+		},
+	}
+
+	plans, err := buildSchedulerRuntimePlans(cfg)
+	if err != nil {
+		t.Fatalf("buildSchedulerRuntimePlans() error = %v", err)
+	}
+	if len(plans) != 2 {
+		t.Fatalf("plan count = %d, want 2", len(plans))
+	}
+	if plans[0].schedulerType != config.SchedulerTypeLegacy || plans[0].maxWaiting != 5 {
+		t.Fatalf("legacy plan = %+v", plans[0])
+	}
+	if plans[1].schedulerType != config.SchedulerTypeProject || plans[1].maxWaiting != 10 || plans[1].waitingTTL != 6*time.Hour || plans[1].runTimeout != 30*time.Minute {
+		t.Fatalf("project plan = %+v", plans[1])
+	}
+}
+
+func TestBuildSchedulerRuntimePlanRejectsInvalidScheduler(t *testing.T) {
+	_, err := buildSchedulerRuntimePlan(&config.Config{}, &config.ProjectConfig{
+		Scheduler: &config.SchedulerConfig{},
+	})
+	if err == nil {
+		t.Fatal("buildSchedulerRuntimePlan() error = nil, want invalid scheduler error")
+	}
+}
+
+func TestSchedulerRuntimePlanConstructsSelectedScheduler(t *testing.T) {
+	legacyPlan := schedulerRuntimePlan{schedulerType: config.SchedulerTypeLegacy, maxWaiting: 5}
+	legacyScheduler := legacyPlan.newScheduler()
+	defer legacyScheduler.Stop(context.Background())
+	if _, ok := legacyScheduler.(*core.LegacyScheduler); !ok {
+		t.Fatalf("legacy scheduler type = %T", legacyScheduler)
+	}
+
+	projectPlan := schedulerRuntimePlan{
+		schedulerType: config.SchedulerTypeProject,
+		maxWaiting:    10,
+		waitingTTL:    6 * time.Hour,
+		runTimeout:    30 * time.Minute,
+	}
+	projectScheduler := projectPlan.newScheduler()
+	defer projectScheduler.Stop(context.Background())
+	if _, ok := projectScheduler.(*core.ProjectScheduler); !ok {
+		t.Fatalf("project scheduler type = %T", projectScheduler)
+	}
+}
+
+type recordingMaxTurnTimeSetter struct {
+	calls []time.Duration
+}
+
+func (s *recordingMaxTurnTimeSetter) SetMaxTurnTime(timeout time.Duration) {
+	s.calls = append(s.calls, timeout)
+}
+
+func TestSchedulerRuntimePlanConfiguresOnlyLegacyPositiveMaxTurnTime(t *testing.T) {
+	tests := []struct {
+		name      string
+		plan      schedulerRuntimePlan
+		wantCalls []time.Duration
+	}{
+		{
+			name: "legacy positive timeout is applied",
+			plan: schedulerRuntimePlan{
+				schedulerType:     config.SchedulerTypeLegacy,
+				legacyMaxTurnTime: 15 * time.Minute,
+			},
+			wantCalls: []time.Duration{15 * time.Minute},
+		},
+		{
+			name: "legacy zero timeout remains disabled",
+			plan: schedulerRuntimePlan{
+				schedulerType: config.SchedulerTypeLegacy,
+			},
+		},
+		{
+			name: "project ignores legacy timeout",
+			plan: schedulerRuntimePlan{
+				schedulerType:     config.SchedulerTypeProject,
+				legacyMaxTurnTime: 15 * time.Minute,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setter := &recordingMaxTurnTimeSetter{}
+			tc.plan.configureEngine(setter)
+			if !reflect.DeepEqual(setter.calls, tc.wantCalls) {
+				t.Fatalf("SetMaxTurnTime calls = %v, want %v", setter.calls, tc.wantCalls)
+			}
+		})
+	}
+}
+
 func TestStopEnginesForShutdownStopsAllEnginesWithoutSignals(t *testing.T) {
 	var order []string
 	e1 := core.NewEngine("one", &stubMainAgent{}, []core.Platform{&shutdownOrderPlatform{name: "p1", order: &order}}, filepath.Join(t.TempDir(), "s1.json"), core.LangEnglish)
