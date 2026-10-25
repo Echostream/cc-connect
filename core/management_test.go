@@ -3285,6 +3285,239 @@ func TestStatusAndConfigContainNoSecretsOrRawTOML(t *testing.T) {
 	}
 }
 
+func TestManagementStatusExposesAllLegacyActiveSessions(t *testing.T) {
+	mgmt, ts, e := testManagementServer(t, "tok")
+	e.projectScheduler.Stop(context.Background())
+	legacy := NewLegacyScheduler(2)
+	e.projectScheduler = legacy
+
+	release := make(chan struct{})
+	started := make(chan string, 2)
+	for i, sessionKey := range []string{"scheduler-session-z", "scheduler-session-a"} {
+		sessionKey := sessionKey
+		result := legacy.Submit(ProjectTask{
+			ID:         fmt.Sprintf("active-%d", i),
+			SessionKey: sessionKey,
+			Run: func(context.Context) TaskResult {
+				started <- sessionKey
+				<-release
+				return TaskResult{}
+			},
+		})
+		if result.Status != SubmitStarted {
+			t.Fatalf("submit %q = %+v, want started", sessionKey, result)
+		}
+	}
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for legacy active tasks")
+		}
+	}
+	t.Cleanup(func() {
+		close(release)
+		legacy.Stop(context.Background())
+	})
+
+	r, code, body := mgmtRequest(t, http.MethodGet, ts.URL+"/api/v1/status", "tok", nil, nil)
+	if code != http.StatusOK || !r.OK {
+		t.Fatalf("status failed code=%d body=%s", code, body)
+	}
+	var data struct {
+		Projects []struct {
+			Name      string `json:"name"`
+			Scheduler struct {
+				Active              int      `json:"active"`
+				ActiveSessionHash   string   `json:"active_session_hash"`
+				ActiveSessionHashes []string `json:"active_session_hashes"`
+			} `json:"scheduler"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal(r.Data, &data); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	if len(data.Projects) != 1 || data.Projects[0].Scheduler.Active != 2 {
+		t.Fatalf("projects = %+v, want one project with two active tasks", data.Projects)
+	}
+	scheduler := data.Projects[0].Scheduler
+	if len(scheduler.ActiveSessionHashes) != 2 {
+		t.Fatalf("active_session_hashes = %#v, want two", scheduler.ActiveSessionHashes)
+	}
+	if !sort.StringsAreSorted(scheduler.ActiveSessionHashes) {
+		t.Fatalf("active_session_hashes not sorted: %#v", scheduler.ActiveSessionHashes)
+	}
+	if scheduler.ActiveSessionHash != scheduler.ActiveSessionHashes[0] {
+		t.Fatalf("active_session_hash = %q, want first plural %q", scheduler.ActiveSessionHash, scheduler.ActiveSessionHashes[0])
+	}
+	for _, raw := range []string{"scheduler-session-z", "scheduler-session-a"} {
+		if strings.Contains(body, raw) {
+			t.Fatalf("status leaked raw session key %q: %s", raw, body)
+		}
+		want := mgmt.hashIdentifier(raw)
+		if scheduler.ActiveSessionHashes[0] != want && scheduler.ActiveSessionHashes[1] != want {
+			t.Fatalf("active_session_hashes = %#v, missing hash for %q", scheduler.ActiveSessionHashes, raw)
+		}
+	}
+}
+
+func TestManagementSchedulerStatusPluralCompatibilityAndDuplicateDefense(t *testing.T) {
+	mgmt := NewManagementServer(0, "tok", nil)
+	payload, err := json.Marshal(mgmt.schedulerStatusDTO(SchedulerSnapshot{
+		ActiveCount: 3,
+		ActiveTasks: []SchedulerTaskSnapshot{
+			{SessionKey: "singleton-session"},
+			{SessionKey: "singleton-session"},
+			{SessionKey: ""},
+		},
+	}))
+	if err != nil {
+		t.Fatalf("marshal scheduler status: %v", err)
+	}
+	var dto struct {
+		ActiveSessionHash   string   `json:"active_session_hash"`
+		ActiveSessionHashes []string `json:"active_session_hashes"`
+	}
+	if err := json.Unmarshal(payload, &dto); err != nil {
+		t.Fatalf("unmarshal scheduler status: %v", err)
+	}
+	if len(dto.ActiveSessionHashes) != 1 {
+		t.Fatalf("active_session_hashes = %#v, want one deduplicated hash", dto.ActiveSessionHashes)
+	}
+	if dto.ActiveSessionHash != dto.ActiveSessionHashes[0] {
+		t.Fatalf("active_session_hash = %q, want singleton plural %q", dto.ActiveSessionHash, dto.ActiveSessionHashes[0])
+	}
+	if dto.ActiveSessionHash == "singleton-session" {
+		t.Fatal("scheduler status exposed raw singleton session key")
+	}
+}
+
+func TestManagementSchedulerStatusIdleSerializesStableEmptyPlural(t *testing.T) {
+	mgmt := NewManagementServer(0, "tok", nil)
+	payload, err := json.Marshal(mgmt.schedulerStatusDTO(SchedulerSnapshot{}))
+	if err != nil {
+		t.Fatalf("marshal idle scheduler status: %v", err)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(payload, &data); err != nil {
+		t.Fatalf("unmarshal idle scheduler status: %v", err)
+	}
+	plural, ok := data["active_session_hashes"].([]any)
+	if !ok || len(plural) != 0 {
+		t.Fatalf("idle active_session_hashes = %#v, want []", data["active_session_hashes"])
+	}
+	if _, exists := data["active_session_hash"]; exists {
+		t.Fatalf("idle active_session_hash should be omitted: %s", payload)
+	}
+}
+
+func TestManagementProjectDetailSeparatesSchedulerAndInteractiveSessions(t *testing.T) {
+	mgmt, ts, e := testManagementServer(t, "tok")
+	schedulerRaw := "scheduler:raw-session-key"
+	interactiveRaw := "interactive:raw-user-identity"
+	release := make(chan struct{})
+	result := e.projectScheduler.Submit(ProjectTask{
+		ID:         "prompt-body-canary attachment-name-canary token-secret-canary",
+		SessionKey: schedulerRaw,
+		Run: func(context.Context) TaskResult {
+			<-release
+			return TaskResult{}
+		},
+	})
+	if result.Status != SubmitStarted {
+		t.Fatalf("submit scheduler task = %+v, want started", result)
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[interactiveRaw] = &interactiveState{}
+	e.interactiveMu.Unlock()
+	t.Cleanup(func() {
+		close(release)
+		e.projectScheduler.Stop(context.Background())
+	})
+
+	r, code, body := mgmtRequest(t, http.MethodGet, ts.URL+"/api/v1/projects/test-project", "tok", nil, nil)
+	if code != http.StatusOK || !r.OK {
+		t.Fatalf("project detail failed code=%d body=%s", code, body)
+	}
+	var data struct {
+		ActiveSessionHashes          []string `json:"active_session_hashes"`
+		InteractiveLiveSessionHashes []string `json:"interactive_live_session_hashes"`
+		Scheduler                    struct {
+			ActiveSessionHash   string   `json:"active_session_hash"`
+			ActiveSessionHashes []string `json:"active_session_hashes"`
+		} `json:"scheduler"`
+	}
+	if err := json.Unmarshal(r.Data, &data); err != nil {
+		t.Fatalf("unmarshal project detail: %v", err)
+	}
+	wantScheduler := mgmt.hashIdentifier(schedulerRaw)
+	wantInteractive := mgmt.hashIdentifier(interactiveRaw)
+	if !reflect.DeepEqual(data.Scheduler.ActiveSessionHashes, []string{wantScheduler}) {
+		t.Fatalf("scheduler active hashes = %#v, want only scheduler hash %q", data.Scheduler.ActiveSessionHashes, wantScheduler)
+	}
+	if data.Scheduler.ActiveSessionHash != wantScheduler {
+		t.Fatalf("scheduler active_session_hash = %q, want singleton plural %q", data.Scheduler.ActiveSessionHash, wantScheduler)
+	}
+	if !reflect.DeepEqual(data.InteractiveLiveSessionHashes, []string{wantInteractive}) {
+		t.Fatalf("interactive live hashes = %#v, want only interactive hash %q", data.InteractiveLiveSessionHashes, wantInteractive)
+	}
+	// active_session_hashes 是兼容旧消费者的 deprecated alias，只能等于 interactive live 集合。
+	if !reflect.DeepEqual(data.ActiveSessionHashes, data.InteractiveLiveSessionHashes) {
+		t.Fatalf("deprecated active_session_hashes alias = %#v, want interactive live %#v", data.ActiveSessionHashes, data.InteractiveLiveSessionHashes)
+	}
+	for _, canary := range []string{schedulerRaw, interactiveRaw, "raw-user-identity", "prompt-body-canary", "attachment-name-canary", "token-secret-canary"} {
+		if strings.Contains(body, canary) {
+			t.Fatalf("project detail leaked %q: %s", canary, body)
+		}
+	}
+}
+
+func TestManagementSessionHashesAreStablePerServerAndSaltIsolated(t *testing.T) {
+	first := NewManagementServer(0, "tok", nil)
+	second := NewManagementServer(0, "tok", nil)
+	key := "stable:raw-session-key"
+	firstHash := first.hashIdentifier(key)
+	if firstHash == "" || firstHash != first.hashIdentifier(key) {
+		t.Fatalf("same server hash is not stable: %q then %q", firstHash, first.hashIdentifier(key))
+	}
+	if secondHash := second.hashIdentifier(key); secondHash == "" || secondHash == firstHash {
+		t.Fatalf("different server salts produced non-isolated hashes: first=%q second=%q", firstHash, secondHash)
+	}
+}
+
+func TestManagementStatusProjectsAreSortedByName(t *testing.T) {
+	mgmt := NewManagementServer(0, "tok", nil)
+	for _, name := range []string{"z-project", "a-project", "m-project"} {
+		engine := NewEngine(name, &stubAgent{}, nil, "", LangEnglish)
+		mgmt.RegisterEngine(name, engine)
+		t.Cleanup(func() { engine.projectScheduler.Stop(context.Background()) })
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	w := httptest.NewRecorder()
+	mgmt.handleStatus(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status code = %d body=%s", w.Code, w.Body.String())
+	}
+	var response struct {
+		Data struct {
+			Projects []struct {
+				Name string `json:"name"`
+			} `json:"projects"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	got := make([]string, len(response.Data.Projects))
+	for i, project := range response.Data.Projects {
+		got[i] = project.Name
+	}
+	want := []string{"a-project", "m-project", "z-project"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("status project order = %v, want %v", got, want)
+	}
+}
+
 func TestStatusExposesCountersAndHashedKeysOnly(t *testing.T) {
 	_, ts, e := testManagementServer(t, "tok")
 	rawKey := "telegram:-100123:owner-open-id"
@@ -3443,7 +3676,7 @@ func TestManagementStatusExactSchemaHashesActiveAndSanitizesHealth(t *testing.T)
 	project := projects[0].(map[string]any)
 	assertManagementKeys(t, "status.project", project, "name", "scheduler")
 	scheduler := project["scheduler"].(map[string]any)
-	assertManagementKeys(t, "status.project.scheduler", scheduler, "active", "active_session_hash", "cancelled", "completed", "expired", "failed", "rejected", "timed_out", "waiting")
+	assertManagementKeys(t, "status.project.scheduler", scheduler, "active", "active_session_hash", "active_session_hashes", "cancelled", "completed", "expired", "failed", "rejected", "timed_out", "waiting")
 	if scheduler["active_session_hash"] == "" || scheduler["active_session_hash"] == rawKey {
 		t.Fatalf("active_session_hash = %#v", scheduler["active_session_hash"])
 	}
@@ -3483,7 +3716,7 @@ func TestManagementProjectDetailExactNestedSchema(t *testing.T) {
 	heartbeat := data["heartbeat"].(map[string]any)
 	assertManagementKeys(t, "project.heartbeat", heartbeat, "enabled", "interval_mins", "paused", "session_hash")
 	scheduler := data["scheduler"].(map[string]any)
-	assertManagementKeys(t, "project.scheduler", scheduler, "active", "cancelled", "completed", "expired", "failed", "rejected", "timed_out", "waiting")
+	assertManagementKeys(t, "project.scheduler", scheduler, "active", "active_session_hashes", "cancelled", "completed", "expired", "failed", "rejected", "timed_out", "waiting")
 }
 
 func TestManagementSensitiveGETRoutesReturnDTOsWithoutRawValues(t *testing.T) {

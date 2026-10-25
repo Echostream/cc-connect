@@ -49,15 +49,16 @@ type managementBridgeStatusDTO struct {
 }
 
 type managementSchedulerStatusDTO struct {
-	Active            int    `json:"active"`
-	Waiting           int    `json:"waiting"`
-	Expired           uint64 `json:"expired"`
-	TimedOut          uint64 `json:"timed_out"`
-	Cancelled         uint64 `json:"cancelled"`
-	Rejected          uint64 `json:"rejected"`
-	Completed         uint64 `json:"completed"`
-	Failed            uint64 `json:"failed"`
-	ActiveSessionHash string `json:"active_session_hash,omitempty"`
+	Active              int      `json:"active"`
+	Waiting             int      `json:"waiting"`
+	Expired             uint64   `json:"expired"`
+	TimedOut            uint64   `json:"timed_out"`
+	Cancelled           uint64   `json:"cancelled"`
+	Rejected            uint64   `json:"rejected"`
+	Completed           uint64   `json:"completed"`
+	Failed              uint64   `json:"failed"`
+	ActiveSessionHash   string   `json:"active_session_hash,omitempty"`
+	ActiveSessionHashes []string `json:"active_session_hashes"`
 }
 
 type managementStatusProjectDTO struct {
@@ -85,16 +86,17 @@ type managementHeartbeatDTO struct {
 }
 
 type managementProjectDetailDTO struct {
-	Name                string                       `json:"name"`
-	AgentType           string                       `json:"agent_type"`
-	Platforms           []map[string]any             `json:"platforms"`
-	SessionsCount       int                          `json:"sessions_count"`
-	ActiveSessionHashes []string                     `json:"active_session_hashes"`
-	Scheduler           managementSchedulerStatusDTO `json:"scheduler"`
-	Heartbeat           *managementHeartbeatDTO      `json:"heartbeat,omitempty"`
-	Settings            managementProjectSettingsDTO `json:"settings"`
-	WorkDirConfigured   bool                         `json:"work_dir_configured"`
-	AgentMode           string                       `json:"agent_mode"`
+	Name                         string                       `json:"name"`
+	AgentType                    string                       `json:"agent_type"`
+	Platforms                    []map[string]any             `json:"platforms"`
+	SessionsCount                int                          `json:"sessions_count"`
+	ActiveSessionHashes          []string                     `json:"active_session_hashes"`
+	InteractiveLiveSessionHashes []string                     `json:"interactive_live_session_hashes"`
+	Scheduler                    managementSchedulerStatusDTO `json:"scheduler"`
+	Heartbeat                    *managementHeartbeatDTO      `json:"heartbeat,omitempty"`
+	Settings                     managementProjectSettingsDTO `json:"settings"`
+	WorkDirConfigured            bool                         `json:"work_dir_configured"`
+	AgentMode                    string                       `json:"agent_mode"`
 }
 
 type managementSessionSummaryDTO struct {
@@ -509,6 +511,24 @@ func (m *ManagementServer) hashIdentifier(value string) string {
 	return "hmac-sha256:" + hex.EncodeToString(sum[:16])
 }
 
+func (m *ManagementServer) hashSessionKeys(keys []string) []string {
+	hashes := make([]string, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		hashed := m.hashIdentifier(key)
+		if hashed == "" {
+			continue
+		}
+		if _, exists := seen[hashed]; exists {
+			continue
+		}
+		seen[hashed] = struct{}{}
+		hashes = append(hashes, hashed)
+	}
+	sort.Strings(hashes)
+	return hashes
+}
+
 func (m *ManagementServer) setCORS(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
 	if origin == "" || !m.isAllowedCORSOrigin(origin) {
@@ -631,18 +651,24 @@ func (m *ManagementServer) handleAgents(w http.ResponseWriter, r *http.Request) 
 }
 
 func (m *ManagementServer) schedulerStatusDTO(snapshot SchedulerSnapshot) managementSchedulerStatusDTO {
-	dto := managementSchedulerStatusDTO{
-		Active:    snapshot.ActiveCount,
-		Waiting:   snapshot.WaitingCount,
-		Expired:   snapshot.Expired,
-		TimedOut:  snapshot.TimedOut,
-		Cancelled: snapshot.Cancelled,
-		Rejected:  snapshot.Rejected,
-		Completed: snapshot.Completed,
-		Failed:    snapshot.Failed,
+	activeSessionKeys := make([]string, 0, len(snapshot.ActiveTasks))
+	for _, task := range snapshot.ActiveTasks {
+		activeSessionKeys = append(activeSessionKeys, task.SessionKey)
 	}
-	if snapshot.Active != nil {
-		dto.ActiveSessionHash = m.hashIdentifier(snapshot.Active.SessionKey)
+	activeSessionHashes := m.hashSessionKeys(activeSessionKeys)
+	dto := managementSchedulerStatusDTO{
+		Active:              snapshot.ActiveCount,
+		Waiting:             snapshot.WaitingCount,
+		Expired:             snapshot.Expired,
+		TimedOut:            snapshot.TimedOut,
+		Cancelled:           snapshot.Cancelled,
+		Rejected:            snapshot.Rejected,
+		Completed:           snapshot.Completed,
+		Failed:              snapshot.Failed,
+		ActiveSessionHashes: activeSessionHashes,
+	}
+	if len(activeSessionHashes) > 0 {
+		dto.ActiveSessionHash = activeSessionHashes[0]
 	}
 	return dto
 }
@@ -702,7 +728,13 @@ func (m *ManagementServer) handleStatus(w http.ResponseWriter, r *http.Request) 
 	platformSet := make(map[string]bool)
 	var degradedEntries []managementDegradedPlatformDTO
 	projects := make([]managementStatusProjectDTO, 0, len(m.engines))
-	for name, e := range m.engines {
+	projectNames := make([]string, 0, len(m.engines))
+	for name := range m.engines {
+		projectNames = append(projectNames, name)
+	}
+	sort.Strings(projectNames)
+	for _, name := range projectNames {
+		e := m.engines[name]
 		schedulerSnapshot := e.projectScheduler.Snapshot()
 		projects = append(projects, managementStatusProjectDTO{
 			Name:      name,
@@ -972,24 +1004,23 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 		sessCount := len(allSessions)
 
 		e.interactiveMu.Lock()
-		keys := make([]string, 0, len(e.interactiveStates))
-		for k := range e.interactiveStates {
-			if hashed := m.hashIdentifier(k); hashed != "" {
-				keys = append(keys, hashed)
-			}
+		interactiveSessionKeys := make([]string, 0, len(e.interactiveStates))
+		for key := range e.interactiveStates {
+			interactiveSessionKeys = append(interactiveSessionKeys, key)
 		}
 		e.interactiveMu.Unlock()
-		sort.Strings(keys)
+		interactiveLiveSessionHashes := m.hashSessionKeys(interactiveSessionKeys)
 
 		schedulerSnapshot := e.projectScheduler.Snapshot()
 
 		data := managementProjectDetailDTO{
-			Name:                name,
-			AgentType:           e.agent.Name(),
-			Platforms:           platInfos,
-			SessionsCount:       sessCount,
-			ActiveSessionHashes: keys,
-			Scheduler:           m.schedulerStatusDTO(schedulerSnapshot),
+			Name:                         name,
+			AgentType:                    e.agent.Name(),
+			Platforms:                    platInfos,
+			SessionsCount:                sessCount,
+			ActiveSessionHashes:          interactiveLiveSessionHashes,
+			InteractiveLiveSessionHashes: interactiveLiveSessionHashes,
+			Scheduler:                    m.schedulerStatusDTO(schedulerSnapshot),
 		}
 
 		if m.heartbeatScheduler != nil {
