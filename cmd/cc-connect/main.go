@@ -312,6 +312,33 @@ func stopEnginesForShutdown(engines []*core.Engine, logErr func(error)) {
 	}
 }
 
+type shutdownWaiter interface {
+	Wait()
+}
+
+const producerShutdownWaitTimeout = 10 * time.Second
+
+func waitProducerForShutdown(name string, waiter shutdownWaiter, timeout time.Duration, logErr func(error)) {
+	if waiter == nil {
+		return
+	}
+	if timeout <= 0 {
+		timeout = producerShutdownWaitTimeout
+	}
+	done := make(chan struct{})
+	go func() {
+		waiter.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		if logErr != nil {
+			logErr(fmt.Errorf("producer %s shutdown wait timeout after %v", name, timeout))
+		}
+	}
+}
+
 func main() {
 	// Agy hooks require stdout to contain only the final JSON decision. Handle
 	// this internal command before update checks, logging, or normal CLI setup.
@@ -1431,14 +1458,14 @@ func main() {
 		bridgeSrv.Stop()
 	}
 	if webhookSrv != nil {
-		webhookSrv.Stop()
+		webhookSrv.CloseAdmission()
 	}
-	heartbeatSched.Stop()
+	heartbeatSched.CloseAdmission()
 	if timerSched != nil {
-		timerSched.Stop()
+		timerSched.CloseAdmission()
 	}
 	if cronSched != nil {
-		cronSched.Stop()
+		cronSched.CloseAdmission()
 	}
 	if apiSrv != nil {
 		apiSrv.Stop()
@@ -1446,6 +1473,24 @@ func main() {
 	stopEnginesForShutdown(engines, func(err error) {
 		slog.Error("shutdown error", "error", err)
 	})
+	if webhookSrv != nil {
+		waitProducerForShutdown("webhook", webhookSrv, producerShutdownWaitTimeout, func(err error) {
+			slog.Error("shutdown error", "error", err)
+		})
+	}
+	waitProducerForShutdown("heartbeat", heartbeatSched, producerShutdownWaitTimeout, func(err error) {
+		slog.Error("shutdown error", "error", err)
+	})
+	if timerSched != nil {
+		waitProducerForShutdown("timer", timerSched, producerShutdownWaitTimeout, func(err error) {
+			slog.Error("shutdown error", "error", err)
+		})
+	}
+	if cronSched != nil {
+		waitProducerForShutdown("cron", cronSched, producerShutdownWaitTimeout, func(err error) {
+			slog.Error("shutdown error", "error", err)
+		})
+	}
 	if logCloser != nil {
 		logCloser.Close()
 	}

@@ -1474,6 +1474,134 @@ func TestConversationScopedCancellation(t *testing.T) {
 	}
 }
 
+func TestProjectCancelTaskWaitsOnlyOwnDetachedCompletionGeneration(t *testing.T) {
+	unrelatedGeneration := &projectCompletionGeneration{remaining: 1}
+	ownGeneration := &projectCompletionGeneration{remaining: 1}
+	done := make(chan struct{})
+	loop := &schedulerLoop{
+		completionGenerations: map[string][]*projectCompletionGeneration{
+			"same-session": []*projectCompletionGeneration{unrelatedGeneration, ownGeneration},
+		},
+		cancelWaiters: []cancelSessionWaiter{{
+			done:        done,
+			generations: []*projectCompletionGeneration{ownGeneration},
+		}},
+	}
+
+	loop.releaseReadyCancelWaiters()
+	select {
+	case <-done:
+		t.Fatal("cancel waiter released while its own completion generation is still pending")
+	default:
+	}
+
+	ownGeneration.remaining = 0
+	loop.releaseReadyCancelWaiters()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancel waiter still blocked by unrelated same-session completion generation")
+	}
+}
+
+func TestCancelTaskContextCancelsOnlyNamedTaskWithinSession(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(6_050, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	t.Cleanup(func() { scheduler.Stop(context.Background()) })
+
+	started := make(chan string, 4)
+	cleaned := make(chan string, 4)
+	finished := make(chan projectSchedulerFinishRecord, 4)
+	activeRelease := make(chan struct{})
+	producerRelease := make(chan struct{})
+	siblingRelease := make(chan struct{})
+
+	if got := scheduler.Submit(ProjectTask{
+		ID:         "interactive",
+		SessionKey: "same-session",
+		Run: func(ctx context.Context) TaskResult {
+			started <- "interactive"
+			select {
+			case <-activeRelease:
+				return TaskResult{State: TaskStateCompleted}
+			case <-ctx.Done():
+				return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+			}
+		},
+		Cleanup:  func() { cleaned <- "interactive" },
+		OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: "interactive", result: result} },
+	}); got.Status != SubmitStarted {
+		t.Fatalf("submit interactive = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "interactive" {
+		t.Fatalf("started = %q", got)
+	}
+	if got := scheduler.Submit(ProjectTask{
+		ID:         "producer",
+		SessionKey: "same-session",
+		Run: func(ctx context.Context) TaskResult {
+			started <- "producer"
+			select {
+			case <-producerRelease:
+				return TaskResult{State: TaskStateCompleted}
+			case <-ctx.Done():
+				return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+			}
+		},
+		Cleanup:  func() { cleaned <- "producer" },
+		OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: "producer", result: result} },
+	}); got.Status != SubmitQueued || got.Position != 1 {
+		t.Fatalf("submit producer = %+v", got)
+	}
+	if got := scheduler.Submit(ProjectTask{
+		ID:         "sibling",
+		SessionKey: "same-session",
+		Run: func(ctx context.Context) TaskResult {
+			started <- "sibling"
+			select {
+			case <-siblingRelease:
+				return TaskResult{State: TaskStateCompleted}
+			case <-ctx.Done():
+				return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+			}
+		},
+		Cleanup:  func() { cleaned <- "sibling" },
+		OnFinish: func(result TaskResult) { finished <- projectSchedulerFinishRecord{id: "sibling", result: result} },
+	}); got.Status != SubmitQueued || got.Position != 2 {
+		t.Fatalf("submit sibling = %+v", got)
+	}
+
+	result := scheduler.CancelTaskContext(context.Background(), "same-session", "producer", CancelStop)
+	if result.ActiveCancelled != 0 || result.WaitingCancelled != 1 || result.Pending {
+		t.Fatalf("CancelTaskContext result = %+v, want waiting=1 pending=false", result)
+	}
+	if got := waitCleanup(t, cleaned); got != "producer" {
+		t.Fatalf("cleanup = %q, want producer", got)
+	}
+	if got := waitFinish(t, finished); got.id != "producer" || got.result.State != TaskStateCancelled {
+		t.Fatalf("producer finish = %+v, want cancelled", got)
+	}
+	assertNoBufferedStart(t, started)
+
+	close(activeRelease)
+	if got := waitCleanup(t, cleaned); got != "interactive" {
+		t.Fatalf("interactive cleanup = %q", got)
+	}
+	if got := waitFinish(t, finished); got.id != "interactive" || got.result.State != TaskStateCompleted {
+		t.Fatalf("interactive finish = %+v", got)
+	}
+	if got := waitStarted(t, started); got != "sibling" {
+		t.Fatalf("next started = %q, want sibling; producer timeout must not cancel sibling", got)
+	}
+	close(siblingRelease)
+	if got := waitCleanup(t, cleaned); got != "sibling" {
+		t.Fatalf("sibling cleanup = %q", got)
+	}
+	if got := waitFinish(t, finished); got.id != "sibling" || got.result.State != TaskStateCompleted {
+		t.Fatalf("sibling finish = %+v", got)
+	}
+}
+
 func TestCancelSessionInvalidScopeAndModeFailClosed(t *testing.T) {
 	clock := newFakeSchedulerClock(time.Unix(6_100, 0))
 	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)

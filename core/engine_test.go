@@ -198,6 +198,53 @@ func (s *resultAgentSession) CurrentSessionID() string                          
 func (s *resultAgentSession) Alive() bool                                          { return true }
 func (s *resultAgentSession) Close() error                                         { return nil }
 
+type recordingTaskIDScheduler struct {
+	mu  sync.Mutex
+	ids []string
+}
+
+func (s *recordingTaskIDScheduler) record(task ProjectTask) SubmitResult {
+	s.mu.Lock()
+	s.ids = append(s.ids, task.ID)
+	s.mu.Unlock()
+	if task.OnFinish != nil {
+		task.OnFinish(TaskResult{State: TaskStateCompleted})
+	}
+	return SubmitResult{Status: SubmitStarted}
+}
+
+func (s *recordingTaskIDScheduler) Submit(task ProjectTask) SubmitResult {
+	return s.record(task)
+}
+
+func (s *recordingTaskIDScheduler) SubmitProactive(task ProjectTask) SubmitResult {
+	return s.record(task)
+}
+
+func (s *recordingTaskIDScheduler) SubmitOnlyIfIdle(task ProjectTask) SubmitResult {
+	return s.record(task)
+}
+
+func (s *recordingTaskIDScheduler) TryBeginLocalMutation(context.Context) (func(), bool) {
+	return func() {}, true
+}
+
+func (s *recordingTaskIDScheduler) Snapshot() SchedulerSnapshot { return SchedulerSnapshot{} }
+
+func (s *recordingTaskIDScheduler) CancelSessionContext(context.Context, string, CancelMode) CancelResult {
+	return CancelResult{}
+}
+
+func (s *recordingTaskIDScheduler) Stop(context.Context) {}
+
+func (s *recordingTaskIDScheduler) submittedIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.ids))
+	copy(out, s.ids)
+	return out
+}
+
 type stubLifecyclePlatform struct {
 	stubPlatformEngine
 	handler            PlatformLifecycleHandler
@@ -13881,6 +13928,62 @@ func TestEngine_AddPlatform_Multiple(t *testing.T) {
 
 	if len(e.platforms) != 3 {
 		t.Fatalf("expected 3 platforms, got %d", len(e.platforms))
+	}
+}
+
+func TestProducerTaskIDUniquePerSubmission(t *testing.T) {
+	scheduler := &recordingTaskIDScheduler{}
+	platform := &stubCronReplyTargetPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "test"},
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{platform}, "", LangEnglish, WithScheduler(scheduler))
+	defer e.cancel()
+
+	job := &CronJob{
+		ID:         "same-cron-job",
+		SessionKey: "test:chat:user",
+		Prompt:     "cron prompt",
+		Mute:       true,
+	}
+	if err := e.ExecuteCronJobContext(context.Background(), job); err != nil {
+		t.Fatalf("first ExecuteCronJobContext() error = %v", err)
+	}
+	if err := e.ExecuteCronJobContext(context.Background(), job); err != nil {
+		t.Fatalf("second ExecuteCronJobContext() error = %v", err)
+	}
+
+	if err := e.ExecuteHeartbeatContext(context.Background(), "test:chat:user", "heartbeat prompt", true); err != nil {
+		t.Fatalf("first ExecuteHeartbeatContext() error = %v", err)
+	}
+	if err := e.ExecuteHeartbeatContext(context.Background(), "test:chat:user", "heartbeat prompt", true); err != nil {
+		t.Fatalf("second ExecuteHeartbeatContext() error = %v", err)
+	}
+
+	timerJob := &TimerJob{
+		ID:         "same-timer-job",
+		SessionKey: "test:chat:user",
+		Prompt:     "timer prompt",
+		Mute:       true,
+	}
+	if err := e.ExecuteTimerJobContext(context.Background(), timerJob); err != nil {
+		t.Fatalf("first ExecuteTimerJobContext() error = %v", err)
+	}
+	if err := e.ExecuteTimerJobContext(context.Background(), timerJob); err != nil {
+		t.Fatalf("second ExecuteTimerJobContext() error = %v", err)
+	}
+
+	ids := scheduler.submittedIDs()
+	if len(ids) != 6 {
+		t.Fatalf("submitted IDs = %v, want 6 submissions", ids)
+	}
+	if ids[0] == ids[1] {
+		t.Fatalf("cron submissions reused task ID %q; producer timeout cancellation cannot distinguish overlapping runs", ids[0])
+	}
+	if ids[2] == ids[3] {
+		t.Fatalf("heartbeat submissions reused task ID %q; producer timeout cancellation cannot distinguish overlapping runs", ids[2])
+	}
+	if ids[4] == ids[5] {
+		t.Fatalf("timer submissions reused task ID %q; producer timeout cancellation cannot distinguish overlapping runs", ids[4])
 	}
 }
 

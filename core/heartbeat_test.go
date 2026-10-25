@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestReadHeartbeatMD(t *testing.T) {
@@ -37,6 +39,35 @@ func TestReadHeartbeatMD_LowerCase(t *testing.T) {
 		t.Errorf("expected %q, got %q", content, got)
 	}
 }
+
+type heartbeatReplyPlatform struct {
+	stubPlatformEngine
+}
+
+func (p *heartbeatReplyPlatform) ReconstructReplyCtx(sessionKey string) (any, error) {
+	return "reply:" + sessionKey, nil
+}
+
+type blockingHeartbeatSession struct {
+	stubAgentSession
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+}
+
+func (s *blockingHeartbeatSession) Send(_ string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.startedOnce.Do(func() { close(s.started) })
+	<-s.release
+	return nil
+}
+
+func (s *blockingHeartbeatSession) Events() <-chan Event {
+	events := make(chan Event, 1)
+	events <- Event{Type: EventResult, Content: "ok", Done: true}
+	return events
+}
+
+func (s *blockingHeartbeatSession) CurrentSessionID() string { return "heartbeat-session" }
 
 func TestHeartbeatScheduler_RegisterSkipsDisabled(t *testing.T) {
 	hs := NewHeartbeatScheduler("")
@@ -153,6 +184,148 @@ func TestHeartbeatScheduler_SetInterval(t *testing.T) {
 	if hs.SetInterval("nonexistent", 5) {
 		t.Error("set interval nonexistent should fail")
 	}
+}
+
+func TestHeartbeatScheduler_RejectsTriggerNowAfterStop(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	sess := &blockingHeartbeatSession{started: started, release: release}
+	platform := &heartbeatReplyPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &resultAgent{session: sess}, []Platform{platform}, "", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+
+	hs := NewHeartbeatScheduler("")
+	hs.Register("proj", HeartbeatConfig{Enabled: true, SessionKey: "test:heartbeat:user", IntervalMins: 30, TimeoutMins: 1, Silent: true}, e, "")
+	hs.Stop()
+
+	if hs.TriggerNow("proj") {
+		t.Fatal("TriggerNow should reject after Stop")
+	}
+	select {
+	case <-started:
+		t.Fatal("heartbeat started after Stop")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+}
+
+func TestHeartbeatScheduler_StopWaitsForInFlightTriggerNow(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	sess := &blockingHeartbeatSession{started: started, release: release}
+	platform := &heartbeatReplyPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &resultAgent{session: sess}, []Platform{platform}, "", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+
+	hs := NewHeartbeatScheduler("")
+	hs.Register("proj", HeartbeatConfig{Enabled: true, SessionKey: "test:heartbeat:user", IntervalMins: 30, TimeoutMins: 1, Silent: true}, e, "")
+
+	if !hs.TriggerNow("proj") {
+		t.Fatal("TriggerNow should accept registered project")
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat did not start")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		hs.Stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned before in-flight heartbeat completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return after in-flight heartbeat completed")
+	}
+}
+
+func TestHeartbeatScheduler_StartAfterStopDoesNotCreateTicker(t *testing.T) {
+	hs := NewHeartbeatScheduler("")
+	hs.Register("proj", HeartbeatConfig{Enabled: true, SessionKey: "test:heartbeat:user", IntervalMins: 30, TimeoutMins: 1}, nil, "")
+	hs.Stop()
+
+	hs.Start()
+
+	hs.mu.Lock()
+	entry := hs.entries["proj"]
+	var ticker *time.Ticker
+	if entry != nil {
+		ticker = entry.ticker
+	}
+	hs.mu.Unlock()
+	if ticker != nil {
+		t.Fatal("Start after Stop created a ticker")
+	}
+}
+
+func TestHeartbeatScheduler_ResumeAfterStopRejected(t *testing.T) {
+	hs := NewHeartbeatScheduler("")
+	hs.Register("proj", HeartbeatConfig{Enabled: true, SessionKey: "test:heartbeat:user", IntervalMins: 30, TimeoutMins: 1}, nil, "")
+	if !hs.Pause("proj") {
+		t.Fatal("Pause should succeed before Stop")
+	}
+	hs.Stop()
+
+	if hs.Resume("proj") {
+		t.Fatal("Resume after Stop should be rejected")
+	}
+}
+
+func TestHeartbeatScheduler_SetIntervalAfterStopRejected(t *testing.T) {
+	hs := NewHeartbeatScheduler("")
+	hs.Register("proj", HeartbeatConfig{Enabled: true, SessionKey: "test:heartbeat:user", IntervalMins: 30, TimeoutMins: 1}, nil, "")
+	hs.Stop()
+
+	if hs.SetInterval("proj", 10) {
+		t.Fatal("SetInterval after Stop should be rejected")
+	}
+	st := hs.Status("proj")
+	if st == nil {
+		t.Fatal("missing heartbeat status")
+	}
+	if st.IntervalMins != 30 {
+		t.Fatalf("interval mutated after Stop: got %d, want 30", st.IntervalMins)
+	}
+}
+
+func TestHeartbeatScheduler_TriggerNowSnapshotsConfigWithoutRacingSetInterval(t *testing.T) {
+	platform := &heartbeatReplyPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{platform}, "", LangEnglish, WithScheduler(&recordingTaskIDScheduler{}))
+	t.Cleanup(func() { _ = e.Stop() })
+
+	hs := NewHeartbeatScheduler("")
+	hs.Register("proj", HeartbeatConfig{
+		Enabled:      true,
+		SessionKey:   "test:heartbeat:user",
+		IntervalMins: 30,
+		TimeoutMins:  1,
+		Silent:       true,
+	}, e, "")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			hs.TriggerNow("proj")
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			hs.SetInterval("proj", 1+(i%5))
+		}(i)
+	}
+	wg.Wait()
+	hs.Wait()
 }
 
 func TestHeartbeatScheduler_Persistence(t *testing.T) {

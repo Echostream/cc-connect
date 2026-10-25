@@ -114,7 +114,6 @@ func TestMutePlatform_DiscardMessages(t *testing.T) {
 	}
 }
 
-
 func TestCronJob_MuteField(t *testing.T) {
 	job := &CronJob{ID: "m1", Mute: false}
 	if job.Mute {
@@ -365,6 +364,65 @@ func TestCronStore_JobsPath(t *testing.T) {
 	expected := filepath.Join(dir, "crons", "jobs.json")
 	if store.path != expected {
 		t.Errorf("store path = %q, want %q", store.path, expected)
+	}
+}
+
+func TestCronScheduler_StopWaitsForInFlightManualRun(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewCronStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler := NewCronScheduler(store)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	sess := &blockingTimerSession{started: started, release: release}
+	platform := &timerReplyPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &resultAgent{session: sess}, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	e.SetCronScheduler(scheduler)
+	t.Cleanup(func() { _ = e.Stop() })
+	scheduler.RegisterEngine("test", e)
+	zeroTimeout := 0
+	if err := store.Add(&CronJob{
+		ID:          "manual-stop",
+		Project:     "test",
+		SessionKey:  "test:cron:user",
+		CronExpr:    "0 6 * * *",
+		Prompt:      "cron prompt",
+		Enabled:     false,
+		Mute:        true,
+		TimeoutMins: &zeroTimeout,
+		CreatedAt:   time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := scheduler.RunJobNow("manual-stop"); err != nil {
+		t.Fatalf("RunJobNow() error = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("manual cron run did not start")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		scheduler.Stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned before in-flight manual cron completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return after in-flight manual cron completed")
 	}
 }
 
@@ -630,6 +688,135 @@ func TestCronScheduler_AddJob_NegativeTimeoutMins(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for negative timeout_mins")
+	}
+}
+
+func TestCronScheduler_StartAfterStopRejected(t *testing.T) {
+	store, err := NewCronStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := NewCronScheduler(store)
+	cs.Stop()
+
+	if err := cs.Start(); err == nil {
+		t.Fatal("Start after Stop should return an error")
+	}
+}
+
+func TestCronScheduler_EnableJobAfterStopDoesNotMutateStore(t *testing.T) {
+	store, err := NewCronStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := NewCronScheduler(store)
+	job := &CronJob{
+		ID: "enable-after-stop", Project: "p", SessionKey: "test:1:1",
+		CronExpr: "0 6 * * *", Prompt: "hi", Enabled: false,
+	}
+	if err := store.Add(job); err != nil {
+		t.Fatal(err)
+	}
+	cs.Stop()
+
+	if err := cs.EnableJob(job.ID); err == nil {
+		t.Fatal("EnableJob after Stop should return an error")
+	}
+	stored := store.Get(job.ID)
+	if stored == nil {
+		t.Fatal("stored job missing")
+	}
+	if stored.Enabled {
+		t.Fatal("EnableJob after Stop mutated store to enabled")
+	}
+}
+
+func TestCronScheduler_UpdateJobAfterStopDoesNotMutateStore(t *testing.T) {
+	store, err := NewCronStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := NewCronScheduler(store)
+	job := &CronJob{
+		ID: "update-after-stop", Project: "p", SessionKey: "test:1:1",
+		CronExpr: "0 6 * * *", Prompt: "hi", Enabled: false,
+	}
+	if err := store.Add(job); err != nil {
+		t.Fatal(err)
+	}
+	cs.Stop()
+
+	if err := cs.UpdateJob(job.ID, "enabled", true); err == nil {
+		t.Fatal("UpdateJob after Stop should return an error")
+	}
+	stored := store.Get(job.ID)
+	if stored == nil {
+		t.Fatal("stored job missing")
+	}
+	if stored.Enabled {
+		t.Fatal("UpdateJob after Stop mutated store to enabled")
+	}
+}
+
+func TestCronScheduler_EnableJobScheduleFailureDoesNotMutateStore(t *testing.T) {
+	store, err := NewCronStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := NewCronScheduler(store)
+	job := &CronJob{
+		ID: "enable-invalid", Project: "p", SessionKey: "test:1:1",
+		CronExpr: "not a cron", Prompt: "hi", Enabled: false,
+	}
+	if err := store.Add(job); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cs.EnableJob(job.ID); err == nil {
+		t.Fatal("EnableJob should return schedule error for invalid stored cron expression")
+	}
+	stored := store.Get(job.ID)
+	if stored == nil {
+		t.Fatal("stored job missing")
+	}
+	if stored.Enabled {
+		t.Fatal("EnableJob schedule failure mutated store to enabled")
+	}
+	if _, ok := cs.entries[job.ID]; ok {
+		t.Fatal("EnableJob schedule failure left a cron entry installed")
+	}
+}
+
+func TestCronScheduler_UpdateJobScheduleFailureKeepsExistingSchedule(t *testing.T) {
+	store, err := NewCronStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := NewCronScheduler(store)
+	job := &CronJob{
+		ID: "update-invalid", Project: "p", SessionKey: "test:1:1",
+		CronExpr: "0 6 * * *", Prompt: "hi", Enabled: true,
+	}
+	if err := cs.AddJob(job); err != nil {
+		t.Fatal(err)
+	}
+	oldEntry, ok := cs.entries[job.ID]
+	if !ok {
+		t.Fatal("AddJob did not install initial cron entry")
+	}
+
+	// Simulate a malformed persisted job from an older version while an already
+	// installed schedule is still active. Updating enabled must not remove the old
+	// entry unless the replacement schedule is known to be valid.
+	store.Get(job.ID).CronExpr = "not a cron"
+	if err := cs.UpdateJob(job.ID, "enabled", true); err == nil {
+		t.Fatal("UpdateJob should return reschedule error for invalid stored cron expression")
+	}
+	if got, ok := cs.entries[job.ID]; !ok || got != oldEntry {
+		t.Fatalf("UpdateJob schedule failure replaced entries[%q]=%v, want preserved %v", job.ID, got, oldEntry)
+	}
+	if stored := store.Get(job.ID); stored == nil || !stored.Enabled {
+		t.Fatalf("stored job = %#v, want still enabled with old schedule preserved", stored)
 	}
 }
 

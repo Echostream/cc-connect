@@ -1,9 +1,9 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -51,6 +51,7 @@ type HeartbeatScheduler struct {
 	stopCh    chan struct{}
 	stopped   bool
 	stateFile string // path to heartbeat_state.json; empty = no persistence
+	inflight  sync.WaitGroup
 }
 
 type heartbeatEntry struct {
@@ -70,6 +71,14 @@ type heartbeatEntry struct {
 	skippedBusy int
 	lastRun     time.Time
 	lastError   string
+}
+
+type heartbeatExecution struct {
+	entry   *heartbeatEntry
+	project string
+	config  HeartbeatConfig
+	engine  *Engine
+	workDir string
 }
 
 func NewHeartbeatScheduler(dataDir string) *HeartbeatScheduler {
@@ -121,6 +130,9 @@ func (hs *HeartbeatScheduler) Register(project string, cfg HeartbeatConfig, engi
 func (hs *HeartbeatScheduler) Start() {
 	hs.mu.Lock()
 	defer hs.mu.Unlock()
+	if hs.stopped {
+		return
+	}
 	for _, entry := range hs.entries {
 		hs.startEntry(entry)
 	}
@@ -146,11 +158,13 @@ func (hs *HeartbeatScheduler) startEntry(entry *heartbeatEntry) {
 	)
 }
 
-// Stop halts all heartbeat tickers.
-func (hs *HeartbeatScheduler) Stop() {
+// CloseAdmission halts heartbeat tickers and rejects new manual triggers without
+// waiting for already accepted runs. Call Wait after stopping engines so producer
+// work blocked inside Engine can observe cancellation and drain.
+func (hs *HeartbeatScheduler) CloseAdmission() {
 	hs.mu.Lock()
-	defer hs.mu.Unlock()
 	if hs.stopped {
+		hs.mu.Unlock()
 		return
 	}
 	hs.stopped = true
@@ -165,6 +179,17 @@ func (hs *HeartbeatScheduler) Stop() {
 			close(entry.stopCh)
 		}
 	}
+	hs.mu.Unlock()
+}
+
+func (hs *HeartbeatScheduler) Wait() {
+	hs.inflight.Wait()
+}
+
+// Stop halts all heartbeat tickers and waits for already accepted runs to finish.
+func (hs *HeartbeatScheduler) Stop() {
+	hs.CloseAdmission()
+	hs.Wait()
 }
 
 // Status returns the heartbeat status for a project.
@@ -214,6 +239,9 @@ func (hs *HeartbeatScheduler) Pause(project string) bool {
 func (hs *HeartbeatScheduler) Resume(project string) bool {
 	hs.mu.Lock()
 	defer hs.mu.Unlock()
+	if hs.stopped {
+		return false
+	}
 	entry, ok := hs.entries[project]
 	if !ok {
 		return false
@@ -238,6 +266,9 @@ func (hs *HeartbeatScheduler) SetInterval(project string, mins int) bool {
 	}
 	hs.mu.Lock()
 	defer hs.mu.Unlock()
+	if hs.stopped {
+		return false
+	}
 	entry, ok := hs.entries[project]
 	if !ok {
 		return false
@@ -256,11 +287,23 @@ func (hs *HeartbeatScheduler) SetInterval(project string, mins int) bool {
 func (hs *HeartbeatScheduler) TriggerNow(project string) bool {
 	hs.mu.Lock()
 	entry, ok := hs.entries[project]
-	hs.mu.Unlock()
-	if !ok {
+	if !ok || hs.stopped {
+		hs.mu.Unlock()
 		return false
 	}
-	go hs.execute(entry)
+	exec := heartbeatExecution{
+		entry:   entry,
+		project: entry.project,
+		config:  entry.config,
+		engine:  entry.engine,
+		workDir: entry.workDir,
+	}
+	hs.inflight.Add(1)
+	hs.mu.Unlock()
+	go func() {
+		defer hs.inflight.Done()
+		hs.execute(exec)
+	}()
 	return true
 }
 
@@ -327,58 +370,68 @@ func (hs *HeartbeatScheduler) run(entry *heartbeatEntry) {
 		case <-entry.ticker.C:
 			hs.mu.Lock()
 			paused := entry.paused
+			stopped := hs.stopped
+			var exec heartbeatExecution
+			if !paused && !stopped {
+				exec = heartbeatExecution{
+					entry:   entry,
+					project: entry.project,
+					config:  entry.config,
+					engine:  entry.engine,
+					workDir: entry.workDir,
+				}
+				hs.inflight.Add(1)
+			}
 			hs.mu.Unlock()
-			if !paused {
-				hs.execute(entry)
+			if !paused && !stopped {
+				hs.execute(exec)
+				hs.inflight.Done()
 			}
 		}
 	}
 }
 
-func (hs *HeartbeatScheduler) execute(entry *heartbeatEntry) {
-	cfg := entry.config
+func (hs *HeartbeatScheduler) execute(exec heartbeatExecution) {
+	cfg := exec.config
 
 	prompt := cfg.Prompt
 	if prompt == "" {
-		prompt = readHeartbeatMD(entry.workDir)
+		prompt = readHeartbeatMD(exec.workDir)
 	}
 	if prompt == "" {
 		prompt = defaultHeartbeatPrompt
 	}
 
-	slog.Info("heartbeat: executing", "project", entry.project, "session_key", cfg.SessionKey, "prompt_len", len(prompt))
+	slog.Info("heartbeat: executing", "project", exec.project, "session_key", cfg.SessionKey, "prompt_len", len(prompt))
 
 	timeout := time.Duration(cfg.TimeoutMins) * time.Minute
-	done := make(chan error, 1)
-	go func() {
-		if cfg.OnlyWhenIdle {
-			done <- entry.engine.ExecuteHeartbeatOnlyIfIdle(cfg.SessionKey, prompt, cfg.Silent)
-		} else {
-			done <- entry.engine.ExecuteHeartbeat(cfg.SessionKey, prompt, cfg.Silent)
-		}
-	}()
-
-	var err error
-	select {
-	case err = <-done:
-	case <-time.After(timeout):
-		err = fmt.Errorf("heartbeat timed out after %v", timeout)
+	ctx := context.Background()
+	cancel := func() {}
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
 	}
+	var err error
+	if cfg.OnlyWhenIdle {
+		err = exec.engine.ExecuteHeartbeatOnlyIfIdleContext(ctx, cfg.SessionKey, prompt, cfg.Silent)
+	} else {
+		err = exec.engine.ExecuteHeartbeatContext(ctx, cfg.SessionKey, prompt, cfg.Silent)
+	}
+	cancel()
 
 	hs.mu.Lock()
-	entry.runCount++
-	entry.lastRun = time.Now()
+	exec.entry.runCount++
+	exec.entry.lastRun = time.Now()
 	if errors.Is(err, errProjectSchedulerBusy) {
-		entry.skippedBusy++
-		entry.lastError = ""
-		slog.Debug("heartbeat: project busy, skipping", "project", entry.project, "session_key", cfg.SessionKey)
+		exec.entry.skippedBusy++
+		exec.entry.lastError = ""
+		slog.Debug("heartbeat: project busy, skipping", "project", exec.project, "session_key", cfg.SessionKey)
 	} else if err != nil {
-		entry.errorCount++
-		entry.lastError = err.Error()
-		slog.Error("heartbeat: execution failed", "project", entry.project, "error", err)
+		exec.entry.errorCount++
+		exec.entry.lastError = err.Error()
+		slog.Error("heartbeat: execution failed", "project", exec.project, "error", err)
 	} else {
-		entry.lastError = ""
-		slog.Info("heartbeat: execution completed", "project", entry.project)
+		exec.entry.lastError = ""
+		slog.Info("heartbeat: execution completed", "project", exec.project)
 	}
 	hs.mu.Unlock()
 }

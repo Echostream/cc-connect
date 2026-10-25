@@ -857,6 +857,12 @@ type EngineProactiveScheduler interface {
 	SubmitProactive(ProjectTask) SubmitResult
 }
 
+// EngineTaskCancellationScheduler 是可选 capability，用于 producer timeout 只取消
+// 本次 producer 提交的 ProjectTask，而不是按 SessionKey 扩大取消到同会话其他工作。
+type EngineTaskCancellationScheduler interface {
+	CancelTaskContext(context.Context, string, string, CancelMode) CancelResult
+}
+
 // EngineActiveTurnSupplementScheduler 是可选 capability：只有调度器能证明目标
 // SessionKey 仍持有当前 active turn 且 generation 未过期时，才允许 /ps、/btw 这类
 // active-turn 文本补充进入后端。调用方不得在不支持该 capability 时回退到
@@ -1628,6 +1634,14 @@ func newAttachmentFailureTaskID() string {
 	return "att-" + hex.EncodeToString(b[:])
 }
 
+func newProducerTaskID(prefix string) string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%s:%d", prefix, time.Now().UnixNano())
+	}
+	return prefix + ":" + hex.EncodeToString(b[:])
+}
+
 func attachmentFailureUserMessage(taskID string) string {
 	return fmt.Sprintf("Attachment could not be processed. Please check the file type and size, then resend. task_id=%s", taskID)
 }
@@ -1735,6 +1749,7 @@ func (e *Engine) ActiveSessionKeys() []string {
 
 type projectAgentTaskRequest struct {
 	ID               string
+	WaitCtx          context.Context
 	Source           AgentTriggerSource
 	SessionKey       string
 	RunSessionKey    string
@@ -1781,7 +1796,14 @@ func (e *Engine) supplementInteractiveActiveTurn(ctx context.Context, interactiv
 	return supplementer.SupplementActiveTurn(ctx, req)
 }
 
-func (e *Engine) submitProjectAgentTaskAndWait(req projectAgentTaskRequest) error {
+type submittedProjectAgentTask struct {
+	done          <-chan TaskResult
+	taskID        string
+	runSessionKey string
+	source        AgentTriggerSource
+}
+
+func (e *Engine) submitProjectAgentTask(req projectAgentTaskRequest) (*submittedProjectAgentTask, error) {
 	if req.RunSessionKey == "" {
 		req.RunSessionKey = req.SessionKey
 	}
@@ -1799,7 +1821,7 @@ func (e *Engine) submitProjectAgentTaskAndWait(req projectAgentTaskRequest) erro
 	}
 	staged, err := e.prepareMessageAttachmentsForSubmit(&req.Message, req.Agent, req.WorkspaceDir)
 	if err != nil {
-		return fmt.Errorf("attachment_failed")
+		return nil, fmt.Errorf("attachment_failed")
 	}
 	taskID := req.ID
 	if taskID == "" {
@@ -1881,30 +1903,78 @@ func (e *Engine) submitProjectAgentTaskAndWait(req projectAgentTaskRequest) erro
 	switch result.Status {
 	case SubmitStarted, SubmitQueued:
 	case SubmitRejectedBusy:
-		return errProjectSchedulerBusy
+		return nil, errProjectSchedulerBusy
 	case SubmitRejectedFull:
-		return fmt.Errorf("project scheduler full")
+		return nil, fmt.Errorf("project scheduler full")
 	case SubmitRejectedStopped:
-		return fmt.Errorf("project scheduler stopped")
+		return nil, fmt.Errorf("project scheduler stopped")
 	case SubmitRejectedNotificationBacklog:
-		return fmt.Errorf("project scheduler notification backlog full")
+		return nil, fmt.Errorf("project scheduler notification backlog full")
 	default:
-		return fmt.Errorf("project scheduler rejected task: %s", result.Status)
+		return nil, fmt.Errorf("project scheduler rejected task: %s", result.Status)
 	}
-	finished := <-done
+	return &submittedProjectAgentTask{
+		done:          done,
+		taskID:        taskID,
+		runSessionKey: req.RunSessionKey,
+		source:        req.Source,
+	}, nil
+}
+
+const producerTaskCancelWaitTimeout = 2 * time.Second
+
+func (e *Engine) waitSubmittedProjectAgentTask(waitCtx context.Context, submitted *submittedProjectAgentTask) error {
+	if waitCtx == nil {
+		waitCtx = context.Background()
+	}
+	var finished TaskResult
+	select {
+	case finished = <-submitted.done:
+	case <-waitCtx.Done():
+		cancelCtx, cancel := context.WithTimeout(context.Background(), producerTaskCancelWaitTimeout)
+		defer cancel()
+		if canceller, ok := e.projectScheduler.(EngineTaskCancellationScheduler); ok {
+			result := canceller.CancelTaskContext(cancelCtx, submitted.runSessionKey, submitted.taskID, CancelStop)
+			if result.Pending {
+				slog.Warn("project task cancellation still pending", "task_id", submitted.taskID, "source", submitted.source)
+			}
+		} else {
+			slog.Warn("project scheduler does not support task-scoped cancellation", "task_id", submitted.taskID, "source", submitted.source)
+		}
+		select {
+		case finished = <-submitted.done:
+		case <-cancelCtx.Done():
+			return waitCtx.Err()
+		}
+	}
 	if finished.Err != nil {
 		return finished.Err
 	}
 	if finished.State != TaskStateCompleted {
-		return fmt.Errorf("project task %s ended with %s", taskID, finished.State)
+		return fmt.Errorf("project task %s ended with %s", submitted.taskID, finished.State)
 	}
 	return nil
+}
+
+func (e *Engine) submitProjectAgentTaskAndWait(req projectAgentTaskRequest) error {
+	submitted, err := e.submitProjectAgentTask(req)
+	if err != nil {
+		return err
+	}
+	return e.waitSubmittedProjectAgentTask(req.WaitCtx, submitted)
 }
 
 // ExecuteCronJob runs a cron job by injecting a synthetic message into the engine.
 // It finds the platform that owns the session key, reconstructs a reply context,
 // and processes the message as if the user sent it.
 func (e *Engine) ExecuteCronJob(job *CronJob) error {
+	return e.ExecuteCronJobContext(context.Background(), job)
+}
+
+func (e *Engine) ExecuteCronJobContext(ctx context.Context, job *CronJob) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	e.hooks.Emit(HookEvent{
 		Event:      HookEventCronTriggered,
 		SessionKey: job.SessionKey,
@@ -2069,7 +2139,8 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	}
 
 	return e.submitProjectAgentTaskAndWait(projectAgentTaskRequest{
-		ID:               job.ID,
+		ID:               newProducerTaskID("cron:" + job.ID),
+		WaitCtx:          ctx,
 		Source:           TaskSourceCron,
 		SessionKey:       sessionKey,
 		RunSessionKey:    runSessionKey,
@@ -2090,6 +2161,13 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 // notification (unless muted), and either runs a shell command or injects a
 // synthetic message into the agent session.
 func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
+	return e.ExecuteTimerJobContext(context.Background(), job)
+}
+
+func (e *Engine) ExecuteTimerJobContext(ctx context.Context, job *TimerJob) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	e.hooks.Emit(HookEvent{
 		Event:      HookEventTimerTriggered,
 		SessionKey: job.SessionKey,
@@ -2248,7 +2326,8 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 	}
 
 	return e.submitProjectAgentTaskAndWait(projectAgentTaskRequest{
-		ID:            job.ID,
+		ID:            newProducerTaskID("timer:" + job.ID),
+		WaitCtx:       ctx,
 		Source:        TaskSourceTimer,
 		SessionKey:    sessionKey,
 		RunSessionKey: runSessionKey,
@@ -2660,14 +2739,25 @@ func (e *Engine) finishCronShell(p Platform, replyCtx any, cmd *exec.Cmd, mu *sy
 // ExecuteHeartbeat runs a heartbeat check by injecting a synthetic message
 // into the main session, similar to cron but designed for periodic awareness.
 func (e *Engine) ExecuteHeartbeat(sessionKey, prompt string, silent bool) error {
-	return e.executeHeartbeat(sessionKey, prompt, silent, false)
+	return e.ExecuteHeartbeatContext(context.Background(), sessionKey, prompt, silent)
+}
+
+func (e *Engine) ExecuteHeartbeatContext(ctx context.Context, sessionKey, prompt string, silent bool) error {
+	return e.executeHeartbeat(ctx, sessionKey, prompt, silent, false)
 }
 
 func (e *Engine) ExecuteHeartbeatOnlyIfIdle(sessionKey, prompt string, silent bool) error {
-	return e.executeHeartbeat(sessionKey, prompt, silent, true)
+	return e.ExecuteHeartbeatOnlyIfIdleContext(context.Background(), sessionKey, prompt, silent)
 }
 
-func (e *Engine) executeHeartbeat(sessionKey, prompt string, silent bool, onlyIfIdle bool) error {
+func (e *Engine) ExecuteHeartbeatOnlyIfIdleContext(ctx context.Context, sessionKey, prompt string, silent bool) error {
+	return e.executeHeartbeat(ctx, sessionKey, prompt, silent, true)
+}
+
+func (e *Engine) executeHeartbeat(ctx context.Context, sessionKey, prompt string, silent bool, onlyIfIdle bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	platformName := ""
 	if idx := strings.Index(sessionKey, ":"); idx > 0 {
 		platformName = sessionKey[:idx]
@@ -2723,7 +2813,8 @@ func (e *Engine) executeHeartbeat(sessionKey, prompt string, silent bool, onlyIf
 	}
 
 	return e.submitProjectAgentTaskAndWait(projectAgentTaskRequest{
-		ID:         "heartbeat:" + sessionKey,
+		ID:         newProducerTaskID("heartbeat:" + sessionKey),
+		WaitCtx:    ctx,
 		Source:     TaskSourceHeartbeat,
 		SessionKey: sessionKey,
 		Platform:   targetPlatform,
@@ -9204,6 +9295,17 @@ func shellExecCommand(ctx context.Context, shell, flag, shellProfile, command st
 		return exec.CommandContext(ctx, shell, "-NoProfile", "-ExecutionPolicy", "Bypass", flag, command)
 	}
 	return exec.CommandContext(ctx, shell, flag, command)
+}
+
+func shellExecCommandNoContext(shell, flag, shellProfile, command string) *exec.Cmd {
+	if shellProfile != "" {
+		command = shellProfile + "\n" + command
+	}
+	base := strings.ToLower(filepath.Base(shell))
+	if strings.HasPrefix(base, "powershell") || strings.HasPrefix(base, "pwsh") {
+		return exec.Command(shell, "-NoProfile", "-ExecutionPolicy", "Bypass", flag, command)
+	}
+	return exec.Command(shell, flag, command)
 }
 
 func defaultShell() string {

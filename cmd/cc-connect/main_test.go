@@ -673,3 +673,28 @@ func TestStopEnginesForShutdownStopsAllEnginesWithoutSignals(t *testing.T) {
 		t.Fatalf("shutdown platform stop order = %q, want %q", got, want)
 	}
 }
+
+type blockingShutdownWaiter struct {
+	release chan struct{}
+}
+
+func (w blockingShutdownWaiter) Wait() {
+	<-w.release
+}
+
+func TestWaitProducerForShutdownTimesOut(t *testing.T) {
+	waiter := blockingShutdownWaiter{release: make(chan struct{})}
+	defer close(waiter.release)
+	var logged []string
+
+	start := time.Now()
+	waitProducerForShutdown("blocked", waiter, 20*time.Millisecond, func(err error) {
+		logged = append(logged, err.Error())
+	})
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("waitProducerForShutdown blocked for %v", elapsed)
+	}
+	if len(logged) != 1 || !strings.Contains(logged[0], "blocked") || !strings.Contains(logged[0], "timeout") {
+		t.Fatalf("logged errors = %v, want one timeout mentioning producer", logged)
+	}
+}

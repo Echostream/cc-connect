@@ -1,11 +1,45 @@
 package core
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestTimerSchedulerStartAfterStopDoesNotMutateStore(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewTimerStore(dir)
+	if err != nil {
+		t.Fatalf("NewTimerStore: %v", err)
+	}
+	job := &TimerJob{
+		ID:          "stale-after-stop",
+		Project:     "test",
+		SessionKey:  "session",
+		ScheduledAt: time.Now().Add(-missedJobGracePeriod - time.Minute),
+		Prompt:      "should remain pending",
+		CreatedAt:   time.Now().Add(-time.Hour),
+	}
+	if err := store.Add(job); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	scheduler := NewTimerScheduler(store)
+	scheduler.Stop()
+	if err := scheduler.Start(); err == nil {
+		t.Fatal("Start after Stop succeeded; want stopped error")
+	}
+	got := store.Get(job.ID)
+	if got == nil {
+		t.Fatal("job missing after Start on stopped scheduler")
+	}
+	if got.Fired || !got.FiredAt.IsZero() || got.LastError != "" {
+		t.Fatalf("Start after Stop mutated job = %+v", got)
+	}
+}
 
 func TestParseDelayOrTime_Relative(t *testing.T) {
 	tests := []struct {
@@ -17,11 +51,11 @@ func TestParseDelayOrTime_Relative(t *testing.T) {
 		{"1h30m", false},
 		{"2h30m15s", false},
 		{"500ms", false},
-		{"0s", true},       // zero = not positive
-		{"-1h", true},      // negative
-		{"", true},         // empty
-		{"garbage", true},  // invalid
-		{"2", true},        // bare number
+		{"0s", true},      // zero = not positive
+		{"-1h", true},     // negative
+		{"", true},        // empty
+		{"garbage", true}, // invalid
+		{"2", true},       // bare number
 	}
 
 	for _, tt := range tests {
@@ -278,6 +312,127 @@ func TestTimerScheduler_FiresOnTime(t *testing.T) {
 	}
 	if !got.Fired {
 		t.Error("job not marked as fired")
+	}
+}
+
+type timerReplyPlatform struct {
+	stubPlatformEngine
+}
+
+func (p *timerReplyPlatform) ReconstructReplyCtx(sessionKey string) (any, error) {
+	return "reply:" + sessionKey, nil
+}
+
+type blockingTimerSession struct {
+	stubAgentSession
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+}
+
+func (s *blockingTimerSession) Send(_ string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.startedOnce.Do(func() { close(s.started) })
+	<-s.release
+	return nil
+}
+
+func (s *blockingTimerSession) Events() <-chan Event {
+	events := make(chan Event, 1)
+	events <- Event{Type: EventResult, Content: "ok", Done: true}
+	return events
+}
+
+func (s *blockingTimerSession) CurrentSessionID() string { return "timer-session" }
+
+func TestExecuteTimerJobContext_WaitsForCancelledTaskToSettle(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	sess := &blockingTimerSession{started: started, release: release}
+	platform := &timerReplyPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &resultAgent{session: sess}, []Platform{platform}, "", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- e.ExecuteTimerJobContext(ctx, &TimerJob{ID: "ctx-timeout", Project: "test", SessionKey: "test:timer:user", Prompt: "timer", Mute: true})
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timer job did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("ExecuteTimerJobContext returned before cancelled task settled: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("ExecuteTimerJobContext returned nil after context cancellation")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ExecuteTimerJobContext did not return after cancelled task settled")
+	}
+}
+
+func TestTimerScheduler_StopWaitsForInFlightJob(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewTimerStore(dir)
+	if err != nil {
+		t.Fatalf("NewTimerStore: %v", err)
+	}
+	sched := NewTimerScheduler(store)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	sess := &blockingTimerSession{started: started, release: release}
+	platform := &timerReplyPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &resultAgent{session: sess}, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	e.SetTimerScheduler(sched)
+	t.Cleanup(func() { _ = e.Stop() })
+	sched.RegisterEngine("test", e)
+
+	zeroTimeout := 0
+	job := &TimerJob{
+		ID:          "inflight1",
+		Project:     "test",
+		SessionKey:  "test:timer:user",
+		ScheduledAt: time.Now().Add(-time.Millisecond),
+		Prompt:      "timer prompt",
+		Mute:        true,
+		TimeoutMins: &zeroTimeout,
+		CreatedAt:   time.Now(),
+	}
+	if err := sched.AddJob(job); err != nil {
+		t.Fatalf("AddJob: %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timer job did not start")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		sched.Stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned before in-flight timer job completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return after in-flight timer job completed")
 	}
 }
 

@@ -64,6 +64,12 @@ type legacyDetachedCompletion struct {
 	sessionKey string
 	completion *taskCompletion
 	result     TaskResult
+	barrier    *legacyCompletionBarrier
+}
+
+type legacyCompletionBarrier struct {
+	remaining int
+	done      chan struct{}
 }
 
 func NewLegacyScheduler(maxWaiting int) *LegacyScheduler {
@@ -332,6 +338,81 @@ func (s *LegacyScheduler) CancelSessionContext(ctx context.Context, sessionKey s
 	return result
 }
 
+func (s *LegacyScheduler) CancelTaskContext(ctx context.Context, sessionKey, taskID string, mode CancelMode) CancelResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if sessionKey == "" || taskID == "" || !isValidCancelMode(mode) {
+		return CancelResult{}
+	}
+
+	s.mu.Lock()
+	lane := s.lanes[sessionKey]
+	if lane == nil {
+		s.mu.Unlock()
+		return CancelResult{}
+	}
+	result := CancelResult{}
+	kept := lane.waiting[:0]
+	cancelled := make([]ProjectTask, 0, 1)
+	for _, task := range lane.waiting {
+		if task.ID == taskID {
+			result.WaitingCancelled++
+			cancelled = append(cancelled, task)
+			continue
+		}
+		kept = append(kept, task)
+	}
+	removed := len(lane.waiting) - len(kept)
+	lane.waiting = kept
+	s.waitingCount -= removed
+	completions := make([]legacyDetachedCompletion, 0, len(cancelled))
+	var cancelBarrier *legacyCompletionBarrier
+	if len(cancelled) > 0 {
+		if lane.completing == 0 {
+			lane.completionDone = make(chan struct{})
+		}
+		cancelBarrier = &legacyCompletionBarrier{remaining: len(cancelled), done: make(chan struct{})}
+		lane.completing += len(cancelled)
+		s.completionCount += len(cancelled)
+		for _, task := range cancelled {
+			s.recordTerminalLocked(TaskStateCancelled)
+			completions = append(completions, legacyDetachedCompletion{
+				sessionKey: sessionKey,
+				completion: s.newTaskCompletion(task, lane),
+				result:     TaskResult{State: TaskStateCancelled},
+				barrier:    cancelBarrier,
+			})
+		}
+	}
+
+	var activeDone <-chan struct{}
+	if lane.active != nil && lane.active.task.ID == taskID {
+		activeDone = lane.active.done
+		if lane.active.phase == legacyActiveRunning {
+			result.ActiveCancelled = 1
+			if lane.active.decision == "" {
+				lane.active.decision = TaskStateCancelled
+			}
+			lane.active.cancel()
+		}
+	}
+	var completionDone <-chan struct{}
+	if cancelBarrier != nil {
+		completionDone = cancelBarrier.done
+	}
+	result.Pending = activeDone != nil || completionDone != nil
+	s.deleteLaneIfIdleLocked(sessionKey, lane)
+	s.mu.Unlock()
+
+	s.runDetachedCompletions(completions)
+	if !waitLegacyCompletionBarrier(ctx, activeDone) || !waitLegacyCompletionBarrier(ctx, completionDone) {
+		return result
+	}
+	result.Pending = false
+	return result
+}
+
 func waitLegacyCompletionBarrier(ctx context.Context, done <-chan struct{}) bool {
 	if done == nil {
 		return true
@@ -494,13 +575,13 @@ func (s *LegacyScheduler) runDetachedCompletions(completions []legacyDetachedCom
 	for _, completion := range completions {
 		completion := completion
 		go func() {
-			defer s.finishDetachedCompletion(completion.sessionKey)
+			defer s.finishDetachedCompletion(completion.sessionKey, completion.barrier)
 			completion.completion.finish(completion.result)
 		}()
 	}
 }
 
-func (s *LegacyScheduler) finishDetachedCompletion(sessionKey string) {
+func (s *LegacyScheduler) finishDetachedCompletion(sessionKey string, barrier *legacyCompletionBarrier) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	lane := s.lanes[sessionKey]
@@ -509,6 +590,12 @@ func (s *LegacyScheduler) finishDetachedCompletion(sessionKey string) {
 	}
 	lane.completing--
 	s.completionCount--
+	if barrier != nil {
+		barrier.remaining--
+		if barrier.remaining == 0 {
+			close(barrier.done)
+		}
+	}
 	if lane.completing == 0 {
 		close(lane.completionDone)
 		lane.completionDone = nil

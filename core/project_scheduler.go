@@ -65,6 +65,14 @@ type cancelSessionCommand struct {
 	done       chan struct{}
 }
 
+type cancelTaskCommand struct {
+	sessionKey string
+	taskID     string
+	mode       CancelMode
+	resp       chan CancelResult
+	done       chan struct{}
+}
+
 type cancelSessionWaiterCancelCommand struct {
 	done chan struct{}
 }
@@ -261,10 +269,36 @@ func (s *ProjectScheduler) CancelSessionContext(ctx context.Context, sessionKey 
 	if sessionKey == "" || !isValidCancelMode(mode) {
 		return CancelResult{}
 	}
+	return s.cancelContext(ctx, cancelSessionCommand{sessionKey: sessionKey, mode: mode})
+}
+
+func (s *ProjectScheduler) CancelTaskContext(ctx context.Context, sessionKey, taskID string, mode CancelMode) CancelResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if sessionKey == "" || taskID == "" || !isValidCancelMode(mode) {
+		return CancelResult{}
+	}
+	return s.cancelContext(ctx, cancelTaskCommand{sessionKey: sessionKey, taskID: taskID, mode: mode})
+}
+
+func (s *ProjectScheduler) cancelContext(ctx context.Context, cmd schedulerCommand) CancelResult {
 	resp := make(chan CancelResult, 1)
 	done := make(chan struct{})
+	switch c := cmd.(type) {
+	case cancelSessionCommand:
+		c.resp = resp
+		c.done = done
+		cmd = c
+	case cancelTaskCommand:
+		c.resp = resp
+		c.done = done
+		cmd = c
+	default:
+		return CancelResult{}
+	}
 	select {
-	case s.commands <- cancelSessionCommand{sessionKey: sessionKey, mode: mode, resp: resp, done: done}:
+	case s.commands <- cmd:
 	case <-s.done:
 		return CancelResult{}
 	case <-ctx.Done():
@@ -413,6 +447,8 @@ func (l *schedulerLoop) handleCommand(cmd schedulerCommand) bool {
 		l.localMutation = false
 	case cancelSessionCommand:
 		l.handleCancelSession(c)
+	case cancelTaskCommand:
+		l.handleCancelTask(c)
 	case cancelSessionWaiterCancelCommand:
 		l.handleCancelSessionWaiterCancel(c)
 	case stopCommand:
@@ -648,6 +684,58 @@ func (l *schedulerLoop) handleCancelSession(c cancelSessionCommand) {
 		}
 	}
 	waiter.generations = append(waiter.generations, l.completionGenerations[c.sessionKey]...)
+	result.Pending = waiter.waitActive != nil || len(waiter.generations) != 0
+	if result.Pending {
+		l.cancelWaiters = append(l.cancelWaiters, waiter)
+	}
+	c.resp <- result
+	l.runDetachedCompletions(completions)
+}
+
+func (l *schedulerLoop) handleCancelTask(c cancelTaskCommand) {
+	if c.sessionKey == "" || c.taskID == "" || !isValidCancelMode(c.mode) {
+		c.resp <- CancelResult{}
+		return
+	}
+	result := CancelResult{}
+	kept := l.waiting[:0]
+	cancelled := make([]ProjectTask, 0, 1)
+	for _, task := range l.waiting {
+		if task.SessionKey == c.sessionKey && task.ID == c.taskID {
+			result.WaitingCancelled++
+			cancelled = append(cancelled, task)
+			continue
+		}
+		kept = append(kept, task)
+	}
+	l.waiting = kept
+	completions := l.detachCompletions(cancelled, TaskStateCancelled)
+	l.armExpiryTimer()
+
+	waiter := cancelSessionWaiter{done: c.done}
+	if l.active != nil && l.active.task.SessionKey == c.sessionKey && l.active.task.ID == c.taskID {
+		waiter.waitActive = l.active
+		if !l.active.completing {
+			result.ActiveCancelled = 1
+			if l.active.decision == "" {
+				l.active.decision = TaskStateCancelled
+			}
+			l.active.cancel()
+		}
+	}
+	if len(completions) != 0 {
+		seen := make(map[*projectCompletionGeneration]struct{}, len(completions))
+		for _, completion := range completions {
+			if completion.generation == nil {
+				continue
+			}
+			if _, ok := seen[completion.generation]; ok {
+				continue
+			}
+			seen[completion.generation] = struct{}{}
+			waiter.generations = append(waiter.generations, completion.generation)
+		}
+	}
 	result.Pending = waiter.waitActive != nil || len(waiter.generations) != 0
 	if result.Pending {
 		l.cancelWaiters = append(l.cancelWaiters, waiter)

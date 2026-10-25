@@ -74,6 +74,33 @@ func stopLegacyScheduler(t *testing.T, scheduler EngineScheduler) {
 	scheduler.Stop(ctx)
 }
 
+func TestLegacyCancelTaskWaitsOnlyOwnDetachedCompletionBarrier(t *testing.T) {
+	unrelatedBarrier := &legacyCompletionBarrier{remaining: 1, done: make(chan struct{})}
+	ownBarrier := &legacyCompletionBarrier{remaining: 1, done: make(chan struct{})}
+	scheduler := NewLegacyScheduler(2)
+	lane := scheduler.newLaneLocked("same-session")
+	lane.completing = 2
+	lane.completionDone = make(chan struct{})
+	scheduler.completionCount = 2
+
+	scheduler.finishDetachedCompletion("same-session", ownBarrier)
+	select {
+	case <-ownBarrier.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("own cancel barrier was not released")
+	}
+	select {
+	case <-lane.completionDone:
+		t.Fatal("lane-wide completion barrier released before unrelated completion finished")
+	default:
+	}
+	select {
+	case <-unrelatedBarrier.done:
+		t.Fatal("unrelated barrier should remain pending")
+	default:
+	}
+}
+
 func TestLegacySchedulerCrossSessionParallelAndSameSessionFIFO(t *testing.T) {
 	scheduler := newLegacySchedulerUnderTest(2)
 	defer stopLegacyScheduler(t, scheduler)
