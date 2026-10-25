@@ -11051,6 +11051,96 @@ func TestExecuteCardAction_NewCleansUpAndCreatesSession(t *testing.T) {
 	}
 }
 
+func TestExecuteCardAction_NewClearsOldSessionMetadata(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	key := "test:user1"
+	old := e.sessions.GetOrCreateActive(key)
+	old.SetAgentSessionID("old-agent-session", "stub")
+	old.AddHistory("user", "old prompt must not survive card new")
+	oldID := old.ID
+
+	e.executeCardAction("/new", "", key)
+
+	if got := old.GetAgentSessionID(); got != "" {
+		t.Fatalf("old agent session id = %q, want cleared after card /new", got)
+	}
+	if got := len(old.GetHistory(0)); got != 0 {
+		t.Fatalf("old history len = %d, want cleared after card /new", got)
+	}
+	if got := e.sessions.ActiveSessionID(key); got == oldID {
+		t.Fatalf("active session id = %q, want a fresh session after card /new", got)
+	}
+}
+
+func TestExecuteCardAction_NewPendingCancelDoesNotResetSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(6_410, 0)), 10, 6*time.Hour, 30*time.Minute)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+	if got := scheduler.Submit(ProjectTask{ID: "stubborn-card-new", SessionKey: "test:pending-card-new", Run: func(ctx context.Context) TaskResult {
+		started <- struct{}{}
+		<-ctx.Done()
+		<-release
+		return TaskResult{State: TaskStateCancelled}
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit stubborn = %+v", got)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stubborn task did not start")
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer stopCancel()
+		scheduler.Stop(stopCtx)
+	})
+
+	p := &stubPlatformEngine{n: "test"}
+	e := &Engine{
+		agent:                         &stubAgent{},
+		sessions:                      NewSessionManager(""),
+		ctx:                           ctx,
+		cancel:                        cancel,
+		i18n:                          NewI18n("en"),
+		interactiveStates:             make(map[string]*interactiveState),
+		closingSessions:               make(map[string]chan struct{}),
+		unsafeResume:                  make(map[string]bool),
+		projectScheduler:              scheduler,
+		projectSchedulerCancelTimeout: 20 * time.Millisecond,
+	}
+	key := "test:pending-card-new"
+	old := e.sessions.GetOrCreateActive(key)
+	old.SetAgentSessionID("must-stay", "stub")
+	old.AddHistory("user", "keep history")
+	oldID := old.ID
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{agentSession: newControllableSession("old-card-new"), platform: p}
+	e.interactiveMu.Unlock()
+
+	e.executeCardAction("/new", "", key)
+
+	after := e.sessions.GetOrCreateActive(key)
+	if after.ID != oldID {
+		t.Fatalf("active session id = %q, want old %q when card /new cancel is pending", after.ID, oldID)
+	}
+	if got := after.GetAgentSessionID(); got != "must-stay" {
+		t.Fatalf("agent session id = %q, want retained", got)
+	}
+	if len(after.GetHistory(0)) == 0 {
+		t.Fatal("history was cleared even though card /new cancel is pending")
+	}
+	e.interactiveMu.Lock()
+	_, exists := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+	if !exists {
+		t.Fatal("interactive state was cleaned up even though card /new cancel is pending")
+	}
+}
+
 func TestExecuteCardAction_LangSwitch(t *testing.T) {
 	e := newTestEngine()
 
@@ -11124,6 +11214,36 @@ func TestCmdStop_UsesInteractiveKeyForMultiWorkspace(t *testing.T) {
 
 	if exists {
 		t.Error("expected interactive state to be cleaned up by /stop using interactiveKey")
+	}
+}
+
+func TestExecuteCardAction_StopFallsBackToLiveInteractiveState(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("card-stop-fallback")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	key := "test:user1"
+	liveKey := "/workspace/project:" + key
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[liveKey] = &interactiveState{agentSession: sess}
+	e.interactiveMu.Unlock()
+
+	e.executeCardAction("/stop", "", key)
+
+	e.interactiveMu.Lock()
+	_, canonicalExists := e.interactiveStates[key]
+	_, liveExists := e.interactiveStates[liveKey]
+	e.interactiveMu.Unlock()
+	if canonicalExists {
+		t.Fatal("canonical interactive state unexpectedly exists")
+	}
+	if liveExists {
+		t.Fatal("expected card /stop to fall back and clean the live interactive state")
+	}
+	select {
+	case <-sess.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected card /stop fallback to close the live agent session")
 	}
 }
 

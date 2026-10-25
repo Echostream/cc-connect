@@ -13893,6 +13893,10 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 			return
 		}
 		e.cleanupInteractiveState(interactiveKey)
+		old := sessions.GetOrCreateActive(sessionKey)
+		old.SetAgentSessionID("", "")
+		old.ClearHistory()
+		sessions.Save()
 		sessions.NewSession(sessionKey, "")
 
 	case "/delete-mode":
@@ -13946,7 +13950,11 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		if result := e.cancelScheduledSession(sessionKey, CancelStop); result.Pending {
 			return
 		}
-		e.stopInteractiveSession(interactiveKey, nil, nil)
+		if !e.stopInteractiveSession(interactiveKey, nil, nil) {
+			if found := e.findInteractiveKeyForSession(sessionKey); found != "" && found != interactiveKey {
+				e.stopInteractiveSession(found, nil, nil)
+			}
+		}
 
 	case "/heartbeat":
 		if e.heartbeatScheduler == nil {
