@@ -240,6 +240,7 @@ const (
 	MsgLangCurrent               MsgKey = "lang_current"
 	MsgUnknownCommand            MsgKey = "unknown_command"
 	MsgWelcome                   MsgKey = "welcome"
+	MsgQueueStatus               MsgKey = "queue_status"
 	MsgHelp                      MsgKey = "message_help" // change from "help", which is used now for builtin command help
 	MsgHelpTitle                 MsgKey = "help_title"
 	MsgHelpSessionSection        MsgKey = "help_session_section"
@@ -611,6 +612,7 @@ const (
 	MsgBuiltinCmdUpgrade   MsgKey = "upgrade"
 	MsgBuiltinCmdRestart   MsgKey = "restart"
 	MsgBuiltinCmdStatus    MsgKey = "status"
+	MsgBuiltinCmdQueue     MsgKey = "queue"
 	MsgBuiltinCmdUsage     MsgKey = "usage"
 	MsgBuiltinCmdVersion   MsgKey = "version"
 	MsgBuiltinCmdHelp      MsgKey = "help"
@@ -1044,6 +1046,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "👋 こんにちは！cc-connect が **%s** に接続しました。\n\nメッセージを送信すればエージェントと会話できます。/help で組み込みコマンド一覧を確認できます。",
 		LangSpanish:            "👋 ¡Hola! Soy cc-connect, conectándote con **%s**.\n\nEnvía un mensaje para chatear con el agente. Usa /help para ver los comandos integrados.",
 	},
+	MsgQueueStatus: {
+		LangEnglish:            "queue: active=%d waiting=%d active_ref=%s active_refs=%s",
+		LangChinese:            "queue: active=%d waiting=%d active_ref=%s active_refs=%s",
+		LangTraditionalChinese: "queue: active=%d waiting=%d active_ref=%s active_refs=%s",
+		LangJapanese:           "queue: active=%d waiting=%d active_ref=%s active_refs=%s",
+		LangSpanish:            "queue: active=%d waiting=%d active_ref=%s active_refs=%s",
+	},
 	MsgHelp: {
 		LangEnglish: "📖 Available Commands\n\n" +
 			"/new [name]\n  Start a new session\n\n" +
@@ -1081,6 +1090,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/upgrade\n  Check for updates and self-update\n\n" +
 			"/restart\n  Restart cc-connect service\n\n" +
 			"/status\n  Show system status\n\n" +
+			"/queue\n  Show scheduler queue status\n\n" +
 			"/version\n  Show cc-connect version\n\n" +
 			"/whoami\n  Show your User ID (for allow_from / admin_from)\n\n" +
 			"/help\n  Show this help\n\n" +
@@ -1125,6 +1135,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/upgrade\n  检查更新并自动升级\n\n" +
 			"/restart\n  重启 cc-connect 服务\n\n" +
 			"/status\n  查看系统状态\n\n" +
+			"/queue\n  查看调度队列状态\n\n" +
 			"/version\n  查看 cc-connect 版本\n\n" +
 			"/whoami\n  查看你的 User ID（用于 allow_from / admin_from 配置）\n\n" +
 			"/help\n  显示此帮助\n\n" +
@@ -1168,6 +1179,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/upgrade\n  檢查更新並自動升級\n\n" +
 			"/restart\n  重啟 cc-connect 服務\n\n" +
 			"/status\n  查看系統狀態\n\n" +
+			"/queue\n  查看排程佇列狀態\n\n" +
 			"/version\n  查看 cc-connect 版本\n\n" +
 			"/whoami\n  查看你的 User ID（用於 allow_from / admin_from 設定）\n\n" +
 			"/help\n  顯示此說明\n\n" +
@@ -1210,6 +1222,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/upgrade\n  アップデートを確認して自動更新\n\n" +
 			"/restart\n  cc-connect サービスを再起動\n\n" +
 			"/status\n  システム状態を表示\n\n" +
+			"/queue\n  スケジューラーキューの状態を表示\n\n" +
 			"/version\n  cc-connect のバージョンを表示\n\n" +
 			"/whoami\n  あなたの User ID を表示（allow_from / admin_from 設定用）\n\n" +
 			"/help\n  このヘルプを表示\n\n" +
@@ -1252,6 +1265,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/upgrade\n  Buscar actualizaciones y auto-actualizar\n\n" +
 			"/restart\n  Reiniciar el servicio cc-connect\n\n" +
 			"/status\n  Mostrar estado del sistema\n\n" +
+			"/queue\n  Mostrar estado de la cola del planificador\n\n" +
 			"/version\n  Mostrar versión de cc-connect\n\n" +
 			"/whoami\n  Mostrar tu User ID (para allow_from / admin_from)\n\n" +
 			"/help\n  Mostrar esta ayuda\n\n" +
@@ -1418,6 +1432,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/upgrade — Check for updates\n" +
 			"/restart — Restart service\n" +
 			"/status — System status\n" +
+			"/queue — Scheduler queue status\n" +
 			"/version — Show version",
 		LangChinese: "**系统**\n" +
 			"/config [get|set|reload] — 运行时配置\n" +
@@ -1427,6 +1442,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/upgrade — 检查更新\n" +
 			"/restart — 重启服务\n" +
 			"/status — 系统状态\n" +
+			"/queue — 调度队列状态\n" +
 			"/version — 查看版本",
 		LangTraditionalChinese: "**系統**\n" +
 			"/config [get|set|reload] — 執行階段配置\n" +
@@ -1436,6 +1452,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/upgrade — 檢查更新\n" +
 			"/restart — 重啟服務\n" +
 			"/status — 系統狀態\n" +
+			"/queue — 排程佇列狀態\n" +
 			"/version — 查看版本",
 		LangJapanese: "**システム**\n" +
 			"/config [get|set|reload] — ランタイム設定\n" +
@@ -1445,6 +1462,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/upgrade — アップデート確認\n" +
 			"/restart — サービス再起動\n" +
 			"/status — システム状態\n" +
+			"/queue — スケジューラーキューの状態\n" +
 			"/version — バージョン表示",
 		LangSpanish: "**Sistema**\n" +
 			"/config [get|set|reload] — Configuración\n" +
@@ -1454,6 +1472,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/upgrade — Buscar actualizaciones\n" +
 			"/restart — Reiniciar servicio\n" +
 			"/status — Estado del sistema\n" +
+			"/queue — Estado de la cola del planificador\n" +
 			"/version — Mostrar versión",
 	},
 	MsgHelpTip: {
@@ -3803,6 +3822,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "查看系統狀態",
 		LangJapanese:           "システム状態を表示",
 		LangSpanish:            "Mostrar estado del sistema",
+	},
+	MsgBuiltinCmdQueue: {
+		LangEnglish:            "Show scheduler queue status",
+		LangChinese:            "查看调度队列状态",
+		LangTraditionalChinese: "查看排程佇列狀態",
+		LangJapanese:           "スケジューラーキューの状態を表示",
+		LangSpanish:            "Mostrar estado de la cola del planificador",
 	},
 	MsgBuiltinCmdUsage: {
 		LangEnglish:            "Show account/model quota usage",

@@ -245,6 +245,30 @@ func (s *recordingTaskIDScheduler) submittedIDs() []string {
 	return out
 }
 
+type snapshotScheduler struct {
+	snapshot SchedulerSnapshot
+}
+
+func (s *snapshotScheduler) Submit(ProjectTask) SubmitResult {
+	return SubmitResult{Status: SubmitRejectedStopped}
+}
+
+func (s *snapshotScheduler) SubmitOnlyIfIdle(ProjectTask) SubmitResult {
+	return SubmitResult{Status: SubmitRejectedStopped}
+}
+
+func (s *snapshotScheduler) TryBeginLocalMutation(context.Context) (func(), bool) {
+	return func() {}, true
+}
+
+func (s *snapshotScheduler) Snapshot() SchedulerSnapshot { return s.snapshot }
+
+func (s *snapshotScheduler) CancelSessionContext(context.Context, string, CancelMode) CancelResult {
+	return CancelResult{}
+}
+
+func (s *snapshotScheduler) Stop(context.Context) {}
+
 type stubLifecyclePlatform struct {
 	stubPlatformEngine
 	handler            PlatformLifecycleHandler
@@ -17609,6 +17633,190 @@ func startBusyProjectTaskForCommandTest(t *testing.T, scheduler *ProjectSchedule
 	return release
 }
 
+func TestQueueCommandReachableWhenIdle(t *testing.T) {
+	scheduler := &snapshotScheduler{snapshot: SchedulerSnapshot{}}
+	agent := &stubStartSessionAgent{}
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(scheduler))
+	t.Cleanup(func() { _ = e.Stop() })
+
+	msg := &Message{SessionKey: "test:caller", Platform: "test", UserID: "user", ReplyCtx: "ctx"}
+	if !e.handleCommand(platform, msg, "/queue") {
+		t.Fatal("/queue was not handled as a built-in command while idle")
+	}
+	sent := platform.getSent()
+	const want = "queue: active=0 waiting=0 active_ref=- active_refs=[]"
+	if len(sent) != 1 || sent[0] != want {
+		t.Fatalf("/queue sent = %v, want %q", sent, want)
+	}
+	if strings.Contains(sent[0], e.i18n.T(MsgUnknownCommand)) {
+		t.Fatalf("/queue sent unknown-command reply: %v", sent)
+	}
+	agent.mu.Lock()
+	startCalls := len(agent.calls)
+	agent.mu.Unlock()
+	if startCalls != 0 {
+		t.Fatalf("/queue started Agent %d times, want local-only query", startCalls)
+	}
+}
+
+func TestQueueStatusPluralActiveRefsStableAndRedacted(t *testing.T) {
+	const (
+		firstKey    = "test:beta-sensitive"
+		secondKey   = "test:alpha-sensitive"
+		fallbackKey = "test:legacy-must-be-ignored"
+	)
+	scheduler := &snapshotScheduler{snapshot: SchedulerSnapshot{
+		ActiveCount:  9,
+		WaitingCount: 4,
+		Active:       &SchedulerTaskSnapshot{SessionKey: fallbackKey},
+		ActiveTasks: []SchedulerTaskSnapshot{
+			{SessionKey: firstKey},
+			{SessionKey: ""},
+			{SessionKey: secondKey},
+			{SessionKey: firstKey},
+		},
+	}}
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(scheduler))
+	t.Cleanup(func() { _ = e.Stop() })
+
+	e.cmdQueue(platform, &Message{ReplyCtx: "ctx"})
+
+	firstRef := redactQueueSessionRef(firstKey)
+	secondRef := redactQueueSessionRef(secondKey)
+	want := fmt.Sprintf("queue: active=9 waiting=4 active_ref=%s active_refs=[%s,%s]", firstRef, firstRef, secondRef)
+	if sent := platform.getSent(); len(sent) != 1 || sent[0] != want {
+		t.Fatalf("/queue sent = %v, want %q", sent, want)
+	}
+	for _, raw := range []string{firstKey, secondKey, fallbackKey} {
+		if strings.Contains(platform.getSent()[0], raw) {
+			t.Fatalf("/queue leaked raw SessionKey %q: %q", raw, platform.getSent()[0])
+		}
+	}
+}
+
+func TestQueueStatusFallsBackToSingularActive(t *testing.T) {
+	const sessionKey = "test:old-snapshot-sensitive"
+	scheduler := &snapshotScheduler{snapshot: SchedulerSnapshot{
+		ActiveCount: 1,
+		Active:      &SchedulerTaskSnapshot{SessionKey: sessionKey},
+		ActiveTasks: []SchedulerTaskSnapshot{
+			{SessionKey: ""},
+		},
+	}}
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(scheduler))
+	t.Cleanup(func() { _ = e.Stop() })
+
+	e.cmdQueue(platform, &Message{ReplyCtx: "ctx"})
+
+	ref := redactQueueSessionRef(sessionKey)
+	want := fmt.Sprintf("queue: active=1 waiting=0 active_ref=%s active_refs=[%s]", ref, ref)
+	if sent := platform.getSent(); len(sent) != 1 || sent[0] != want {
+		t.Fatalf("/queue fallback sent = %v, want %q", sent, want)
+	}
+	if strings.Contains(platform.getSent()[0], sessionKey) {
+		t.Fatalf("/queue fallback leaked raw SessionKey: %q", platform.getSent()[0])
+	}
+}
+
+func TestQueueStatusLegacySchedulerShowsAllActiveLanes(t *testing.T) {
+	scheduler := NewLegacyScheduler(10)
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	for _, key := range []string{"test:lane-b-sensitive", "test:lane-a-sensitive"} {
+		key := key
+		result := scheduler.Submit(ProjectTask{ID: key, SessionKey: key, Run: func(ctx context.Context) TaskResult {
+			started <- key
+			select {
+			case <-release:
+				return TaskResult{State: TaskStateCompleted}
+			case <-ctx.Done():
+				return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+			}
+		}})
+		if result.Status != SubmitStarted {
+			t.Fatalf("Submit(%q) = %+v, want started", key, result)
+		}
+	}
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for Legacy active lanes")
+		}
+	}
+	platform := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish, WithProjectScheduler(scheduler))
+	t.Cleanup(func() {
+		close(release)
+		_ = e.Stop()
+	})
+
+	if !e.handleCommand(platform, &Message{SessionKey: "test:caller", UserID: "user", ReplyCtx: "ctx"}, "/queue") {
+		t.Fatal("/queue was not handled with Legacy active lanes")
+	}
+
+	firstKey := "test:lane-a-sensitive"
+	secondKey := "test:lane-b-sensitive"
+	firstRef := redactQueueSessionRef(firstKey)
+	secondRef := redactQueueSessionRef(secondKey)
+	want := fmt.Sprintf("queue: active=2 waiting=0 active_ref=%s active_refs=[%s,%s]", firstRef, firstRef, secondRef)
+	if sent := platform.getSent(); len(sent) != 1 || sent[0] != want {
+		t.Fatalf("Legacy /queue sent = %v, want %q", sent, want)
+	}
+	for _, raw := range []string{firstKey, secondKey} {
+		if strings.Contains(platform.getSent()[0], raw) {
+			t.Fatalf("Legacy /queue leaked raw SessionKey %q: %q", raw, platform.getSent()[0])
+		}
+	}
+}
+
+func TestBuiltinQueueCommandAndHelpAreLocalized(t *testing.T) {
+	languages := []Language{LangEnglish, LangChinese, LangTraditionalChinese, LangJapanese, LangSpanish}
+	for _, lang := range languages {
+		t.Run(string(lang), func(t *testing.T) {
+			queueStatus, ok := messages[MsgQueueStatus][lang]
+			if !ok || queueStatus == "" {
+				t.Fatalf("queue status translation missing for %s", lang)
+			}
+			queueDescription, ok := messages[MsgBuiltinCmdQueue][lang]
+			if !ok || queueDescription == "" {
+				t.Fatalf("queue command description missing for %s", lang)
+			}
+			i18n := NewI18n(lang)
+			if got := i18n.Tf(MsgQueueStatus, 1, 2, "u4:11111111", "[u4:11111111]"); got != "queue: active=1 waiting=2 active_ref=u4:11111111 active_refs=[u4:11111111]" {
+				t.Fatalf("localized queue status = %q", got)
+			}
+			if help := i18n.T(MsgHelp); !strings.Contains(help, "/queue") {
+				t.Fatalf("legacy help for %s does not expose /queue", lang)
+			}
+			if systemHelp := i18n.T(MsgHelpSystemSection); !strings.Contains(systemHelp, "/queue") {
+				t.Fatalf("system help for %s does not expose /queue", lang)
+			}
+		})
+	}
+
+	e := NewEngine("test", &stubAgent{}, nil, "", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+	found := false
+	for _, command := range e.GetAllCommands() {
+		if command.Command == "queue" {
+			found = true
+			if command.Description != e.i18n.T(MsgBuiltinCmdQueue) {
+				t.Fatalf("queue command description = %q, want localized description", command.Description)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("GetAllCommands does not expose /queue")
+	}
+	if cardText := e.renderHelpGroupCard("system").RenderText(); !strings.Contains(cardText, "/queue") {
+		t.Fatalf("system help card does not expose /queue: %q", cardText)
+	}
+}
+
 func TestBusyProjectAllowsQueriesAndCancellationOnly(t *testing.T) {
 	scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(7_000, 0)), 10, 6*time.Hour, 30*time.Minute)
 	busyRelease := startBusyProjectTaskForCommandTest(t, scheduler, "test:busy-owner")
@@ -17635,8 +17843,8 @@ func TestBusyProjectAllowsQueriesAndCancellationOnly(t *testing.T) {
 	if !e.handleCommand(platform, msg, "/queue") {
 		t.Fatal("/queue was not handled while project busy")
 	}
-	if sent := platform.getSent(); len(sent) != 1 || strings.Contains(sent[0], "test:busy-owner") || strings.Contains(sent[0], "test:caller") {
-		t.Fatalf("/queue sent = %v, want one脱敏队列回复", sent)
+	if sent := platform.getSent(); len(sent) != 1 || !strings.Contains(sent[0], "queue: active=1") || !strings.Contains(sent[0], "active_refs=[") || strings.Contains(sent[0], "project_busy_mutation_rejected") || strings.Contains(sent[0], "test:busy-owner") || strings.Contains(sent[0], "test:caller") {
+		t.Fatalf("/queue sent = %v, want one脱敏队列状态回复", sent)
 	}
 
 	platform.clearSent()

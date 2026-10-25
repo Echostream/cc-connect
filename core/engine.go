@@ -7692,6 +7692,7 @@ var builtinCommands = []struct {
 	{[]string{"name", "rename"}, "name"},
 	{[]string{"current"}, "current"},
 	{[]string{"status"}, "status"},
+	{[]string{"queue"}, "queue"},
 	{[]string{"usage", "quota"}, "usage"},
 	{[]string{"history"}, "history"},
 	{[]string{"allow"}, "allow"},
@@ -10151,13 +10152,36 @@ func (e *Engine) cmdStatus(p Platform, msg *Message) {
 
 func (e *Engine) cmdQueue(p Platform, msg *Message) {
 	snap := e.projectScheduler.Snapshot()
-	active := snap.ActiveCount
-	waiting := snap.WaitingCount
+	refs := queueActiveRefs(snap)
 	activeRef := "-"
-	if snap.Active != nil {
-		activeRef = redactQueueSessionRef(snap.Active.SessionKey)
+	if len(refs) > 0 {
+		activeRef = refs[0]
 	}
-	e.reply(p, msg.ReplyCtx, fmt.Sprintf("queue: active=%d waiting=%d active_ref=%s", active, waiting, activeRef))
+	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgQueueStatus,
+		snap.ActiveCount,
+		snap.WaitingCount,
+		activeRef,
+		"["+strings.Join(refs, ",")+"]",
+	))
+}
+
+func queueActiveRefs(snap SchedulerSnapshot) []string {
+	refs := make([]string, 0, len(snap.ActiveTasks))
+	seen := make(map[string]struct{}, len(snap.ActiveTasks))
+	for _, active := range snap.ActiveTasks {
+		if active.SessionKey == "" {
+			continue
+		}
+		if _, exists := seen[active.SessionKey]; exists {
+			continue
+		}
+		seen[active.SessionKey] = struct{}{}
+		refs = append(refs, redactQueueSessionRef(active.SessionKey))
+	}
+	if len(refs) == 0 && snap.Active != nil && snap.Active.SessionKey != "" {
+		refs = append(refs, redactQueueSessionRef(snap.Active.SessionKey))
+	}
+	return refs
 }
 
 func redactQueueSessionRef(sessionKey string) string {
@@ -10902,6 +10926,7 @@ func helpCardGroups() []helpCardGroup {
 			titleKey: MsgHelpSystemSection,
 			items: []helpCardItem{
 				{command: "/status", action: "nav:/status"},
+				{command: "/queue", action: "cmd:/queue"},
 				{command: "/doctor", action: "nav:/doctor"},
 				{command: "/usage", action: "cmd:/usage"},
 				{command: "/config", action: "nav:/config"},
