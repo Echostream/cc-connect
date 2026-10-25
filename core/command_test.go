@@ -291,7 +291,8 @@ func TestBusyCommandClassificationExactCommandsAndSubcommands(t *testing.T) {
 		{name: "cron list query", cmd: "cron", args: []string{"list"}, want: BusyCommandReadonly},
 		{name: "cron run agent trigger", cmd: "cron", args: []string{"run", "job"}, want: BusyCommandAgentTrigger},
 		{name: "shell mutation risk", cmd: "shell", args: []string{"echo", "hi"}, want: BusyCommandSharedMutation},
-		{name: "ps active supplement rejected", cmd: "ps", args: []string{"more"}, want: BusyCommandSharedMutation},
+		{name: "ps active supplement control", cmd: "ps", args: []string{"more"}, want: BusyCommandActiveTurnControl},
+		{name: "btw active supplement control", cmd: "btw", args: []string{"also"}, want: BusyCommandActiveTurnControl},
 		{name: "unknown stays unknown", cmd: "does-not-exist", want: BusyCommandUnknown},
 	}
 	for _, tt := range tests {

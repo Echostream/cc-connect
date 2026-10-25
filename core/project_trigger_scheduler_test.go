@@ -254,7 +254,6 @@ func projectAgentBypassViolations(fset *token.FileSet, files []*ast.File, info *
 	allowedAgentSend := map[string]bool{
 		"processInteractiveMessageWithContext": true,
 		"processInteractiveEventsWithContext":  true,
-		"cmdPs":                                true,
 		"runCompress":                          true,
 		"drainPendingMessages":                 true,
 		"runRelayProjectTask":                  true,

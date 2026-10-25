@@ -8554,8 +8554,10 @@ func TestDrainEventsOpenChannel(t *testing.T) {
 // queuingAgentSession records Send calls and emits events via a controllable channel.
 type queuingAgentSession struct {
 	controllableAgentSession
-	sendCalls []string
-	sendMu    sync.Mutex
+	sendCalls       []string
+	supplementCalls []ActiveTurnSupplementRequest
+	supplementErr   error
+	sendMu          sync.Mutex
 }
 
 func newQueuingSession(id string) *queuingAgentSession {
@@ -8574,6 +8576,14 @@ func (s *queuingAgentSession) Send(prompt string, _ string, _ []ImageAttachment,
 	s.sendCalls = append(s.sendCalls, prompt)
 	s.sendMu.Unlock()
 	return nil
+}
+
+func (s *queuingAgentSession) SupplementActiveTurn(_ context.Context, req ActiveTurnSupplementRequest) error {
+	s.sendMu.Lock()
+	s.supplementCalls = append(s.supplementCalls, req)
+	err := s.supplementErr
+	s.sendMu.Unlock()
+	return err
 }
 
 // blockingSendAgentSession blocks in Send until unblock is closed, mimicking agents
@@ -10383,6 +10393,86 @@ func TestCmdCompress_DrainsQueueAfterSuccess(t *testing.T) {
 
 // --- cmdPs ---
 
+type supplementAssertion struct {
+	noSendLabel string
+	sessionKey  string
+	text        string
+	messageID   string
+	command     string
+	taskID      string
+}
+
+func startActiveSupplementTestTurn(t *testing.T, e *Engine, p Platform, key, taskID string, sess AgentSession) func() {
+	t.Helper()
+	state := &interactiveState{agentSession: sess, platform: p}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	result := e.projectScheduler.Submit(ProjectTask{
+		ID:         taskID,
+		SessionKey: key,
+		Run: func(ctx context.Context) TaskResult {
+			close(started)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			return TaskResult{State: TaskStateCompleted}
+		},
+		ActiveSupplement: func(ctx context.Context, supplement ActiveTurnSupplementRequest) error {
+			return e.supplementInteractiveActiveTurn(ctx, key, supplement)
+		},
+	})
+	if result.Status != SubmitStarted {
+		t.Fatalf("Submit status = %v, want %v", result.Status, SubmitStarted)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active task did not start")
+	}
+	return func() {
+		close(release)
+		e.projectScheduler.Stop(context.Background())
+	}
+}
+
+func assertSupplementDelivered(t *testing.T, e *Engine, p *stubPlatformEngine, sess *queuingAgentSession, want supplementAssertion) {
+	t.Helper()
+	sess.sendMu.Lock()
+	sendCalls := append([]string(nil), sess.sendCalls...)
+	supplementCalls := append([]ActiveTurnSupplementRequest(nil), sess.supplementCalls...)
+	sess.sendMu.Unlock()
+	if len(sendCalls) != 0 {
+		t.Fatalf("%s must not call AgentSession.Send, got %v", want.noSendLabel, sendCalls)
+	}
+	if len(supplementCalls) != 1 {
+		t.Fatalf("supplementCalls len = %d, want 1; calls=%+v", len(supplementCalls), supplementCalls)
+	}
+	got := supplementCalls[0]
+	if got.SessionKey != want.sessionKey || got.Text != want.text || got.MessageID != want.messageID || got.Command != want.command {
+		t.Fatalf("supplement request = %+v", got)
+	}
+	if got.TaskID != want.taskID || got.Generation == 0 {
+		t.Fatalf("supplement ownership = task %q generation %d, want active task token", got.TaskID, got.Generation)
+	}
+
+	sent := p.getSent()
+	found := false
+	for _, s := range sent {
+		if strings.Contains(s, e.i18n.T(MsgPsSent)) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected MsgPsSent reply, got %v", sent)
+	}
+}
+
 func TestCmdPs_EmptyArgs_RepliesUsage(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -10437,45 +10527,99 @@ func TestCmdPs_IdleSession_RepliesNoSession(t *testing.T) {
 	}
 }
 
-func TestCmdPs_BusySession_InjectsToAgent(t *testing.T) {
+func TestCmdPs_ActiveTurnUnsupportedSession_RepliesUnsupported(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
-	sess := newQueuingSession("ps-busy")
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
 
 	key := "test:user1"
-	state := &interactiveState{agentSession: sess, platform: p}
+	state := &interactiveState{agentSession: newControllableSession("ps-unsupported"), platform: p}
 	e.interactiveMu.Lock()
 	e.interactiveStates[key] = state
 	e.interactiveMu.Unlock()
 
-	// Simulate a turn in flight.
-	session := e.sessions.GetOrCreateActive(key)
-	if _, lockedNow := session.TryLock(); !lockedNow {
-		t.Fatal("expected TryLock to succeed")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	result := e.projectScheduler.Submit(ProjectTask{
+		ID:         "ps-unsupported-active",
+		SessionKey: key,
+		Run: func(ctx context.Context) TaskResult {
+			close(started)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			return TaskResult{State: TaskStateCompleted}
+		},
+		ActiveSupplement: func(ctx context.Context, supplement ActiveTurnSupplementRequest) error {
+			return e.supplementInteractiveActiveTurn(ctx, key, supplement)
+		},
+	})
+	if result.Status != SubmitStarted {
+		t.Fatalf("Submit status = %v, want %v", result.Status, SubmitStarted)
 	}
-	defer session.Unlock(0)
+	defer func() {
+		close(release)
+		e.projectScheduler.Stop(context.Background())
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active task did not start")
+	}
 
 	msg := &Message{SessionKey: key, Content: "/ps add unit tests", ReplyCtx: "ctx"}
 	e.cmdPs(p, msg, []string{"add", "unit", "tests"})
 
-	sess.sendMu.Lock()
-	calls := append([]string(nil), sess.sendCalls...)
-	sess.sendMu.Unlock()
-	if len(calls) != 1 || calls[0] != "add unit tests" {
-		t.Fatalf("expected Send(\"add unit tests\"), got %v", calls)
+	sent := p.getSent()
+	if len(sent) == 0 || !strings.Contains(sent[len(sent)-1], e.i18n.T(MsgPsUnsupported)) {
+		t.Fatalf("expected MsgPsUnsupported reply, got %v", sent)
+	}
+}
+
+func TestCmdPs_ActiveTurnSupplement_UsesSchedulerAndCapability(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("ps-active")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+	release := startActiveSupplementTestTurn(t, e, p, key, "ps-active", sess)
+	defer release()
+
+	msg := &Message{SessionKey: key, Content: "/ps add unit tests", MessageID: "m-ps", ReplyCtx: "ctx"}
+	e.cmdPs(p, msg, []string{"add", "unit", "tests"})
+
+	assertSupplementDelivered(t, e, p, sess, supplementAssertion{
+		noSendLabel: "/ps",
+		sessionKey:  key,
+		text:        "add unit tests",
+		messageID:   "m-ps",
+		command:     "ps",
+		taskID:      "ps-active",
+	})
+}
+
+func TestCmdBtw_ActiveTurnSupplement_DispatchesBtwCommand(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("btw-active")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+	release := startActiveSupplementTestTurn(t, e, p, key, "btw-active", sess)
+	defer release()
+
+	msg := &Message{SessionKey: key, Content: "/btw also add docs", MessageID: "m-btw", ReplyCtx: "ctx"}
+	if !e.handleCommand(p, msg, msg.Content) {
+		t.Fatal("/btw was not handled as a command")
 	}
 
-	sent := p.getSent()
-	found := false
-	for _, s := range sent {
-		if strings.Contains(s, e.i18n.T(MsgPsSent)) {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("expected MsgPsSent reply, got %v", sent)
-	}
+	assertSupplementDelivered(t, e, p, sess, supplementAssertion{
+		noSendLabel: "/btw",
+		sessionKey:  key,
+		text:        "also add docs",
+		messageID:   "m-btw",
+		command:     "btw",
+		taskID:      "btw-active",
+	})
 }
 
 // --- 3. executeCardAction routing ---
@@ -15671,11 +15815,12 @@ func TestSessionName_ACPLikeFlow(t *testing.T) {
 	}
 }
 
-// TestBtwAlias_ResolvesToPs verifies that /btw is accepted as an alias for /ps.
-func TestBtwAlias_ResolvesToPs(t *testing.T) {
+// TestBtwCommand_ResolvesSeparatelyFromPs verifies that /btw remains accepted
+// while preserving its command identity for active-turn supplement auditing.
+func TestBtwCommand_ResolvesSeparatelyFromPs(t *testing.T) {
 	id := matchPrefix("btw", builtinCommands)
-	if id != "ps" {
-		t.Fatalf("matchPrefix(\"btw\") = %q, want \"ps\"", id)
+	if id != "btw" {
+		t.Fatalf("matchPrefix(\"btw\") = %q, want \"btw\"", id)
 	}
 	id2 := matchPrefix("ps", builtinCommands)
 	if id2 != "ps" {
@@ -17346,15 +17491,17 @@ func TestBusyProjectCustomSkillPromptQueuesButExecAndPsReject(t *testing.T) {
 	}
 	defer session.Unlock(lockGen)
 	recording := &psSendRecordingSession{}
+	e.interactiveMu.Lock()
 	e.interactiveStates[key] = &interactiveState{agentSession: recording}
+	e.interactiveMu.Unlock()
 	if !e.handleCommand(platform, msg, "/ps more context") {
-		t.Fatal("/ps was not handled as busy rejection")
+		t.Fatal("/ps was not handled")
 	}
 	if recording.sendCalls != 0 {
 		t.Fatalf("/ps called agent Send %d times; busy /ps must not supplement active stdin", recording.sendCalls)
 	}
-	if sent := platform.getSent(); len(sent) != 1 || !strings.Contains(sent[0], "project_busy_mutation_rejected") {
-		t.Fatalf("/ps busy reply = %v, want fixed reason", sent)
+	if sent := platform.getSent(); len(sent) != 1 || !strings.Contains(sent[0], e.i18n.T(MsgPsNoSession)) {
+		t.Fatalf("/ps reply = %v, want no active scheduler-owned turn", sent)
 	}
 }
 

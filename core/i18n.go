@@ -552,6 +552,7 @@ const (
 	MsgPsSendFailed      MsgKey = "ps_send_failed"
 	MsgPsEmpty           MsgKey = "ps_empty"
 	MsgPsNoSession       MsgKey = "ps_no_session"
+	MsgPsUnsupported     MsgKey = "ps_unsupported"
 
 	MsgWhoamiTitle     MsgKey = "whoami_title"
 	MsgWhoamiCardTitle MsgKey = "whoami_card_title"
@@ -3432,6 +3433,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "目前沒有正在執行的任務。",
 		LangJapanese:           "現在実行中のタスクはありません。",
 		LangSpanish:            "No hay ninguna tarea en ejecución.",
+	},
+	MsgPsUnsupported: {
+		LangEnglish:            "This agent session does not support active-turn P.S. delivery.",
+		LangChinese:            "当前 Agent 会话不支持向运行中的任务补充 P.S.。",
+		LangTraditionalChinese: "目前 Agent 會話不支援向執行中的任務補充 P.S.。",
+		LangJapanese:           "このエージェントセッションは実行中タスクへの P.S. 追加に対応していません。",
+		LangSpanish:            "Esta sesión de agente no admite entregar P.S. al turno activo.",
 	},
 	MsgWhoamiTitle: {
 		LangEnglish:            "🪪 **Your Identity**",

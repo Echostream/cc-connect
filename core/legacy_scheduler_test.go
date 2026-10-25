@@ -531,3 +531,92 @@ func TestLegacySchedulerStopIsBoundedButRetainsActiveOwnership(t *testing.T) {
 		t.Fatalf("重复 Stop 破坏 exactly-once: cleanup=%d/%d finish=%d/%d", a1.cleanup.Load(), a2.cleanup.Load(), a1.finish.Load(), a2.finish.Load())
 	}
 }
+
+func TestLegacySchedulerActiveTurnSupplementTargetsOnlyRequestedLane(t *testing.T) {
+	scheduler := NewLegacyScheduler(2)
+	defer stopLegacyScheduler(t, scheduler)
+
+	startedA := make(chan struct{})
+	startedB := make(chan struct{})
+	release := make(chan struct{})
+	deliveredA := make(chan ActiveTurnSupplementRequest, 1)
+	deliveredB := make(chan ActiveTurnSupplementRequest, 1)
+	if got := scheduler.Submit(ProjectTask{ID: "active-a", SessionKey: "session-a", Run: func(ctx context.Context) TaskResult {
+		close(startedA)
+		select {
+		case <-release:
+			return TaskResult{State: TaskStateCompleted}
+		case <-ctx.Done():
+			return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+		}
+	}, ActiveSupplement: func(_ context.Context, req ActiveTurnSupplementRequest) error {
+		deliveredA <- req
+		return nil
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit A = %+v", got)
+	}
+	if got := scheduler.Submit(ProjectTask{ID: "active-b", SessionKey: "session-b", Run: func(ctx context.Context) TaskResult {
+		close(startedB)
+		select {
+		case <-release:
+			return TaskResult{State: TaskStateCompleted}
+		case <-ctx.Done():
+			return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+		}
+	}, ActiveSupplement: func(_ context.Context, req ActiveTurnSupplementRequest) error {
+		deliveredB <- req
+		return nil
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit B = %+v", got)
+	}
+	waitLegacySignal(t, startedA, "A 启动")
+	waitLegacySignal(t, startedB, "B 启动")
+
+	handleA, ok := scheduler.ActiveTurn("session-a")
+	if !ok || handleA.TaskID != "active-a" || handleA.Generation == 0 {
+		t.Fatalf("active A handle = %+v ok=%v", handleA, ok)
+	}
+	handleB, ok := scheduler.ActiveTurn("session-b")
+	if !ok || handleB.TaskID != "active-b" || handleB.Generation == 0 {
+		t.Fatalf("active B handle = %+v ok=%v", handleB, ok)
+	}
+	if handleA.Generation == handleB.Generation {
+		t.Fatalf("different legacy lanes should have distinct ownership tokens, got A=%d B=%d", handleA.Generation, handleB.Generation)
+	}
+
+	got := scheduler.SupplementActiveTurn(context.Background(), ActiveTurnSupplementRequest{
+		SessionKey: handleA.SessionKey,
+		TaskID:     handleA.TaskID,
+		Generation: handleA.Generation,
+		Text:       "only A",
+		Command:    "btw",
+	})
+	if got.Status != ActiveTurnSupplementDelivered || got.Err != nil {
+		t.Fatalf("supplement A = %+v", got)
+	}
+	select {
+	case req := <-deliveredA:
+		if req.Text != "only A" || req.SessionKey != "session-a" {
+			t.Fatalf("delivered A = %+v", req)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("A supplement not delivered")
+	}
+	select {
+	case req := <-deliveredB:
+		t.Fatalf("supplement leaked to B: %+v", req)
+	default:
+	}
+
+	if got := scheduler.SupplementActiveTurn(context.Background(), ActiveTurnSupplementRequest{
+		SessionKey: "session-a",
+		TaskID:     handleB.TaskID,
+		Generation: handleB.Generation,
+		Text:       "wrong lane token",
+		Command:    "ps",
+	}); got.Status != ActiveTurnSupplementStale {
+		t.Fatalf("cross-lane token supplement = %+v", got)
+	}
+
+	close(release)
+}

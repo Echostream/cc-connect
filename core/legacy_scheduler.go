@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"time"
@@ -22,15 +23,16 @@ type LegacyScheduler struct {
 	settled              chan struct{}
 	settleOnce           sync.Once
 
-	activeCount     int
-	waitingCount    int
-	completionCount int
-	completed       uint64
-	failed          uint64
-	expired         uint64
-	timedOut        uint64
-	cancelled       uint64
-	rejected        uint64
+	activeCount      int
+	waitingCount     int
+	completionCount  int
+	completed        uint64
+	failed           uint64
+	expired          uint64
+	timedOut         uint64
+	cancelled        uint64
+	rejected         uint64
+	activeGeneration uint64
 }
 
 type legacyLane struct {
@@ -52,6 +54,7 @@ type legacyActiveTask struct {
 	task       ProjectTask
 	cancel     context.CancelFunc
 	completion *taskCompletion
+	generation uint64
 	decision   string
 	phase      legacyActivePhase
 	done       chan struct{}
@@ -99,6 +102,53 @@ func (s *LegacyScheduler) SubmitWithOptions(task ProjectTask, options SubmitOpti
 		return s.SubmitOnlyIfIdle(task)
 	}
 	return s.Submit(task)
+}
+
+func (s *LegacyScheduler) ActiveTurn(sessionKey string) (ActiveTurnHandle, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lane := s.lanes[sessionKey]
+	if lane == nil || lane.active == nil || lane.active.phase != legacyActiveRunning || lane.active.decision != "" {
+		return ActiveTurnHandle{}, false
+	}
+	return ActiveTurnHandle{
+		SessionKey: lane.active.task.SessionKey,
+		TaskID:     lane.active.task.ID,
+		Generation: lane.active.generation,
+	}, true
+}
+
+func (s *LegacyScheduler) SupplementActiveTurn(ctx context.Context, req ActiveTurnSupplementRequest) ActiveTurnSupplementResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	lane := s.lanes[req.SessionKey]
+	if lane == nil || lane.active == nil || lane.active.phase != legacyActiveRunning || lane.active.decision != "" {
+		s.mu.Unlock()
+		return ActiveTurnSupplementResult{Status: ActiveTurnSupplementNoActive}
+	}
+	active := lane.active
+	if active.task.SessionKey != req.SessionKey {
+		s.mu.Unlock()
+		return ActiveTurnSupplementResult{Status: ActiveTurnSupplementWrongSession}
+	}
+	if active.task.ID != req.TaskID || active.generation != req.Generation {
+		s.mu.Unlock()
+		return ActiveTurnSupplementResult{Status: ActiveTurnSupplementStale}
+	}
+	handler := active.task.ActiveSupplement
+	s.mu.Unlock()
+	if handler == nil {
+		return ActiveTurnSupplementResult{Status: ActiveTurnSupplementUnsupported}
+	}
+	if err := handler(ctx, req); err != nil {
+		if errors.Is(err, ErrNotSupported) {
+			return ActiveTurnSupplementResult{Status: ActiveTurnSupplementUnsupported, Err: err}
+		}
+		return ActiveTurnSupplementResult{Status: ActiveTurnSupplementFailed, Err: err}
+	}
+	return ActiveTurnSupplementResult{Status: ActiveTurnSupplementDelivered}
 }
 
 func (s *LegacyScheduler) submit(task ProjectTask, admission submitAdmission) SubmitResult {
@@ -367,10 +417,12 @@ func (s *LegacyScheduler) notificationReleased(sessionKey string, lane *legacyLa
 
 func (s *LegacyScheduler) startTaskLocked(lane *legacyLane, task ProjectTask) {
 	ctx, cancel := context.WithCancel(context.Background())
+	s.activeGeneration++
 	active := &legacyActiveTask{
 		task:       task,
 		cancel:     cancel,
 		completion: s.newTaskCompletion(task, lane),
+		generation: s.activeGeneration,
 		done:       make(chan struct{}),
 	}
 	lane.active = active

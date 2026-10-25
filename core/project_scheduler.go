@@ -25,6 +25,22 @@ type snapshotCommand struct {
 	resp chan SchedulerSnapshot
 }
 
+type activeTurnCommand struct {
+	sessionKey string
+	resp       chan activeTurnResponse
+}
+
+type activeTurnResponse struct {
+	handle ActiveTurnHandle
+	ok     bool
+}
+
+type supplementActiveTurnCommand struct {
+	ctx  context.Context
+	req  ActiveTurnSupplementRequest
+	resp chan ActiveTurnSupplementResult
+}
+
 type stopCommand struct {
 	ctx  context.Context
 	done chan struct{}
@@ -114,6 +130,7 @@ type activeTask struct {
 	task       ProjectTask
 	cancel     context.CancelFunc
 	completion *taskCompletion
+	generation uint64
 	deadline   time.Time
 	decision   string
 	completing bool
@@ -139,6 +156,7 @@ type schedulerLoop struct {
 	completionGenerations map[string][]*projectCompletionGeneration
 	detachedCompletions   []projectDetachedCompletion
 	completionRunning     bool
+	activeGeneration      uint64
 
 	expiryTimer SchedulerTimer
 	runTimer    SchedulerTimer
@@ -298,6 +316,39 @@ func (s *ProjectScheduler) Snapshot() SchedulerSnapshot {
 	}
 }
 
+func (s *ProjectScheduler) ActiveTurn(sessionKey string) (ActiveTurnHandle, bool) {
+	resp := make(chan activeTurnResponse, 1)
+	select {
+	case s.commands <- activeTurnCommand{sessionKey: sessionKey, resp: resp}:
+		result := <-resp
+		return result.handle, result.ok
+	case <-s.done:
+		return ActiveTurnHandle{}, false
+	}
+}
+
+func (s *ProjectScheduler) SupplementActiveTurn(ctx context.Context, req ActiveTurnSupplementRequest) ActiveTurnSupplementResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	resp := make(chan ActiveTurnSupplementResult, 1)
+	select {
+	case s.commands <- supplementActiveTurnCommand{ctx: ctx, req: req, resp: resp}:
+	case <-s.done:
+		return ActiveTurnSupplementResult{Status: ActiveTurnSupplementNoActive}
+	case <-ctx.Done():
+		return ActiveTurnSupplementResult{Status: ActiveTurnSupplementFailed, Err: ctx.Err()}
+	}
+	select {
+	case result := <-resp:
+		return result
+	case <-s.done:
+		return ActiveTurnSupplementResult{Status: ActiveTurnSupplementNoActive}
+	case <-ctx.Done():
+		return ActiveTurnSupplementResult{Status: ActiveTurnSupplementFailed, Err: ctx.Err()}
+	}
+}
+
 func (s *ProjectScheduler) Stop(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -352,6 +403,10 @@ func (l *schedulerLoop) handleCommand(cmd schedulerCommand) bool {
 		c.resp <- l.handleSubmit(c.task, c.admission)
 	case snapshotCommand:
 		c.resp <- l.snapshot()
+	case activeTurnCommand:
+		c.resp <- l.activeTurn(c.sessionKey)
+	case supplementActiveTurnCommand:
+		l.handleSupplementActiveTurn(c)
 	case beginLocalMutationCommand:
 		l.handleBeginLocalMutation(c)
 	case endLocalMutationCommand:
@@ -471,6 +526,57 @@ func (l *schedulerLoop) handleDetachedTaskCompletionFinished(c detachedTaskCompl
 	}
 	l.startNextEligible()
 	return false
+}
+
+func (l *schedulerLoop) activeTurn(sessionKey string) activeTurnResponse {
+	if l.active == nil || l.active.completing || l.active.decision != "" {
+		return activeTurnResponse{}
+	}
+	if l.active.task.SessionKey != sessionKey {
+		return activeTurnResponse{}
+	}
+	return activeTurnResponse{handle: ActiveTurnHandle{
+		SessionKey: l.active.task.SessionKey,
+		TaskID:     l.active.task.ID,
+		Generation: l.active.generation,
+	}, ok: true}
+}
+
+func (l *schedulerLoop) handleSupplementActiveTurn(c supplementActiveTurnCommand) {
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if l.active == nil || l.active.completing || l.active.decision != "" {
+		c.resp <- ActiveTurnSupplementResult{Status: ActiveTurnSupplementNoActive}
+		return
+	}
+	active := l.active
+	if active.task.SessionKey != c.req.SessionKey {
+		c.resp <- ActiveTurnSupplementResult{Status: ActiveTurnSupplementWrongSession}
+		return
+	}
+	if active.task.ID != c.req.TaskID || active.generation != c.req.Generation {
+		c.resp <- ActiveTurnSupplementResult{Status: ActiveTurnSupplementStale}
+		return
+	}
+	handler := active.task.ActiveSupplement
+	if handler == nil {
+		c.resp <- ActiveTurnSupplementResult{Status: ActiveTurnSupplementUnsupported}
+		return
+	}
+	req := c.req
+	go func() {
+		if err := handler(ctx, req); err != nil {
+			if errors.Is(err, ErrNotSupported) {
+				c.resp <- ActiveTurnSupplementResult{Status: ActiveTurnSupplementUnsupported, Err: err}
+				return
+			}
+			c.resp <- ActiveTurnSupplementResult{Status: ActiveTurnSupplementFailed, Err: err}
+			return
+		}
+		c.resp <- ActiveTurnSupplementResult{Status: ActiveTurnSupplementDelivered}
+	}()
 }
 
 func (l *schedulerLoop) handleBeginLocalMutation(c beginLocalMutationCommand) {
@@ -671,7 +777,8 @@ func (l *schedulerLoop) startNextEligible() {
 func (l *schedulerLoop) startTask(task ProjectTask) {
 	ctx, cancel := context.WithCancel(context.Background())
 	completion := newTaskCompletion(task, l.notificationSlots, l.notifier)
-	active := &activeTask{task: task, cancel: cancel, completion: completion}
+	l.activeGeneration++
+	active := &activeTask{task: task, cancel: cancel, completion: completion, generation: l.activeGeneration}
 	if l.runTimeout > 0 {
 		active.deadline = l.clock.Now().Add(l.runTimeout)
 	}

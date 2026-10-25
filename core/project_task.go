@@ -29,6 +29,39 @@ type CancelResult struct {
 	Pending          bool
 }
 
+type ActiveTurnSupplementStatus string
+
+const (
+	ActiveTurnSupplementDelivered   ActiveTurnSupplementStatus = "delivered"
+	ActiveTurnSupplementNoActive    ActiveTurnSupplementStatus = "no_active"
+	ActiveTurnSupplementWrongSession ActiveTurnSupplementStatus = "wrong_session"
+	ActiveTurnSupplementStale       ActiveTurnSupplementStatus = "stale"
+	ActiveTurnSupplementUnsupported ActiveTurnSupplementStatus = "unsupported"
+	ActiveTurnSupplementFailed      ActiveTurnSupplementStatus = "failed"
+)
+
+type ActiveTurnHandle struct {
+	SessionKey string
+	TaskID     string
+	Generation uint64
+}
+
+type ActiveTurnSupplementRequest struct {
+	SessionKey  string
+	TaskID      string
+	Generation  uint64
+	Text        string
+	MessageID   string
+	Command     string
+}
+
+type ActiveTurnSupplementResult struct {
+	Status ActiveTurnSupplementStatus
+	Err    error
+}
+
+type ActiveTurnSupplementFunc func(context.Context, ActiveTurnSupplementRequest) error
+
 const (
 	TaskStateCompleted = "completed"
 	TaskStateExpired   = "expired"
@@ -64,9 +97,10 @@ type ProjectTask struct {
 	ReplyCtx   any
 	EnqueuedAt time.Time
 	ExpiresAt  time.Time
-	Run        func(context.Context) TaskResult
-	Cleanup    func()
-	OnFinish   func(TaskResult)
+	Run              func(context.Context) TaskResult
+	ActiveSupplement ActiveTurnSupplementFunc
+	Cleanup          func()
+	OnFinish         func(TaskResult)
 }
 
 type SubmitStatus string

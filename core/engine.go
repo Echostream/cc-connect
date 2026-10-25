@@ -857,6 +857,15 @@ type EngineProactiveScheduler interface {
 	SubmitProactive(ProjectTask) SubmitResult
 }
 
+// EngineActiveTurnSupplementScheduler 是可选 capability：只有调度器能证明目标
+// SessionKey 仍持有当前 active turn 且 generation 未过期时，才允许 /ps、/btw 这类
+// active-turn 文本补充进入后端。调用方不得在不支持该 capability 时回退到
+// AgentSession.Send，否则会绕过调度器 ownership。
+type EngineActiveTurnSupplementScheduler interface {
+	ActiveTurn(sessionKey string) (ActiveTurnHandle, bool)
+	SupplementActiveTurn(context.Context, ActiveTurnSupplementRequest) ActiveTurnSupplementResult
+}
+
 // EngineProjectScheduler is kept as a compatibility alias for callers that used
 // the pre-neutral scheduler name. New code should use EngineScheduler.
 type EngineProjectScheduler = EngineScheduler
@@ -1752,6 +1761,26 @@ func submitProactiveTask(scheduler EngineScheduler, task ProjectTask) SubmitResu
 	return scheduler.Submit(task)
 }
 
+func (e *Engine) supplementInteractiveActiveTurn(ctx context.Context, interactiveKey string, req ActiveTurnSupplementRequest) error {
+	e.interactiveMu.Lock()
+	state, ok := e.interactiveStates[interactiveKey]
+	e.interactiveMu.Unlock()
+	if !ok || state == nil {
+		return ErrNotSupported
+	}
+	state.mu.Lock()
+	session := state.agentSession
+	state.mu.Unlock()
+	if session == nil || !session.Alive() {
+		return ErrNotSupported
+	}
+	supplementer, ok := session.(ActiveTurnSupplementer)
+	if !ok {
+		return ErrNotSupported
+	}
+	return supplementer.SupplementActiveTurn(ctx, req)
+}
+
 func (e *Engine) submitProjectAgentTaskAndWait(req projectAgentTaskRequest) error {
 	if req.RunSessionKey == "" {
 		req.RunSessionKey = req.SessionKey
@@ -1777,13 +1806,21 @@ func (e *Engine) submitProjectAgentTaskAndWait(req projectAgentTaskRequest) erro
 		taskID = newAttachmentFailureTaskID()
 	}
 	done := make(chan TaskResult, 1)
+	activeInteractiveKey := req.InteractiveKey
+	var activeInteractiveMu sync.RWMutex
 	task := ProjectTask{
 		ID:         taskID,
 		Source:     req.Source,
 		SessionKey: req.RunSessionKey,
 		Platform:   req.Platform,
 		ReplyCtx:   req.Message.ReplyCtx,
-		Cleanup:    func() { cleanupStagedTaskAttachments(taskID, staged) },
+		ActiveSupplement: func(ctx context.Context, supplement ActiveTurnSupplementRequest) error {
+			activeInteractiveMu.RLock()
+			interactiveKey := activeInteractiveKey
+			activeInteractiveMu.RUnlock()
+			return e.supplementInteractiveActiveTurn(ctx, interactiveKey, supplement)
+		},
+		Cleanup: func() { cleanupStagedTaskAttachments(taskID, staged) },
 		Run: func(runCtx context.Context) TaskResult {
 			msg := req.Message
 			sessionKey := req.SessionKey
@@ -1800,6 +1837,9 @@ func (e *Engine) submitProjectAgentTaskAndWait(req projectAgentTaskRequest) erro
 			} else {
 				session = req.Sessions.GetOrCreateActive(sessionKey)
 			}
+			activeInteractiveMu.Lock()
+			activeInteractiveKey = interactiveKey
+			activeInteractiveMu.Unlock()
 			lockGen, locked := session.TryLock()
 			if !locked {
 				err := fmt.Errorf("session %q is busy outside project scheduler", sessionKey)
@@ -2972,7 +3012,10 @@ func (e *Engine) submitProjectMessage(p Platform, msg *Message, agent Agent, ses
 		SessionKey: msgCopy.SessionKey,
 		Platform:   p,
 		ReplyCtx:   msgCopy.ReplyCtx,
-		Cleanup:    func() { cleanupStagedTaskAttachments(taskID, staged) },
+		ActiveSupplement: func(ctx context.Context, supplement ActiveTurnSupplementRequest) error {
+			return e.supplementInteractiveActiveTurn(ctx, interactiveKey, supplement)
+		},
+		Cleanup: func() { cleanupStagedTaskAttachments(taskID, staged) },
 		Run: func(runCtx context.Context) TaskResult {
 			session := sessions.GetOrCreateActive(interactiveKey)
 			lockGen, locked := session.TryLock()
@@ -3668,7 +3711,10 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		SessionKey: msg.SessionKey,
 		Platform:   p,
 		ReplyCtx:   msg.ReplyCtx,
-		Cleanup:    func() { cleanupStagedTaskAttachments(taskID, staged) },
+		ActiveSupplement: func(ctx context.Context, supplement ActiveTurnSupplementRequest) error {
+			return e.supplementInteractiveActiveTurn(ctx, interactiveKey, supplement)
+		},
+		Cleanup: func() { cleanupStagedTaskAttachments(taskID, staged) },
 		Run: func(runCtx context.Context) TaskResult {
 			session := sessions.GetOrCreateActive(msgCopy.SessionKey)
 			sessions.UpdateUserMeta(msgCopy.SessionKey, msgCopy.UserName, msgCopy.ChatName)
@@ -7591,7 +7637,8 @@ var builtinCommands = []struct {
 	{[]string{"whoami", "myid"}, "whoami"},
 	{[]string{"web"}, "web"},
 	{[]string{"diff"}, "diff"},
-	{[]string{"ps", "btw"}, "ps"},
+	{[]string{"ps"}, "ps"},
+	{[]string{"btw"}, "btw"},
 }
 
 func schedulerIsProjectBusy(snapshot SchedulerSnapshot) bool {
@@ -7635,7 +7682,7 @@ func (e *Engine) handleBusyCommandGate(p Platform, msg *Message, cmdID, rawCmd s
 		return false, nil
 	}
 	switch disposition {
-	case BusyCommandReadonly, BusyCommandScopeControl, BusyCommandAgentTrigger:
+	case BusyCommandReadonly, BusyCommandScopeControl, BusyCommandAgentTrigger, BusyCommandActiveTurnControl:
 		return true, nil
 	case BusyCommandSharedMutation:
 		if busy {
@@ -7663,34 +7710,46 @@ func (e *Engine) handleBusyCommandGate(p Platform, msg *Message, cmdID, rawCmd s
 }
 
 func (e *Engine) cmdPs(p Platform, msg *Message, args []string) {
+	e.cmdActiveTurnSupplement(p, msg, args, "ps")
+}
+
+func (e *Engine) cmdActiveTurnSupplement(p Platform, msg *Message, args []string, command string) {
 	text := strings.TrimSpace(strings.Join(args, " "))
 	if text == "" {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsEmpty))
 		return
 	}
-	iKey := e.interactiveKeyForSessionKey(msg.SessionKey)
-	e.interactiveMu.Lock()
-	state, ok := e.interactiveStates[iKey]
-	e.interactiveMu.Unlock()
-	if !ok || state == nil || state.agentSession == nil || !state.agentSession.Alive() {
+	supplementScheduler, ok := e.projectScheduler.(EngineActiveTurnSupplementScheduler)
+	if !ok {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsUnsupported))
+		return
+	}
+	handle, ok := supplementScheduler.ActiveTurn(msg.SessionKey)
+	if !ok {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsNoSession))
 		return
 	}
-	// /ps is only meaningful as a supplement to a turn already in flight.
-	// When the session is idle, injecting via agentSession.Send bypasses the
-	// session lock and races with concurrent normal messages on the CLI's
-	// stdin, so reject instead.
-	_, sessions := e.sessionContextForKey(msg.SessionKey)
-	if session := sessions.GetOrCreateActive(msg.SessionKey); !session.Busy() {
+	result := supplementScheduler.SupplementActiveTurn(e.ctx, ActiveTurnSupplementRequest{
+		SessionKey: msg.SessionKey,
+		TaskID:     handle.TaskID,
+		Generation: handle.Generation,
+		Text:       text,
+		MessageID:  msg.MessageID,
+		Command:    command,
+	})
+	switch result.Status {
+	case ActiveTurnSupplementDelivered:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsSent))
+	case ActiveTurnSupplementUnsupported:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsUnsupported))
+	case ActiveTurnSupplementNoActive, ActiveTurnSupplementWrongSession, ActiveTurnSupplementStale:
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsNoSession))
-		return
-	}
-	if err := state.agentSession.Send(text, "", nil, nil); err != nil {
-		slog.Error("ps: send failed", "error", err)
+	case ActiveTurnSupplementFailed:
+		slog.Error("ps: supplement failed", "error", result.Err)
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsSendFailed))
-		return
+	default:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsSendFailed))
 	}
-	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsSent))
 }
 
 // matchPrefix finds a unique command matching the given prefix.
@@ -7916,6 +7975,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdWeb(p, msg, args)
 	case "ps":
 		e.cmdPs(p, msg, args)
+	case "btw":
+		e.cmdActiveTurnSupplement(p, msg, args, "btw")
 	case "queue":
 		e.cmdQueue(p, msg)
 	default:

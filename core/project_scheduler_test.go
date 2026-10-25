@@ -121,6 +121,20 @@ func assertNoBufferedStart(t *testing.T, started <-chan string) {
 	}
 }
 
+func waitProjectSchedulerIdle(t *testing.T, scheduler *ProjectScheduler) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var last SchedulerSnapshot
+	for time.Now().Before(deadline) {
+		last = scheduler.Snapshot()
+		if last.ActiveCount == 0 && last.WaitingCount == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("scheduler did not become idle; last=%+v", last)
+}
+
 type projectSchedulerStubPlatform struct{ name string }
 
 func (p projectSchedulerStubPlatform) Name() string                             { return p.name }
@@ -1963,4 +1977,137 @@ func TestStagedAttachmentLifecycleAcrossSchedulerTerminals(t *testing.T) {
 		active.assertCleanedOnceAndRemoved(t, "shutdown-active")
 		waiting.assertCleanedOnceAndRemoved(t, "shutdown-waiting")
 	})
+}
+
+func TestProjectSchedulerActiveTurnSupplementRequiresActiveOwnership(t *testing.T) {
+	clock := newFakeSchedulerClock(time.Unix(14_000, 0))
+	scheduler := NewProjectScheduler(clock, 10, 6*time.Hour, 30*time.Minute)
+	defer scheduler.Stop(context.Background())
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	delivered := make(chan ActiveTurnSupplementRequest, 1)
+	if got := scheduler.Submit(ProjectTask{
+		ID:         "active",
+		SessionKey: "session-a",
+		Run: func(ctx context.Context) TaskResult {
+			started <- struct{}{}
+			select {
+			case <-release:
+				return TaskResult{State: TaskStateCompleted}
+			case <-ctx.Done():
+				return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+			}
+		},
+		ActiveSupplement: func(_ context.Context, req ActiveTurnSupplementRequest) error {
+			delivered <- req
+			return nil
+		},
+	}); got.Status != SubmitStarted {
+		t.Fatalf("submit active = %+v", got)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active task not started")
+	}
+
+	handle, ok := scheduler.ActiveTurn("session-a")
+	if !ok || handle.SessionKey != "session-a" || handle.TaskID != "active" || handle.Generation == 0 {
+		t.Fatalf("active handle = %+v ok=%v", handle, ok)
+	}
+	if _, ok := scheduler.ActiveTurn("session-b"); ok {
+		t.Fatal("wrong session unexpectedly got active handle")
+	}
+
+	wrong := scheduler.SupplementActiveTurn(context.Background(), ActiveTurnSupplementRequest{
+		SessionKey: "session-b",
+		TaskID:     handle.TaskID,
+		Generation: handle.Generation,
+		Text:       "wrong",
+		Command:    "ps",
+	})
+	if wrong.Status != ActiveTurnSupplementWrongSession {
+		t.Fatalf("wrong-session supplement = %+v", wrong)
+	}
+	stale := scheduler.SupplementActiveTurn(context.Background(), ActiveTurnSupplementRequest{
+		SessionKey: handle.SessionKey,
+		TaskID:     handle.TaskID,
+		Generation: handle.Generation + 1,
+		Text:       "stale",
+		Command:    "ps",
+	})
+	if stale.Status != ActiveTurnSupplementStale {
+		t.Fatalf("stale supplement = %+v", stale)
+	}
+	okResult := scheduler.SupplementActiveTurn(context.Background(), ActiveTurnSupplementRequest{
+		SessionKey: handle.SessionKey,
+		TaskID:     handle.TaskID,
+		Generation: handle.Generation,
+		Text:       "hello active",
+		Command:    "ps",
+	})
+	if okResult.Status != ActiveTurnSupplementDelivered || okResult.Err != nil {
+		t.Fatalf("active supplement = %+v", okResult)
+	}
+	select {
+	case req := <-delivered:
+		if req.Text != "hello active" || req.SessionKey != "session-a" || req.Generation != handle.Generation {
+			t.Fatalf("delivered request = %+v", req)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("supplement handler not called")
+	}
+
+	close(release)
+	waitProjectSchedulerIdle(t, scheduler)
+	if _, ok := scheduler.ActiveTurn("session-a"); ok {
+		t.Fatal("completed task still exposes active handle")
+	}
+	if got := scheduler.SupplementActiveTurn(context.Background(), ActiveTurnSupplementRequest{
+		SessionKey: handle.SessionKey,
+		TaskID:     handle.TaskID,
+		Generation: handle.Generation,
+		Text:       "after",
+		Command:    "ps",
+	}); got.Status != ActiveTurnSupplementNoActive {
+		t.Fatalf("post-completion supplement = %+v", got)
+	}
+}
+
+func TestProjectSchedulerActiveTurnSupplementRejectsUnsupported(t *testing.T) {
+	scheduler := NewProjectScheduler(newFakeSchedulerClock(time.Unix(14_100, 0)), 10, 6*time.Hour, 30*time.Minute)
+	defer scheduler.Stop(context.Background())
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	if got := scheduler.Submit(ProjectTask{ID: "active", SessionKey: "session-a", Run: func(ctx context.Context) TaskResult {
+		started <- struct{}{}
+		select {
+		case <-release:
+			return TaskResult{State: TaskStateCompleted}
+		case <-ctx.Done():
+			return TaskResult{State: TaskStateCancelled, Err: ctx.Err()}
+		}
+	}}); got.Status != SubmitStarted {
+		t.Fatalf("submit active = %+v", got)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active task not started")
+	}
+	handle, ok := scheduler.ActiveTurn("session-a")
+	if !ok {
+		t.Fatal("missing active handle")
+	}
+	if got := scheduler.SupplementActiveTurn(context.Background(), ActiveTurnSupplementRequest{
+		SessionKey: handle.SessionKey,
+		TaskID:     handle.TaskID,
+		Generation: handle.Generation,
+		Text:       "unsupported",
+		Command:    "ps",
+	}); got.Status != ActiveTurnSupplementUnsupported {
+		t.Fatalf("unsupported supplement = %+v", got)
+	}
+	close(release)
 }

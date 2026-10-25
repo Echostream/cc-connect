@@ -47,6 +47,14 @@ type Platform interface {
 // ErrNotSupported indicates a platform doesn't support a particular operation.
 var ErrNotSupported = errors.New("operation not supported by this platform")
 
+// ActiveTurnSupplementer is an optional AgentSession capability for appending
+// plain text to the currently running turn. Implementations must not start a new
+// turn from this method; unsupported sessions should omit the interface or return
+// ErrNotSupported.
+type ActiveTurnSupplementer interface {
+	SupplementActiveTurn(context.Context, ActiveTurnSupplementRequest) error
+}
+
 // ReplyContextReconstructor is an optional interface for platforms that can
 // recreate a reply context from a session key. This is needed for cron jobs
 // to send messages to users without an incoming message.

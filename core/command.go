@@ -15,9 +15,10 @@ type BusyCommandDisposition string
 const (
 	BusyCommandUnknown        BusyCommandDisposition = "unknown"
 	BusyCommandReadonly       BusyCommandDisposition = "readonly"
-	BusyCommandScopeControl   BusyCommandDisposition = "scope_control"
-	BusyCommandAgentTrigger   BusyCommandDisposition = "agent_trigger"
-	BusyCommandSharedMutation BusyCommandDisposition = "shared_mutation"
+	BusyCommandScopeControl      BusyCommandDisposition = "scope_control"
+	BusyCommandAgentTrigger      BusyCommandDisposition = "agent_trigger"
+	BusyCommandActiveTurnControl BusyCommandDisposition = "active_turn_control"
+	BusyCommandSharedMutation    BusyCommandDisposition = "shared_mutation"
 )
 
 const ProjectBusyMutationRejectedReason = "project_busy_mutation_rejected"
@@ -106,7 +107,9 @@ func ClassifyBusyCommand(cmd string, args []string) BusyCommandDisposition {
 		return BusyCommandSharedMutation
 	case "compress", "compact":
 		return BusyCommandAgentTrigger
-	case "switch", "name", "rename", "delete", "del", "rm", "allow", "lang", "quiet", "alias", "restart", "shell", "sh", "exec", "run", "dir", "cd", "chdir", "workdir", "ps", "btw", "upgrade", "update":
+	case "ps", "btw":
+		return BusyCommandActiveTurnControl
+	case "switch", "name", "rename", "delete", "del", "rm", "allow", "lang", "quiet", "alias", "restart", "shell", "sh", "exec", "run", "dir", "cd", "chdir", "workdir", "upgrade", "update":
 		return BusyCommandSharedMutation
 	default:
 		return BusyCommandUnknown
